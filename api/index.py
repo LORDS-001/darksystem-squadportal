@@ -8,8 +8,6 @@ import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
-
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
@@ -36,6 +34,9 @@ def invoke_existing_backend(request: Request, body: bytes) -> Response:
     h.rfile = io.BytesIO(body)
     h.wfile = io.BytesIO()
     h.server = SimpleNamespace(server_address=(request.url.hostname or "vercel", 443 if request.url.scheme == "https" else 80))
+    client_host = request.client.host if request.client else "0.0.0.0"
+    client_port = request.client.port if request.client else 0
+    h.client_address = (client_host, client_port)
     h.request_version = "HTTP/1.1"
     h.command = request.method
     h._status = 200

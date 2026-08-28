@@ -37,6 +37,13 @@ LOCK = threading.RLock()
 def now_iso():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
 class PostgresCompat:
     def __init__(self, conn):
         self.conn = conn
@@ -76,7 +83,7 @@ def db():
         except ImportError as exc:
             raise RuntimeError('PostgreSQL mode requires psycopg[binary].') from exc
         return PostgresCompat(psycopg.connect(DATABASE_URL, row_factory=dict_row))
-    c = sqlite3.connect(DB_PATH, timeout=10)
+    c = sqlite3.connect(DB_PATH, timeout=10, factory=ClosingSQLiteConnection)
     c.row_factory = sqlite3.Row
     return c
 
@@ -951,7 +958,11 @@ class Handler(BaseHTTPRequestHandler):
         return json_response(self, {'ok':True,'authoritative':True})
     def static_or_404(self,path):
         rel='index.html' if path=='/' else path.lstrip('/')
-        file=ROOT/rel
+        file=(ROOT/rel).resolve()
+        try:
+            file.relative_to(ROOT.resolve())
+        except ValueError:
+            return json_response(self,{'error':'Not found'},404)
         if not file.exists() or not file.is_file(): return json_response(self,{'error':'Not found'},404)
         data=file.read_bytes(); ctype='text/plain'
         if file.suffix=='.html':ctype='text/html; charset=utf-8'
