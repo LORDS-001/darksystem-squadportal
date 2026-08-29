@@ -1,4 +1,5 @@
 import unittest
+from urllib.parse import urlsplit
 
 from tests import http_harness
 
@@ -24,7 +25,10 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
 
         resolved = self.resolver()({"TEST_DATABASE_URL": test_url})
 
-        self.assertEqual(resolved, test_url)
+        parsed = urlsplit(resolved)
+        self.assertEqual(parsed.hostname, "test.example")
+        self.assertEqual(parsed.port, 5432)
+        self.assertEqual(parsed.path, "/postgres")
 
     def test_gate_rejects_the_same_database_as_production_without_exposing_credentials(self):
         test_url = "postgresql://test-role@shared.example/postgres?sslmode=require"
@@ -50,7 +54,10 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(resolved, test_url)
+        self.assertEqual(
+            resolved,
+            "postgresql://test-project.example:5432/postgres",
+        )
 
     def test_gate_rejects_non_postgresql_urls_without_exposing_them(self):
         unsafe_url = "sqlite:///sensitive-marker.sqlite3"
@@ -129,13 +136,95 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
             self.resolver()(
                 {
                     "TEST_DATABASE_URL": (
-                        "postgresql://test-role@EXAMPLE%2Ecom:5432/dark%2Dsystem"
+                        "postgresql://test-role@EXAMPLE%2Ecom.:5432/dark%2Dsystem"
                     ),
                     "DATABASE_URL": (
                         "postgres://production-role@example.com/dark-system"
                     ),
                 }
             )
+
+    def test_gate_rejects_every_target_affecting_libpq_environment_default(self):
+        target_environment = {
+            "PGHOST": "sensitive-pghost",
+            "PGHOSTADDR": "sensitive-pghostaddr",
+            "PGPORT": "6543",
+            "PGDATABASE": "sensitive-pgdatabase",
+            "PGSERVICE": "sensitive-pgservice",
+            "PGSERVICEFILE": "sensitive-pgservicefile",
+            "PGTARGETSESSIONATTRS": "sensitive-pgtargetsessionattrs",
+            "PGLOADBALANCEHOSTS": "sensitive-pgloadbalancehosts",
+            "PGSYSCONFDIR": "sensitive-pgsysconfdir",
+        }
+        for variable, value in target_environment.items():
+            environment = {
+                "TEST_DATABASE_URL": "postgresql://test.example/postgres",
+                variable: value,
+            }
+            with self.subTest(variable=variable):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.resolver()(environment)
+                self.assertNotIn(value, str(captured.exception))
+                self.assertNotIn("test.example", str(captured.exception))
+
+    def test_gate_rejects_omitted_port_bypass_from_ambient_pgport(self):
+        with self.assertRaises(RuntimeError):
+            self.resolver()(
+                {
+                    "TEST_DATABASE_URL": "postgresql://same.example/postgres",
+                    "DATABASE_URL": "postgresql://same.example:6543/postgres",
+                    "PGPORT": "6543",
+                }
+            )
+
+    def test_gate_rejects_a_present_target_environment_variable_even_when_empty(self):
+        with self.assertRaises(RuntimeError):
+            self.resolver()(
+                {
+                    "TEST_DATABASE_URL": "postgresql://test.example/postgres",
+                    "PGHOST": "",
+                }
+            )
+
+    def test_gate_canonicalizes_equivalent_ipv6_literals(self):
+        with self.assertRaises(RuntimeError):
+            self.resolver()(
+                {
+                    "TEST_DATABASE_URL": (
+                        "postgresql://test-role@[2001:0db8:0000:0000:0000:0000:0000:0001]:5432/postgres"
+                    ),
+                    "DATABASE_URL": (
+                        "postgresql://production-role@[2001:db8::1]/postgres"
+                    ),
+                }
+            )
+
+    def test_gate_accepts_and_preserves_ordinary_supabase_pooler_uri(self):
+        test_url = (
+            "postgresql://postgres.project-ref:encoded%40password@"
+            "aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
+        )
+
+        resolved = self.resolver()(
+            {
+                "TEST_DATABASE_URL": test_url,
+                "DATABASE_URL": "postgresql://prod.example:5432/postgres",
+            }
+        )
+
+        self.assertEqual(resolved, test_url)
+
+    def test_gate_rejects_query_routing_options(self):
+        for option in ("target_session_attrs=primary", "load_balance_hosts=random"):
+            with self.subTest(option=option):
+                with self.assertRaises(RuntimeError):
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": (
+                                f"postgresql://test.example/postgres?{option}"
+                            )
+                        }
+                    )
 
 
 if __name__ == "__main__":

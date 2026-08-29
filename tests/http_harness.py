@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import io
 import json
 import os
@@ -6,7 +7,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 import server
 from fastapi import Request
@@ -17,9 +18,22 @@ _TARGET_QUERY_OPTIONS = {
     "dbname",
     "host",
     "hostaddr",
+    "load_balance_hosts",
     "port",
     "service",
     "servicefile",
+    "target_session_attrs",
+}
+_TARGET_LIBPQ_ENVIRONMENT = {
+    "PGDATABASE",
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGLOADBALANCEHOSTS",
+    "PGPORT",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+    "PGTARGETSESSIONATTRS",
 }
 
 
@@ -34,6 +48,14 @@ def _psycopg_conninfo(database_url):
         return None
 
 
+def _normalize_postgres_host(host):
+    decoded = unquote(str(host)).lower().rstrip(".")
+    try:
+        return ipaddress.ip_address(decoded).compressed
+    except ValueError:
+        return decoded
+
+
 def _postgres_database_identity(database_url):
     try:
         parsed = urlsplit(database_url)
@@ -41,7 +63,7 @@ def _postgres_database_identity(database_url):
             str(key).lower()
             for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
         }
-        host = unquote(parsed.hostname or "").lower().rstrip(".")
+        host = _normalize_postgres_host(parsed.hostname or "")
         port = parsed.port or 5432
     except (TypeError, ValueError):
         return None
@@ -62,7 +84,7 @@ def _postgres_database_identity(database_url):
     if normalized:
         if normalized.get("service") or normalized.get("servicefile"):
             return None
-        normalized_host = unquote(str(normalized.get("host", host))).lower().rstrip(".")
+        normalized_host = _normalize_postgres_host(normalized.get("host", host))
         normalized_port = str(normalized.get("port", port))
         normalized_database = str(normalized.get("dbname", database_name))
         if "," in normalized_host or "," in normalized_port:
@@ -80,12 +102,44 @@ def _postgres_database_identity(database_url):
     )
 
 
+def _explicit_postgres_url(database_url, identity):
+    parsed = urlsplit(database_url)
+    if parsed.netloc.count("@") > 1:
+        return None
+    raw_userinfo, separator, _raw_target = parsed.netloc.rpartition("@")
+    userinfo = f"{raw_userinfo}@" if separator else ""
+    host, port, database_name = identity
+    try:
+        host_literal = ipaddress.ip_address(host)
+    except ValueError:
+        uri_host = host
+    else:
+        uri_host = (
+            f"[{host_literal.compressed}]"
+            if host_literal.version == 6
+            else str(host_literal)
+        )
+    return urlunsplit(
+        (
+            "postgresql",
+            f"{userinfo}{uri_host}:{port}",
+            f"/{quote(database_name, safe='')}",
+            parsed.query,
+            "",
+        )
+    )
+
+
 def resolve_test_database_url(environment=None):
     """Return the explicit disposable PostgreSQL URL without falling back."""
     source = os.environ if environment is None else environment
     test_database_url = str(source.get("TEST_DATABASE_URL", "")).strip()
     if not test_database_url:
         return None
+    if any(variable in source for variable in _TARGET_LIBPQ_ENVIRONMENT):
+        raise RuntimeError(
+            "Target-affecting libpq environment variables must be unset for the PostgreSQL test gate."
+        )
     test_identity = _postgres_database_identity(test_database_url)
     if test_identity is None:
         raise RuntimeError(
@@ -104,7 +158,15 @@ def resolve_test_database_url(environment=None):
         raise RuntimeError(
             "The disposable PostgreSQL test database must differ from DATABASE_URL."
         )
-    return test_database_url
+    explicit_test_database_url = _explicit_postgres_url(
+        test_database_url,
+        test_identity,
+    )
+    if explicit_test_database_url is None:
+        raise RuntimeError(
+            "TEST_DATABASE_URL cannot be converted to an explicit safe PostgreSQL target."
+        )
+    return explicit_test_database_url
 
 
 @dataclass
