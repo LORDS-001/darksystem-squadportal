@@ -43,7 +43,7 @@ class OwnerFoundationTests(unittest.TestCase):
         self.assertEqual(fresh_status.status, 200)
         self.assertEqual(fresh_status.json, {"setupComplete": False})
 
-        setup_payload = {
+        original_setup_payload = {
             "username": "overall-owner",
             "password": "owner-password-123",
             "squadOwner": {
@@ -53,11 +53,26 @@ class OwnerFoundationTests(unittest.TestCase):
                 "accessCode": "DS-OWNER",
             },
         }
-        setup = self.backend.request("POST", "/api/owner/setup", setup_payload)
+        setup = self.backend.request("POST", "/api/owner/setup", original_setup_payload)
         self.assertEqual(setup.status, 200)
 
-        repeated_setup = self.backend.request("POST", "/api/owner/setup", setup_payload)
+        replacement_setup_payload = {
+            "username": "replacement-owner",
+            "password": "replacement-password-456",
+            "squadOwner": {
+                "ign": "ReplacementOwner",
+                "gameId": "654321",
+                "serverId": "4321",
+                "accessCode": "REPLACED-OWNER",
+            },
+        }
+        repeated_setup = self.backend.request(
+            "POST", "/api/owner/setup", replacement_setup_payload
+        )
         self.assertEqual(repeated_setup.status, 409)
+        locked_status = self.backend.request("GET", "/api/owner/setup/status")
+        self.assertEqual(locked_status.status, 200)
+        self.assertEqual(locked_status.json, {"setupComplete": True})
 
         login = self.backend.request(
             "POST",
@@ -66,6 +81,22 @@ class OwnerFoundationTests(unittest.TestCase):
         )
         self.assertEqual(login.status, 200)
         copied_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+        replacement_login = self.backend.request(
+            "POST",
+            "/api/owner/login",
+            {"username": "replacement-owner", "password": "replacement-password-456"},
+        )
+        self.assertEqual(replacement_login.status, 401)
+
+        original_squad_login = self.backend.request(
+            "POST", "/api/squad/login", original_setup_payload["squadOwner"]
+        )
+        self.assertEqual(original_squad_login.status, 200)
+        replacement_squad_login = self.backend.request(
+            "POST", "/api/squad/login", replacement_setup_payload["squadOwner"]
+        )
+        self.assertEqual(replacement_squad_login.status, 401)
 
         overview = self.backend.request("GET", "/api/owner/overview", cookie=copied_cookie)
         self.assertEqual(overview.status, 200)
