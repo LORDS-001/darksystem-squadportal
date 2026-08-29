@@ -1,0 +1,11 @@
+[project]
+name = "dark-system-squadportal"
+version = "35.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[tool.vercel]
+entrypoint = "api.index:app"
