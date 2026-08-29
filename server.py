@@ -301,6 +301,47 @@ def clear_session_cookie(h):
 def clear_session(h):
     h.send_header('Set-Cookie', clear_session_cookie(h))
 
+def overview_secret_key(key):
+    normalized = ''.join(ch for ch in str(key).lower() if ch.isalnum())
+    return any(part in normalized for part in ('password', 'accesscode', 'resetcode', 'token'))
+
+_OVERVIEW_OMIT = object()
+
+def sanitize_overview_value(value, secret_values):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if overview_secret_key(key):
+                continue
+            safe_item = sanitize_overview_value(item, secret_values)
+            if safe_item is not _OVERVIEW_OMIT:
+                cleaned[str(key)] = safe_item
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [item for value_item in value if (item := sanitize_overview_value(value_item, secret_values)) is not _OVERVIEW_OMIT]
+    if isinstance(value, str) and value in secret_values:
+        return _OVERVIEW_OMIT
+    return value
+
+def overview_details(raw_details, secret_values):
+    try:
+        details = json.loads(raw_details or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    details = sanitize_overview_value(details, secret_values)
+    return {} if details is _OVERVIEW_OMIT else details
+
+def overview_status(value):
+    return ''.join(ch for ch in str(value or '').lower() if ch.isalnum())
+
+def pending_overview_result(match):
+    submission = match.get('submission')
+    if isinstance(submission, dict):
+        return overview_status(submission.get('status')) not in ('confirmed', 'ownerapproved', 'rejected')
+    return overview_status(match.get('resultStatus')) in (
+        'pending', 'pendingconfirmation', 'awaitingconfirmation', 'awaitingreview', 'disputed'
+    )
+
 def request_ip(h):
     return (request_header(h, 'X-Forwarded-For').split(',')[0].strip() or h.client_address[0])
 
@@ -351,6 +392,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/owner/setup/status' and method=='GET': return self.owner_setup_status()
         if path=='/api/owner/setup' and method=='POST': return self.owner_setup()
         if path=='/api/owner/login' and method=='POST': return self.owner_login()
+        if path=='/api/owner/overview' and method=='GET': return self.owner_overview()
         if path=='/api/owner/audit' and method=='GET': return self.owner_audit()
         if path=='/api/roles' and method=='GET': return self.roles_info()
         if path=='/api/squad/role' and method=='POST': return self.squad_role_change()
@@ -438,6 +480,48 @@ class Handler(BaseHTTPRequestHandler):
         token=create_session('owner',row['id'],'Overall Owner')
         self.audit({'type':'owner','id':row['id'],'role':'Overall Owner'},'owner_login','owner',row['id'])
         return json_response(self, {'ok':True,'role':'Overall Owner'},200,{'Set-Cookie':session_cookie(self, token)})
+
+    def owner_overview(self):
+        s=require_auth(self,['owner'])
+        if not s:return
+        if s.get('role')!='Overall Owner': return json_response(self,{'error':'Overall Owner permission required.'},403)
+        with LOCK, db() as c:
+            tournaments=state_get(c,'tournaments',[])
+            registrations=state_get(c,'registrations',[])
+            approvals=state_get(c,'squadTournamentApprovals',[])
+            tournaments=tournaments if isinstance(tournaments,list) else []
+            registrations=registrations if isinstance(registrations,list) else []
+            approvals=approvals if isinstance(approvals,list) else []
+            secret_values=set()
+            for query, column in (
+                ('SELECT access_code FROM squad_members', 'access_code'),
+                ('SELECT password_hash FROM community_accounts', 'password_hash'),
+                ('SELECT reset_code FROM community_accounts WHERE reset_code IS NOT NULL', 'reset_code'),
+                ('SELECT password_hash FROM owner_accounts', 'password_hash'),
+                ('SELECT token FROM sessions', 'token'),
+            ):
+                for row in c.execute(query).fetchall():
+                    if row[column]: secret_values.add(str(row[column]))
+            cookies=SimpleCookie(); cookies.load(request_header(self, 'Cookie'))
+            if cookies.get(COOKIE_NAME): secret_values.add(cookies[COOKIE_NAME].value)
+            audit=[]
+            for row in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC LIMIT 10').fetchall():
+                item=sanitize_overview_value(dict(row), secret_values)
+                item['details']=overview_details(item.get('details'), secret_values)
+                audit.append(item)
+            completed=lambda tournament: bool(tournament.get('completed')) or overview_status(tournament.get('status'))=='completed'
+            counts={
+                'communityMembers':c.execute('SELECT COUNT(*) AS n FROM community_accounts').fetchone()['n'],
+                'squadMembers':c.execute('SELECT COUNT(*) AS n FROM squad_members').fetchone()['n'],
+                'activeTournaments':sum(1 for tournament in tournaments if isinstance(tournament,dict) and not completed(tournament) and overview_status(tournament.get('status')) not in ('cancelled','canceled')),
+                'completedTournaments':sum(1 for tournament in tournaments if isinstance(tournament,dict) and completed(tournament)),
+            }
+            pending={
+                'registrations':sum(1 for registration in registrations if isinstance(registration,dict) and overview_status(registration.get('status') or 'Registered') in ('registered','pending','awaitingapproval')),
+                'squadApprovals':sum(1 for approval in approvals if isinstance(approval,dict) and overview_status(approval.get('status') or 'Pending')=='pending'),
+                'results':sum(1 for tournament in tournaments if isinstance(tournament,dict) for match in (tournament.get('matches') or []) if isinstance(match,dict) and pending_overview_result(match)),
+            }
+        return json_response(self,{'health':{'database':'healthy'},'counts':counts,'pending':pending,'recentAudit':audit})
 
     def owner_audit(self):
         s=require_auth(self,['owner'])

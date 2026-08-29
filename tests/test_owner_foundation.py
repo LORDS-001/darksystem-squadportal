@@ -320,3 +320,139 @@ class OwnerFoundationTests(unittest.TestCase):
         )
         self.assertEqual(plain_http_login.status_code, 200)
         self.assertNotIn("; Secure", plain_http_login.headers["set-cookie"])
+
+    def test_owner_overview_requires_owner(self):
+        response = self.backend.request("GET", "/api/owner/overview")
+
+        self.assertEqual(response.status, 401)
+        self.assertEqual(response.json, {"error": "Authentication required"})
+
+    def test_owner_overview_rejects_community_and_squad_sessions(self):
+        community = self.backend.request(
+            "POST",
+            "/api/community/register",
+            {
+                "email": "overview-member@example.test",
+                "password": "member-password-123",
+                "ign": "OverviewMember",
+                "gameId": "654321",
+                "serverId": "4321",
+            },
+        )
+        self.assertEqual(community.status, 200)
+
+        self.complete_owner_setup()
+        squad = self.backend.request(
+            "POST",
+            "/api/squad/login",
+            {"ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER"},
+        )
+        self.assertEqual(squad.status, 200)
+
+        for cookie in (
+            community.headers["Set-Cookie"].split(";", 1)[0],
+            squad.headers["Set-Cookie"].split(";", 1)[0],
+        ):
+            response = self.backend.request("GET", "/api/owner/overview", cookie=cookie)
+            self.assertIn(response.status, (401, 403))
+
+    def test_owner_overview_reports_sanitized_system_state(self):
+        community = self.backend.request(
+            "POST",
+            "/api/community/register",
+            {
+                "email": "overview-count@example.test",
+                "password": "member-password-123",
+                "ign": "CountMember",
+                "gameId": "765432",
+                "serverId": "2345",
+            },
+        )
+        self.assertEqual(community.status, 200)
+        self.complete_owner_setup()
+        owner_cookie = self.owner_login_cookie()
+
+        tournaments = [
+            {
+                "id": "open",
+                "status": "Open",
+                "matches": [
+                    {"id": "legacy-pending", "result": {"winner": "member"}, "resultStatus": "Pending Confirmation"},
+                    {"id": "disputed", "submission": {"status": "Disputed"}},
+                    {"id": "confirmed", "submission": {"status": "Confirmed"}},
+                ],
+            },
+            {"id": "complete", "status": "Completed", "completed": True, "matches": []},
+            {"id": "cancelled", "status": "Cancelled", "matches": []},
+        ]
+        registrations = [
+            {"id": "registered", "status": "Registered"},
+            {"id": "pending", "status": "Pending"},
+            {"id": "approved", "status": "Approved"},
+            {"id": "rejected", "status": "Rejected"},
+        ]
+        approvals = [
+            {"id": "waiting", "status": "Pending"},
+            {"id": "approved", "status": "Approved"},
+        ]
+        with server.LOCK, server.db() as connection:
+            connection.execute(
+                """INSERT INTO squad_members
+                   (id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                ("overview-squad", "Overview Squad", "OverviewSquad", "111111", "1111", "Squad Member", "squad-secret", "Offline", 1, 1),
+            )
+            for key, value in (
+                ("tournaments", tournaments),
+                ("registrations", registrations),
+                ("squadTournamentApprovals", approvals),
+            ):
+                connection.execute(
+                    "INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, json.dumps(value)),
+                )
+            for index in range(12):
+                details = {
+                    "message": f"visible audit {index}",
+                    "nested": {
+                        "password": "audit-password",
+                        "accessCode": "audit-access-code",
+                        "reset_code": "audit-reset-code",
+                        "sessionToken": "audit-token",
+                        "credential": owner_cookie.split("=", 1)[1],
+                        "safe": "visible nested value",
+                    },
+                }
+                connection.execute(
+                    """INSERT INTO audit_log
+                       (id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (f"overview-audit-{index}", "owner", "owner-1", "Overall Owner", "overview_test", "system", owner_cookie.split("=", 1)[1], f"2099-01-{index + 1:02d}T00:00:00Z", json.dumps(details)),
+                )
+            connection.execute(
+                """INSERT INTO audit_log
+                   (id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                ("overview-malformed", "owner", "owner-1", "Overall Owner", "overview_test", "system", "", "2100-01-01T00:00:00Z", "{not json"),
+            )
+            connection.commit()
+
+        response = self.backend.request("GET", "/api/owner/overview", cookie=owner_cookie)
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("health", response.json)
+        self.assertEqual(
+            response.json["counts"],
+            {"communityMembers": 1, "squadMembers": 2, "activeTournaments": 1, "completedTournaments": 1},
+        )
+        self.assertEqual(response.json["pending"], {"registrations": 2, "squadApprovals": 1, "results": 2})
+        self.assertEqual(len(response.json["recentAudit"]), 10)
+        self.assertEqual(response.json["recentAudit"][0]["details"], {})
+        self.assertEqual(response.json["recentAudit"][1]["details"]["nested"], {"safe": "visible nested value"})
+
+        serialized = json.dumps(response.json).lower()
+        for secret_name in ("password", "access_code", "reset_code", "token"):
+            self.assertNotIn(secret_name, serialized)
+        for secret_value in ("audit-password", "audit-access-code", "audit-reset-code", "audit-token", "squad-secret"):
+            self.assertNotIn(secret_value, serialized)
+        self.assertNotIn(owner_cookie.split("=", 1)[1].lower(), serialized)
