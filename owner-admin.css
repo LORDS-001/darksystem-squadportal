@@ -1,0 +1,214 @@
+.owner-admin {
+  min-height: 100vh;
+  background: radial-gradient(circle at 88% 0, rgba(34, 184, 255, .16), transparent 31%), var(--bg);
+}
+
+.owner-admin .owner-admin__header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 72px;
+  padding: 14px max(20px, calc((100% - var(--max)) / 2));
+  border-bottom: 1px solid var(--line);
+  background: rgba(5, 9, 18, .94);
+  backdrop-filter: blur(14px);
+}
+
+.owner-admin .owner-admin__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--txt);
+  font: 800 15px Orbitron, sans-serif;
+  letter-spacing: .4px;
+}
+
+.owner-admin .owner-admin__brand small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font: 700 9px Rajdhani, sans-serif;
+  letter-spacing: 2px;
+}
+
+.owner-admin .owner-admin__brand-mark,
+.owner-admin .owner-admin__loading-mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--a);
+  color: var(--a2);
+  font: 800 12px Orbitron, sans-serif;
+  box-shadow: 0 0 22px rgba(34, 184, 255, .16);
+}
+
+.owner-admin .owner-admin__access-label {
+  color: var(--a2);
+  font: 700 10px Orbitron, sans-serif;
+  letter-spacing: 1.6px;
+}
+
+.owner-admin .owner-admin__main {
+  width: min(100%, var(--max));
+  margin: 0 auto;
+  padding: clamp(36px, 8vw, 100px) 20px;
+}
+
+.owner-admin .owner-admin__root {
+  min-height: calc(100vh - 72px);
+}
+
+.owner-admin .owner-admin__loading-card,
+.owner-admin .owner-admin__auth-card,
+.owner-admin .owner-admin__metric-card,
+.owner-admin .owner-admin__activity-list {
+  border: 1px solid rgba(105, 139, 177, .28);
+  border-radius: 18px;
+  background: linear-gradient(145deg, rgba(15, 27, 44, .94), rgba(8, 16, 28, .98));
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .24);
+}
+
+.owner-admin .owner-admin__loading-card {
+  display: grid;
+  min-height: 280px;
+  place-items: center;
+  align-content: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.owner-admin .owner-admin__loading-mark {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+}
+
+.owner-admin .owner-admin__status {
+  margin: 0;
+  color: var(--muted);
+}
+
+.owner-admin .owner-admin__auth-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, .8fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.owner-admin .owner-admin__auth-card {
+  padding: clamp(22px, 4vw, 38px);
+}
+
+.owner-admin .owner-admin__eyebrow {
+  margin: 0 0 8px;
+  color: var(--a2);
+  font: 700 11px Orbitron, sans-serif;
+  letter-spacing: 1.4px;
+}
+
+.owner-admin .owner-admin__title {
+  margin: 0;
+  color: var(--txt);
+  font: 800 clamp(30px, 5vw, 48px) / 1.05 Orbitron, sans-serif;
+}
+
+.owner-admin .owner-admin__copy {
+  margin: 14px 0 0;
+  color: var(--muted);
+}
+
+.owner-admin .owner-admin__dashboard-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 28px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.owner-admin .owner-admin__metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.owner-admin .owner-admin__metric-card {
+  padding: 20px;
+}
+
+.owner-admin .owner-admin__metric-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.owner-admin .owner-admin__metric-value {
+  display: block;
+  margin-top: 8px;
+  color: var(--txt);
+  font: 800 32px / 1 Orbitron, sans-serif;
+}
+
+.owner-admin .owner-admin__activity-list {
+  margin-top: 24px;
+  padding: 8px 20px;
+}
+
+.owner-admin .owner-admin__activity-item {
+  display: grid;
+  grid-template-columns: 10px 1fr;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid rgba(105, 139, 177, .18);
+}
+
+.owner-admin .owner-admin__activity-item:first-child {
+  border-top: 0;
+}
+
+.owner-admin .owner-admin__activity-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 8px;
+  border-radius: 50%;
+  background: var(--a);
+  box-shadow: 0 0 10px rgba(34, 184, 255, .7);
+}
+
+.owner-admin .owner-admin__error-banner {
+  margin: 0 0 20px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--txt);
+}
+
+@media (max-width: 850px) {
+  .owner-admin .owner-admin__auth-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .owner-admin .owner-admin__metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .owner-admin .owner-admin__header,
+  .owner-admin .owner-admin__dashboard-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .owner-admin .owner-admin__access-label {
+    font-size: 9px;
+  }
+
+  .owner-admin .owner-admin__metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}

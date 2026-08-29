@@ -1091,7 +1091,10 @@ class Handler(BaseHTTPRequestHandler):
         self.audit(s,'legacy_state_sync','state','global',{'domains':list(squad.keys())+list(community.keys())})
         return json_response(self, {'ok':True,'authoritative':True})
     def static_or_404(self,path):
-        rel='index.html' if path=='/' else path.lstrip('/')
+        if path in ('/owner-admin', '/owner-admin/'):
+            rel='owner-admin.html'
+        else:
+            rel='index.html' if path=='/' else path.lstrip('/')
         file=(ROOT/rel).resolve()
         try:
             file.relative_to(ROOT.resolve())

@@ -511,3 +511,25 @@ class OwnerFoundationTests(unittest.TestCase):
             [entry["id"] for entry in response.json["recentAudit"][:2]],
             ["same-second-low", "same-second-high"],
         )
+
+    def test_owner_admin_private_route(self):
+        for path in ("/owner-admin", "/owner-admin/"):
+            response = self.backend.request("GET", path)
+
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith("text/html"))
+            self.assertIn(b'<meta name="robots" content="noindex,nofollow">', response.body)
+            self.assertIn(b'<div id="ownerRoot"', response.body)
+
+    def test_vercel_adapter_serves_owner_admin_aliases(self):
+        for path in ("/owner-admin", "/owner-admin/"):
+            response = self.adapter_request("GET", path)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.headers["content-type"].startswith("text/html"))
+            self.assertIn(b'<meta name="robots" content="noindex,nofollow">', response.body)
+
+    def test_public_entry_does_not_disclose_owner_admin_route(self):
+        public_entry = (server.ROOT / "index.html").read_text(encoding="utf-8")
+
+        self.assertNotIn("/owner-admin", public_entry)

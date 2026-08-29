@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Dark System | Owner Administration</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="owner-admin.css">
+</head>
+<body class="owner-admin">
+  <header class="owner-admin__header">
+    <div class="owner-admin__brand" aria-label="Dark System Owner Administration">
+      <span class="owner-admin__brand-mark" aria-hidden="true">DS</span>
+      <span>DARK SYSTEM<small>OWNER ADMINISTRATION</small></span>
+    </div>
+    <span class="owner-admin__access-label">PRIVATE WORKSPACE</span>
+  </header>
+  <main class="owner-admin__main">
+    <div id="ownerRoot" class="owner-admin__root" aria-busy="true">
+      <section class="owner-admin__loading-card" aria-labelledby="ownerStatus">
+        <span class="owner-admin__loading-mark" aria-hidden="true">DS</span>
+        <p id="ownerStatus" class="owner-admin__status" role="status" aria-live="polite">Loading secure Owner workspace…</p>
+      </section>
+    </div>
+  </main>
+  <script src="owner-admin.js" defer></script>
+</body>
+</html>
