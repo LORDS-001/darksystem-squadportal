@@ -503,6 +503,8 @@ class Handler(BaseHTTPRequestHandler):
             session = auth_from_cookie(self)
             if session and session.get('type') == 'owner':
                 return self.owner_logout(session)
+            if session and session.get('type') == 'squad':
+                return self.squad_logout(session)
             revoke_session(self)
             return json_response(self, {'ok':True}, 200, {'Set-Cookie':clear_session_cookie(self)})
         if path=='/api/community/register' and method=='POST': return self.community_register()
@@ -628,6 +630,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             logging.exception('Owner logout transaction failed.')
             return json_response(self, {'error':'Owner logout could not be completed.'},503)
+        return json_response(self, {'ok':True},200,{'Set-Cookie':clear_session_cookie(self)})
+
+    def squad_logout(self, session):
+        raw=request_header(self, 'Cookie')
+        cookies=SimpleCookie(); cookies.load(raw)
+        morsel=cookies.get(COOKIE_NAME)
+        try:
+            with LOCK, db() as c:
+                c.execute(
+                    'UPDATE squad_members SET status=? WHERE id=?',
+                    ('Offline', str(session['id'])),
+                )
+                if morsel:
+                    c.execute(
+                        'DELETE FROM sessions WHERE token=?',
+                        (session_token_hash(morsel.value),),
+                    )
+                c.commit()
+        except Exception:
+            logging.exception('Squad logout transaction failed.')
+            return json_response(self, {'error':'Squad logout could not be completed.'},503)
         return json_response(self, {'ok':True},200,{'Set-Cookie':clear_session_cookie(self)})
 
     def owner_overview(self):

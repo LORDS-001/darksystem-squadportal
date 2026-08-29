@@ -179,6 +179,7 @@ function renderOwnerLogin(notice = "", isError = false) {
     "Use your Owner credentials to open the secure system overview.",
   );
   const form = ownerElement("form", "owner-admin__form");
+  form.noValidate = true;
   const noticeElement = ownerElement("p", isError ? "owner-admin__error-banner" : "owner-admin__notice", notice);
   noticeElement.hidden = !notice;
   noticeElement.setAttribute("role", isError ? "alert" : "status");

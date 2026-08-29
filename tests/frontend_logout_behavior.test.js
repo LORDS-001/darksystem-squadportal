@@ -226,6 +226,12 @@ function deferred() {
   return { promise, resolve };
 }
 
+async function submitAsBrowser(form) {
+  if (!form.noValidate && !form.reportValidity()) return false;
+  await form.listeners.get("submit")({ preventDefault() {} });
+  return true;
+}
+
 function makeContext(scriptName, initialFetch) {
   const document = new TestDocument();
   let fetchImplementation = initialFetch;
@@ -328,6 +334,28 @@ test("Owner logout success clears the session and renders the unchanged login no
   assert.equal(status.textContent, "You have been logged out.");
 });
 
+test("Owner invalid login submission clears the password without making a request", async () => {
+  const harness = ownerHarness();
+  await new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext("renderOwnerLogin()", harness.context);
+  const form = harness.ownerRoot.querySelector("form");
+  const username = harness.document.getElementById("owner-login-username");
+  const password = harness.document.getElementById("owner-login-password");
+  username.value = "";
+  password.value = "typed-owner-password";
+  form.reportValidity = () => false;
+  let fetchCount = 0;
+  harness.setFetch(async () => {
+    fetchCount += 1;
+    return jsonResponse(true, {});
+  });
+
+  await submitAsBrowser(form);
+
+  assert.equal(password.value, "");
+  assert.equal(fetchCount, 0);
+});
+
 test("Owner overview renders separate backend and database health values safely", async () => {
   const harness = ownerHarness();
   await new Promise((resolve) => setImmediate(resolve));
@@ -388,6 +416,32 @@ test("Squad logout failure preserves authenticated state, presence, and visible 
   assert.equal(harness.document.getElementById("app").classList.contains("hidden"), false);
   assert.equal(harness.document.getElementById("public").classList.contains("hidden"), true);
   assert.match(harness.document.getElementById("modalBody").innerHTML, /LOGOUT FAILED/);
+});
+
+test("Squad logout success does not attempt state sync after session revocation", async () => {
+  const harness = await publicHarness();
+  harness.document.getElementById("app").classList.remove("hidden");
+  harness.document.getElementById("public").classList.add("hidden");
+  harness.document.querySelector("footer").classList.add("hidden");
+  vm.runInContext(`
+    current = { id: "squad-1", ign: "SquadTester", role: "Squad Member", profileComplete: true };
+    db.members.push({ id: "squad-1", ign: "SquadTester", status: "Online" });
+  `, harness.context);
+  const requestPaths = [];
+  harness.setFetch(async (requestPath) => {
+    requestPaths.push(requestPath);
+    return jsonResponse(true, { ok: true });
+  });
+
+  const result = await vm.runInContext("logout()", harness.context);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(result, true);
+  assert.deepEqual(requestPaths, ["/api/logout"]);
+  assert.equal(vm.runInContext('db.members.find((member) => member.id === "squad-1").status', harness.context), "Offline");
+  assert.equal(vm.runInContext("current", harness.context), null);
+  assert.equal(harness.document.getElementById("app").classList.contains("hidden"), true);
+  assert.equal(harness.document.getElementById("public").classList.contains("hidden"), false);
 });
 
 test("Owner concurrent logout calls share one successful revocation", async () => {

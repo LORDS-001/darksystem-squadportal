@@ -34,6 +34,29 @@ class _BarrierConnection:
         return self.connection.__exit__(exc_type, exc, traceback)
 
 
+class _FailingSquadSessionDeleteConnection:
+    """Fail after the Squad presence update to verify transaction rollback."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.lower().split())
+        if normalized.startswith("delete from sessions where token="):
+            raise RuntimeError("forced synthetic squad session delete failure")
+        return self.connection.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self.connection.__exit__(exc_type, exc, traceback)
+
+
 class OwnerSecurityTests(unittest.TestCase):
     def setUp(self):
         self.backend = BackendHarness()
@@ -463,6 +486,36 @@ class OwnerSecurityTests(unittest.TestCase):
             "GET", "/api/auth/me", cookie=cookie
         )
         self.assertTrue(still_authenticated.json["authenticated"])
+
+    def test_squad_logout_failure_rolls_back_presence_and_session_revocation(self):
+        self.complete_setup()
+        cookie = self.squad_cookie()
+        original_db = server.db
+
+        def failing_db():
+            return _FailingSquadSessionDeleteConnection(original_db())
+
+        with patch.object(server, "db", side_effect=failing_db):
+            with self.assertLogs(level=logging.ERROR) as captured:
+                response = self.backend.adapter_request(
+                    "POST", "/api/logout", cookie=cookie
+                )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("squad logout transaction failed", " ".join(captured.output).lower())
+        self.assertEqual(
+            json.loads(response.body),
+            {"error": "Squad logout could not be completed."},
+        )
+        still_authenticated = self.backend.request(
+            "GET", "/api/auth/me", cookie=cookie
+        )
+        self.assertTrue(still_authenticated.json["authenticated"])
+        with server.LOCK, server.db() as connection:
+            member = connection.execute(
+                "SELECT status FROM squad_members WHERE id=?", ("1",)
+            ).fetchone()
+        self.assertEqual(member["status"], "Online")
 
     def test_legacy_audit_failure_is_logged_instead_of_silently_swallowed(self):
         self.complete_setup()

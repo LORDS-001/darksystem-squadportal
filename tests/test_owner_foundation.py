@@ -205,6 +205,38 @@ class OwnerFoundationTests(unittest.TestCase):
         after_logout = self.backend.request("GET", "/api/auth/me", cookie=copied_cookie)
         self.assertEqual(after_logout.json, {"authenticated": False, "session": None})
 
+    def test_squad_logout_persists_offline_before_revoking_the_session(self):
+        self.complete_owner_setup()
+        login = self.backend.request(
+            "POST",
+            "/api/squad/login",
+            {
+                "ign": "DarkOwner",
+                "gameId": "123456",
+                "serverId": "1234",
+                "accessCode": "DS-OWNER",
+            },
+        )
+        self.assertEqual(login.status, 200)
+        self.assertEqual(login.json["member"]["status"], "Online")
+        cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            before = connection.execute(
+                "SELECT status FROM squad_members WHERE id=?", ("1",)
+            ).fetchone()
+        self.assertEqual(before["status"], "Online")
+
+        logout = self.backend.request("POST", "/api/logout", cookie=cookie)
+
+        self.assertEqual(logout.status, 200)
+        rejected = self.backend.request("GET", "/api/auth/me", cookie=cookie)
+        self.assertEqual(rejected.json, {"authenticated": False, "session": None})
+        with server.LOCK, server.db() as connection:
+            after = connection.execute(
+                "SELECT status FROM squad_members WHERE id=?", ("1",)
+            ).fetchone()
+        self.assertEqual(after["status"], "Offline")
+
     def test_owner_session_token_is_stored_only_as_a_hash(self):
         self.complete_owner_setup()
         cookie = self.owner_login_cookie()
