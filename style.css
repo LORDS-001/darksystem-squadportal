@@ -260,3 +260,6 @@ footer{border-top-color:rgba(105,139,177,.22)}
   .welcome-panel > div:first-child{max-width:100%}
   .welcome-panel .welcome-mark{display:none}
 }
+
+/* Preserve the original typography while keeping every button edge sharp. */
+button{border-radius:0!important}
