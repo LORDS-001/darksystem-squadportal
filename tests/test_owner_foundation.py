@@ -456,3 +456,58 @@ class OwnerFoundationTests(unittest.TestCase):
         for secret_value in ("audit-password", "audit-access-code", "audit-reset-code", "audit-token", "squad-secret"):
             self.assertNotIn(secret_value, serialized)
         self.assertNotIn(owner_cookie.split("=", 1)[1].lower(), serialized)
+
+    def test_owner_overview_omits_other_active_session_token_from_neutral_audit_fields(self):
+        self.complete_owner_setup()
+        requesting_cookie = self.owner_login_cookie()
+        other_cookie = self.owner_login_cookie()
+        other_token = other_cookie.split("=", 1)[1]
+        with server.LOCK, server.db() as connection:
+            connection.execute(
+                """INSERT INTO audit_log
+                   (id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    "other-session-audit",
+                    "owner",
+                    "other-owner",
+                    "Overall Owner",
+                    "safe_action",
+                    "safe_target",
+                    other_token,
+                    "2200-01-01T00:00:00Z",
+                    json.dumps({"credential": other_token, "message": "ordinary safe audit value"}),
+                ),
+            )
+            connection.commit()
+
+        response = self.backend.request("GET", "/api/owner/overview", cookie=requesting_cookie)
+
+        self.assertEqual(response.status, 200)
+        serialized = json.dumps(response.json).lower()
+        self.assertNotIn(other_token.lower(), serialized)
+        self.assertNotIn("credential", serialized)
+        self.assertNotIn("token", serialized)
+        self.assertEqual(response.json["recentAudit"][0]["details"], {"message": "ordinary safe audit value"})
+        self.assertNotIn("target_id", response.json["recentAudit"][0])
+
+    def test_owner_overview_orders_same_second_audit_rows_by_id_descending(self):
+        self.complete_owner_setup()
+        owner_cookie = self.owner_login_cookie()
+        with server.LOCK, server.db() as connection:
+            for audit_id in ("same-second-high", "same-second-low"):
+                connection.execute(
+                    """INSERT INTO audit_log
+                       (id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (audit_id, "owner", "owner-1", "Overall Owner", "ordering_test", "system", "", "2201-01-01T00:00:00Z", "{}"),
+                )
+            connection.commit()
+
+        response = self.backend.request("GET", "/api/owner/overview", cookie=owner_cookie)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            [entry["id"] for entry in response.json["recentAudit"][:2]],
+            ["same-second-low", "same-second-high"],
+        )

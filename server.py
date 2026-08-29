@@ -303,32 +303,32 @@ def clear_session(h):
 
 def overview_secret_key(key):
     normalized = ''.join(ch for ch in str(key).lower() if ch.isalnum())
-    return any(part in normalized for part in ('password', 'accesscode', 'resetcode', 'token'))
+    return any(part in normalized for part in ('password', 'accesscode', 'resetcode', 'token', 'credential', 'secret'))
 
 _OVERVIEW_OMIT = object()
 
-def sanitize_overview_value(value, secret_values):
+def sanitize_overview_value(value, secret_values, session_token_hashes):
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
             if overview_secret_key(key):
                 continue
-            safe_item = sanitize_overview_value(item, secret_values)
+            safe_item = sanitize_overview_value(item, secret_values, session_token_hashes)
             if safe_item is not _OVERVIEW_OMIT:
                 cleaned[str(key)] = safe_item
         return cleaned
     if isinstance(value, (list, tuple)):
-        return [item for value_item in value if (item := sanitize_overview_value(value_item, secret_values)) is not _OVERVIEW_OMIT]
-    if isinstance(value, str) and value in secret_values:
+        return [item for value_item in value if (item := sanitize_overview_value(value_item, secret_values, session_token_hashes)) is not _OVERVIEW_OMIT]
+    if isinstance(value, str) and (value in secret_values or session_token_hash(value) in session_token_hashes):
         return _OVERVIEW_OMIT
     return value
 
-def overview_details(raw_details, secret_values):
+def overview_details(raw_details, secret_values, session_token_hashes):
     try:
         details = json.loads(raw_details or '{}')
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
-    details = sanitize_overview_value(details, secret_values)
+    details = sanitize_overview_value(details, secret_values, session_token_hashes)
     return {} if details is _OVERVIEW_OMIT else details
 
 def overview_status(value):
@@ -498,16 +498,16 @@ class Handler(BaseHTTPRequestHandler):
                 ('SELECT password_hash FROM community_accounts', 'password_hash'),
                 ('SELECT reset_code FROM community_accounts WHERE reset_code IS NOT NULL', 'reset_code'),
                 ('SELECT password_hash FROM owner_accounts', 'password_hash'),
-                ('SELECT token FROM sessions', 'token'),
             ):
                 for row in c.execute(query).fetchall():
                     if row[column]: secret_values.add(str(row[column]))
+            session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
             cookies=SimpleCookie(); cookies.load(request_header(self, 'Cookie'))
             if cookies.get(COOKIE_NAME): secret_values.add(cookies[COOKIE_NAME].value)
             audit=[]
-            for row in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC LIMIT 10').fetchall():
-                item=sanitize_overview_value(dict(row), secret_values)
-                item['details']=overview_details(item.get('details'), secret_values)
+            for row in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC, id DESC LIMIT 10').fetchall():
+                item=sanitize_overview_value(dict(row), secret_values, session_token_hashes)
+                item['details']=overview_details(item.get('details'), secret_values, session_token_hashes)
                 audit.append(item)
             completed=lambda tournament: bool(tournament.get('completed')) or overview_status(tournament.get('status'))=='completed'
             counts={
