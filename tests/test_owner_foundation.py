@@ -288,11 +288,30 @@ class OwnerFoundationTests(unittest.TestCase):
         self.assertIn("; Secure", login.headers["set-cookie"])
 
         copied_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        me = self.adapter_request(
+            "GET", "/api/auth/me", cookie=copied_cookie, forwarded_proto="https"
+        )
+        self.assertEqual(me.status_code, 200)
+        self.assertTrue(json.loads(me.body)["authenticated"])
+
         logout = self.adapter_request(
             "POST", "/api/logout", cookie=copied_cookie, forwarded_proto="https"
         )
         self.assertEqual(logout.status_code, 200)
         self.assertIn("; Secure", logout.headers["set-cookie"])
+
+        after_logout = self.adapter_request(
+            "GET", "/api/auth/me", cookie=copied_cookie, forwarded_proto="https"
+        )
+        self.assertEqual(
+            json.loads(after_logout.body), {"authenticated": False, "session": None}
+        )
+        token_hash = hashlib.sha256(copied_cookie.split("=", 1)[1].encode()).hexdigest()
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT token FROM sessions WHERE token=?", (token_hash,)
+            ).fetchone()
+        self.assertIsNone(row)
 
         plain_http_login = self.adapter_request(
             "POST",

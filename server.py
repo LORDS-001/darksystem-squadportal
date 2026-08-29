@@ -230,8 +230,16 @@ def bootstrap(session):
         squad = {'members':members,'announcements':state_get(c,'announcements',[]),'reports':state_get(c,'reports',[]),'complaints':state_get(c,'complaints',[]),'events':state_get(c,'events',[]),'reportConfig':state_get(c,'reportConfig',{}) ,'notifications':[]}
         return {'squad':squad,'community':community}
 
+def request_header(handler, name, default=''):
+    value = handler.headers.get(name)
+    if value is not None: return value
+    wanted = name.lower()
+    for key, value in handler.headers.items():
+        if key.lower() == wanted: return value
+    return default
+
 def auth_from_cookie(handler):
-    raw = handler.headers.get('Cookie','')
+    raw = request_header(handler, 'Cookie')
     c = SimpleCookie(); c.load(raw)
     morsel = c.get(COOKIE_NAME)
     if not morsel: return None
@@ -248,7 +256,7 @@ def auth_from_cookie(handler):
     return {'type': row['type'], 'id': str(row['user_id']), 'role': row['role'], 'exp': int(row['expires'])}
 
 def revoke_session(handler):
-    raw = handler.headers.get('Cookie','')
+    raw = request_header(handler, 'Cookie')
     c = SimpleCookie(); c.load(raw)
     morsel = c.get(COOKIE_NAME)
     if not morsel: return
@@ -264,7 +272,7 @@ def json_response(h, data, status=200, headers=None):
     h.end_headers(); h.wfile.write(raw)
 
 def read_json(h):
-    n = int(h.headers.get('Content-Length','0') or 0)
+    n = int(request_header(h, 'Content-Length', '0') or 0)
     raw = h.rfile.read(n) if n else b'{}'
     try: return json.loads(raw.decode() or '{}')
     except Exception: return {}
@@ -276,7 +284,7 @@ def require_auth(h, types=None):
     return s
 
 def request_is_https(h):
-    forwarded_proto = h.headers.get('X-Forwarded-Proto') or h.headers.get('x-forwarded-proto', '')
+    forwarded_proto = request_header(h, 'X-Forwarded-Proto')
     return forwarded_proto.split(',', 1)[0].strip().lower() == 'https' or h.server.server_address[1] == 443
 
 def session_cookie(h, token):
@@ -294,7 +302,7 @@ def clear_session(h):
     h.send_header('Set-Cookie', clear_session_cookie(h))
 
 def request_ip(h):
-    return (h.headers.get('X-Forwarded-For','').split(',')[0].strip() or h.client_address[0])
+    return (request_header(h, 'X-Forwarded-For').split(',')[0].strip() or h.client_address[0])
 
 def rate_limited(h, bucket):
     now=time.time(); key=(request_ip(h),bucket)
@@ -304,9 +312,9 @@ def rate_limited(h, bucket):
         return len(hits) > RATE_LIMIT_MAX
 
 def valid_origin(h):
-    origin=h.headers.get('Origin')
+    origin=request_header(h, 'Origin')
     if not origin: return True
-    host=h.headers.get('Host','')
+    host=request_header(h, 'Host')
     return origin in (f'http://{host}', f'https://{host}')
 
 def smtp_send(to, subject, text):
