@@ -117,10 +117,20 @@ def unsign(value):
     except Exception:
         return None
 
-def make_session(user_type, user_id, role='Community Member'):
-    payload = {'type': user_type, 'id': str(user_id), 'role': role, 'exp': int(time.time()) + SESSION_TTL}
-    raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode().rstrip('=')
-    return sign(raw)
+def session_token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def create_session(user_type, user_id, role='Community Member'):
+    token = secrets.token_urlsafe(32)
+    expires = int(time.time()) + SESSION_TTL
+    with LOCK, db() as c:
+        c.execute(
+            'INSERT INTO sessions(token,type,user_id,role,expires) VALUES(?,?,?,?,?)',
+            (session_token_hash(token), user_type, str(user_id), role, expires),
+        )
+        c.execute('DELETE FROM sessions WHERE expires<?', (int(time.time()),))
+        c.commit()
+    return token
 
 def init_db():
     with LOCK, db() as c:
@@ -225,7 +235,26 @@ def auth_from_cookie(handler):
     c = SimpleCookie(); c.load(raw)
     morsel = c.get(COOKIE_NAME)
     if not morsel: return None
-    return unsign(morsel.value)
+    token_hash = session_token_hash(morsel.value)
+    with LOCK, db() as connection:
+        row = connection.execute(
+            'SELECT type,user_id,role,expires FROM sessions WHERE token=?', (token_hash,)
+        ).fetchone()
+        if not row: return None
+        if int(row['expires']) < int(time.time()):
+            connection.execute('DELETE FROM sessions WHERE token=?', (token_hash,))
+            connection.commit()
+            return None
+    return {'type': row['type'], 'id': str(row['user_id']), 'role': row['role'], 'exp': int(row['expires'])}
+
+def revoke_session(handler):
+    raw = handler.headers.get('Cookie','')
+    c = SimpleCookie(); c.load(raw)
+    morsel = c.get(COOKIE_NAME)
+    if not morsel: return
+    with LOCK, db() as connection:
+        connection.execute('DELETE FROM sessions WHERE token=?', (session_token_hash(morsel.value),))
+        connection.commit()
 
 def json_response(h, data, status=200, headers=None):
     raw = json.dumps(data, ensure_ascii=False).encode()
@@ -308,6 +337,10 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/roles' and method=='GET': return self.roles_info()
         if path=='/api/squad/role' and method=='POST': return self.squad_role_change()
         if path=='/api/logout' and method=='POST':
+            session = auth_from_cookie(self)
+            revoke_session(self)
+            if session and session.get('type') == 'owner':
+                self.audit(session, 'owner_logout', 'owner', session['id'])
             secure = '; Secure' if self.headers.get('X-Forwarded-Proto','').lower() == 'https' or self.server.server_address[1] == 443 else ''
             return json_response(self, {'ok':True}, 200, {'Set-Cookie':f'{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}'})
         if path=='/api/community/register' and method=='POST': return self.community_register()
@@ -385,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
         d=read_json(self); username=str(d.get('username','')).strip().lower(); password=str(d.get('password',''))
         with LOCK, db() as c: row=c.execute('SELECT * FROM owner_accounts WHERE lower(username)=?',(username,)).fetchone()
         if not row or not verify_password(password,row['password_hash']): return json_response(self, {'error':'The Owner username or password is incorrect.'},401)
-        token=make_session('owner',row['id'],'Overall Owner')
+        token=create_session('owner',row['id'],'Overall Owner')
         self.audit({'type':'owner','id':row['id'],'role':'Overall Owner'},'owner_login','owner',row['id'])
         return json_response(self, {'ok':True,'role':'Overall Owner'},200,{'Set-Cookie':f'{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}'})
 
@@ -441,13 +474,13 @@ class Handler(BaseHTTPRequestHandler):
             aid=str(int(time.time()*1000)); created=now_iso()
             c.execute('INSERT INTO community_accounts(id,squad_member_id,ign,game_id,server_id,email,phone,password_hash,role,lane,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(aid,d.get('squadMemberId'),str(d.get('ign','')).strip(),str(d.get('gameId','')).strip(),str(d.get('serverId','')).strip(),email,str(d.get('phone','')).strip(),hash_password(password),d.get('role','Community Member'),d.get('lane',''),created))
             c.commit(); row=c.execute('SELECT * FROM community_accounts WHERE id=?',(aid,)).fetchone()
-        token=make_session('community',aid,row['role'] or 'Community Member');
+        token=create_session('community',aid,row['role'] or 'Community Member');
         return json_response(self, {'account':public_account(row)},200,{'Set-Cookie':f'{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}'})
     def community_login(self):
         d=read_json(self); email=str(d.get('email','')).strip().lower(); password=str(d.get('password',''))
         with LOCK, db() as c: row=c.execute('SELECT * FROM community_accounts WHERE lower(email)=?',(email,)).fetchone()
         if not row or not verify_password(password,row['password_hash']): return json_response(self, {'error':'The email or password is incorrect.'},401)
-        token=make_session('community',row['id'],row['role'] or 'Community Member')
+        token=create_session('community',row['id'],row['role'] or 'Community Member')
         return json_response(self, {'account':public_account(row)},200,{'Set-Cookie':f'{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}'})
     def community_forgot(self):
         d=read_json(self); email=str(d.get('email','')).strip().lower()
@@ -545,7 +578,7 @@ class Handler(BaseHTTPRequestHandler):
         stamp=now_iso()
         with LOCK, db() as c:
             c.execute('UPDATE squad_members SET status=?,last_login=? WHERE id=?',('Online',stamp,row['id'])); c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(row['id'],)).fetchone()
-        token=make_session('squad',row['id'],row['role'])
+        token=create_session('squad',row['id'],row['role'])
         return json_response(self, {'member':public_member(row,True)},200,{'Set-Cookie':f'{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}'})
     def squad_profile(self):
         s=require_auth(self,['squad']);
