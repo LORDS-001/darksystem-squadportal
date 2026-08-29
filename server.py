@@ -22,7 +22,7 @@ def load_dotenv_file():
 load_dotenv_file()
 DB_PATH = ROOT / 'dark_system.sqlite3'
 DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
-PORT = int(os.getenv('PORT', '8080'))
+PORT = int(os.getenv('PORT') or '8080')
 HOST = os.getenv('HOST', '0.0.0.0')
 SESSION_SECRET = os.getenv('DARK_SYSTEM_SESSION_SECRET', 'change-this-in-production')
 DEMO_DATA = os.getenv('DARK_SYSTEM_DEMO_DATA', '0') == '1'
@@ -271,7 +271,7 @@ def valid_origin(h):
     return origin in (f'http://{host}', f'https://{host}')
 
 def smtp_send(to, subject, text):
-    host=os.getenv('SMTP_HOST'); port=int(os.getenv('SMTP_PORT','587')); user=os.getenv('SMTP_USER'); password=os.getenv('SMTP_PASSWORD'); sender=os.getenv('SMTP_FROM',user or '')
+    host=os.getenv('SMTP_HOST'); port=int(os.getenv('SMTP_PORT') or '587'); user=os.getenv('SMTP_USER'); password=os.getenv('SMTP_PASSWORD'); sender=os.getenv('SMTP_FROM',user or '')
     if not host or not sender: return False
     msg=EmailMessage(); msg['From']=sender; msg['To']=to; msg['Subject']=subject; msg.set_content(text)
     with smtplib.SMTP(host,port,timeout=15) as s:
