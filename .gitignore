@@ -1,4 +1,60 @@
+# Isolated development workspaces and agent scratch files
 .worktrees/
 .superpowers/
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+
+# Vercel local project metadata
+.vercel/
+
+# Python caches, virtual environments, and tooling
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local databases and runtime state
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Logs and temporary output
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# JavaScript dependency/build artifacts
+node_modules/
+coverage/
+dist/
+build/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
