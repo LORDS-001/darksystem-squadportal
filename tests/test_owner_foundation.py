@@ -1,6 +1,7 @@
 import hashlib
 import time
 import unittest
+from unittest.mock import patch
 
 import server
 from tests.http_harness import BackendHarness
@@ -106,6 +107,48 @@ class OwnerFoundationTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(row)
 
+    def test_session_expiring_at_the_current_second_is_rejected_and_deleted(self):
+        token = "exact-expiry-session-token"
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        current_second = 1_700_000_000
+        with server.LOCK, server.db() as connection:
+            connection.execute(
+                "INSERT INTO sessions(token,type,user_id,role,expires) VALUES(?,?,?,?,?)",
+                (token_hash, "owner", "expired-owner", "Overall Owner", current_second),
+            )
+            connection.commit()
+
+        with patch("server.time.time", return_value=current_second):
+            response = self.backend.request(
+                "GET", "/api/auth/me", cookie=f"dark_system_session={token}"
+            )
+
+        self.assertEqual(response.json, {"authenticated": False, "session": None})
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT token FROM sessions WHERE token=?", (token_hash,)
+            ).fetchone()
+        self.assertIsNone(row)
+
+    def test_create_session_removes_sessions_expiring_at_the_current_second(self):
+        token_hash = hashlib.sha256(b"cleanup-boundary-token").hexdigest()
+        current_second = 1_700_000_000
+        with server.LOCK, server.db() as connection:
+            connection.execute(
+                "INSERT INTO sessions(token,type,user_id,role,expires) VALUES(?,?,?,?,?)",
+                (token_hash, "owner", "expired-owner", "Overall Owner", current_second),
+            )
+            connection.commit()
+
+        with patch("server.time.time", return_value=current_second):
+            server.create_session("owner", "new-owner", "Overall Owner")
+
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT token FROM sessions WHERE token=?", (token_hash,)
+            ).fetchone()
+        self.assertIsNone(row)
+
     def test_owner_logout_is_audited_without_session_secrets(self):
         self.complete_owner_setup()
         cookie = self.owner_login_cookie()
@@ -164,3 +207,39 @@ class OwnerFoundationTests(unittest.TestCase):
                 ).fetchone()
             self.assertIsNone(raw_row)
             self.assertIsNotNone(hashed_row)
+
+    def test_https_session_issuers_set_secure_cookie(self):
+        community_registration = self.backend.request(
+            "POST",
+            "/api/community/register",
+            {
+                "email": "secure-member@example.test",
+                "password": "member-password-123",
+                "ign": "SecureCommunityPlayer",
+                "gameId": "765432",
+                "serverId": "2345",
+            },
+        )
+        community_login = self.backend.request(
+            "POST",
+            "/api/community/login",
+            {"email": "secure-member@example.test", "password": "member-password-123"},
+        )
+        self.complete_owner_setup()
+        owner_login = self.backend.request(
+            "POST",
+            "/api/owner/login",
+            {"username": "overall-owner", "password": "owner-password-123"},
+        )
+        squad_login = self.backend.request(
+            "POST",
+            "/api/squad/login",
+            {"ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER"},
+        )
+
+        for response in (community_registration, community_login, owner_login, squad_login):
+            self.assertEqual(response.status, 200)
+            self.assertIn("; HttpOnly", response.headers["Set-Cookie"])
+            self.assertIn("; SameSite=Strict", response.headers["Set-Cookie"])
+            self.assertIn(f"; Max-Age={server.SESSION_TTL}", response.headers["Set-Cookie"])
+            self.assertIn("; Secure", response.headers["Set-Cookie"])
