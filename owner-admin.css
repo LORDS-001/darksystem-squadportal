@@ -187,6 +187,122 @@
   color: var(--txt);
 }
 
+.owner-admin .owner-admin__form {
+  display: grid;
+  gap: 16px;
+}
+
+.owner-admin .owner-admin__form-heading,
+.owner-admin .owner-admin__section-title {
+  margin: 10px 0 0;
+  color: var(--txt);
+  font: 700 17px Orbitron, sans-serif;
+}
+
+.owner-admin .owner-admin__field {
+  display: grid;
+  gap: 7px;
+}
+
+.owner-admin .owner-admin__field-label {
+  color: var(--txt);
+  font: 700 13px Rajdhani, sans-serif;
+  letter-spacing: .5px;
+}
+
+.owner-admin .owner-admin__input {
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(3, 8, 16, .72);
+  color: var(--txt);
+}
+
+.owner-admin .owner-admin__input:focus-visible,
+.owner-admin .owner-admin__button:focus-visible {
+  outline: 2px solid var(--a2);
+  outline-offset: 3px;
+}
+
+.owner-admin .owner-admin__field-hint,
+.owner-admin .owner-admin__empty,
+.owner-admin .owner-admin__activity-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.owner-admin .owner-admin__notice {
+  margin: 0;
+  color: var(--a2);
+}
+
+.owner-admin .owner-admin__button {
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid var(--a);
+  border-radius: 10px;
+  background: var(--a);
+  color: #03101a;
+  cursor: pointer;
+  font: 800 12px Orbitron, sans-serif;
+}
+
+.owner-admin .owner-admin__button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.owner-admin .owner-admin__button--secondary {
+  background: transparent;
+  color: var(--a2);
+}
+
+.owner-admin .owner-admin__dashboard,
+.owner-admin .owner-admin__metric-group,
+.owner-admin .owner-admin__activity-section {
+  display: grid;
+  gap: 16px;
+}
+
+.owner-admin .owner-admin__metric-group,
+.owner-admin .owner-admin__activity-section {
+  margin-top: 28px;
+}
+
+.owner-admin .owner-admin__health-card {
+  padding: 18px 20px;
+  border: 1px solid rgba(70, 217, 163, .42);
+  border-radius: 14px;
+  background: rgba(70, 217, 163, .08);
+}
+
+.owner-admin .owner-admin__health-indicator {
+  margin: 10px 0 0;
+  color: #78e9be;
+  font-weight: 700;
+}
+
+.owner-admin .owner-admin__activity-detail {
+  display: grid;
+  grid-template-columns: 10px 1fr;
+  gap: 8px 12px;
+}
+
+.owner-admin .owner-admin__activity-dot {
+  grid-row: span 2;
+}
+
+.owner-admin .owner-admin__activity-action {
+  color: var(--txt);
+}
+
+.owner-admin .owner-admin__entry-error {
+  max-width: 640px;
+}
+
 @media (max-width: 850px) {
   .owner-admin .owner-admin__auth-shell {
     grid-template-columns: 1fr;
