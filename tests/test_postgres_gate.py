@@ -5,13 +5,29 @@ from tests import http_harness
 
 
 class PostgreSQLGateSafetyTests(unittest.TestCase):
-    def resolver(self):
+    CONFIRMATION = "unit-test-disposable-confirmation-0123456789"
+
+    def raw_resolver(self):
         resolver = getattr(http_harness, "resolve_test_database_url", None)
         self.assertIsNotNone(
             resolver,
             "the PostgreSQL release gate must provide an explicit environment guard",
         )
         return resolver
+
+    def resolver(self):
+        resolver = self.raw_resolver()
+
+        def confirmed(environment):
+            source = dict(environment)
+            if source.get("TEST_DATABASE_URL"):
+                source.setdefault(
+                    "TEST_DATABASE_CONFIRMATION",
+                    self.CONFIRMATION,
+                )
+            return resolver(source)
+
+        return confirmed
 
     def test_database_url_alone_never_enables_the_postgresql_gate(self):
         resolved = self.resolver()(
@@ -20,7 +36,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
 
         self.assertIsNone(resolved)
 
-    def test_test_database_url_is_the_only_required_opt_in(self):
+    def test_test_database_url_and_confirmation_are_the_only_opt_in(self):
         test_url = "postgresql://gate-user@test.example/postgres"
 
         resolved = self.resolver()({"TEST_DATABASE_URL": test_url})
@@ -363,6 +379,57 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
                         }
                     )
                 self.assertNotIn("test-secret", str(captured.exception))
+
+    def test_gate_requires_a_strong_explicit_database_confirmation(self):
+        test_url = "postgresql://gate-user@test.example:5432/postgres"
+
+        for environment in (
+            {"TEST_DATABASE_URL": test_url},
+            {
+                "TEST_DATABASE_URL": test_url,
+                "TEST_DATABASE_CONFIRMATION": "too-short",
+            },
+            {
+                "TEST_DATABASE_URL": test_url,
+                "TEST_DATABASE_CONFIRMATION": "contains spaces and is long enough to be unsafe",
+            },
+            {
+                "TEST_DATABASE_URL": test_url,
+                "TEST_DATABASE_CONFIRMATION": f" {self.CONFIRMATION} ",
+            },
+        ):
+            with self.subTest(confirmation=environment.get("TEST_DATABASE_CONFIRMATION")):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.raw_resolver()(environment)
+                self.assertNotIn("too-short", str(captured.exception))
+                self.assertNotIn("contains spaces", str(captured.exception))
+
+        self.assertIsNone(
+            self.raw_resolver()(
+                {"TEST_DATABASE_CONFIRMATION": self.CONFIRMATION}
+            )
+        )
+
+    def test_gate_rejects_ipv4_mapped_ipv6_in_both_comparison_directions(self):
+        routes = (
+            (
+                "postgresql://gate-user@[::ffff:127.0.0.1]:5432/postgres",
+                "postgresql://production-user@127.0.0.1:5432/postgres",
+            ),
+            (
+                "postgresql://gate-user@127.0.0.1:5432/postgres",
+                "postgresql://production-user@[::ffff:7f00:1]:5432/postgres",
+            ),
+        )
+        for test_url, production_url in routes:
+            with self.subTest(test_host=urlsplit(test_url).hostname):
+                with self.assertRaises(RuntimeError):
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": test_url,
+                            "DATABASE_URL": production_url,
+                        }
+                    )
 
 
 if __name__ == "__main__":

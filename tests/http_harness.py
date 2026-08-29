@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import ipaddress
 import io
 import json
@@ -6,7 +7,7 @@ import os
 import re
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
@@ -47,6 +48,14 @@ _SUPABASE_PROJECT_REF = re.compile(r"^[a-z0-9]{20}$")
 _SUPABASE_DIRECT_HOST = re.compile(
     r"^db\.([a-z0-9]{20})\.supabase\.co$"
 )
+_DATABASE_CONFIRMATION = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+_DATABASE_MARKER_NAME = "dark-system-owner-release-gate-v1"
+_DATABASE_MARKER_QUERY = (
+    "SELECT confirmation "
+    "FROM public.dark_system_disposable_test_marker "
+    "WHERE marker_name=%s"
+)
+_ENABLE_DATABASE_WRITES_QUERY = "SET default_transaction_read_only=off"
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,12 @@ class _PostgresTarget:
     database: str
     username: str
     supabase_project: str
+
+
+@dataclass(frozen=True)
+class PostgreSQLTestGate:
+    database_url: str = field(repr=False)
+    confirmation: str = field(repr=False)
 
 
 def _psycopg_conninfo(database_url):
@@ -87,6 +102,8 @@ def _canonical_postgres_host(host):
             return None
         return decoded
     if getattr(address, "scope_id", None):
+        return None
+    if address.version == 6 and address.ipv4_mapped is not None:
         return None
     return address.compressed
 
@@ -213,8 +230,64 @@ def _explicit_postgres_url(database_url, target):
     )
 
 
-def resolve_test_database_url(environment=None):
-    """Return the explicit disposable PostgreSQL URL without falling back."""
+def _valid_database_confirmation(confirmation):
+    return bool(
+        isinstance(confirmation, str)
+        and _DATABASE_CONFIRMATION.fullmatch(confirmation)
+    )
+
+
+def connect_validated_test_database(
+    psycopg_module,
+    database_url,
+    confirmation,
+    *,
+    autocommit=False,
+    **connect_options,
+):
+    """Open one target connection only after its read-only marker matches."""
+    if not _valid_database_confirmation(confirmation):
+        raise RuntimeError("Disposable PostgreSQL marker validation failed.")
+    connection = None
+    try:
+        connection = psycopg_module.connect(
+            database_url,
+            autocommit=False,
+            options="-c default_transaction_read_only=on",
+            **connect_options,
+        )
+        row = connection.execute(
+            _DATABASE_MARKER_QUERY,
+            (_DATABASE_MARKER_NAME,),
+        ).fetchone()
+        if isinstance(row, dict):
+            stored_confirmation = row.get("confirmation")
+        elif row:
+            stored_confirmation = row[0]
+        else:
+            stored_confirmation = None
+        if not (
+            isinstance(stored_confirmation, str)
+            and hmac.compare_digest(stored_confirmation, confirmation)
+        ):
+            raise RuntimeError("Disposable PostgreSQL marker validation failed.")
+        connection.rollback()
+        connection.read_only = False
+        connection.autocommit = True
+        connection.execute(_ENABLE_DATABASE_WRITES_QUERY)
+        connection.autocommit = autocommit
+        return connection
+    except Exception:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise RuntimeError("Disposable PostgreSQL marker validation failed.") from None
+
+
+def resolve_test_database_gate(environment=None):
+    """Return the explicit disposable PostgreSQL gate without falling back."""
     source = os.environ if environment is None else environment
     test_database_url = str(source.get("TEST_DATABASE_URL", "")).strip()
     if not test_database_url:
@@ -222,6 +295,11 @@ def resolve_test_database_url(environment=None):
     if any(variable in source for variable in _TARGET_LIBPQ_ENVIRONMENT):
         raise RuntimeError(
             "Target-affecting libpq environment variables must be unset for the PostgreSQL test gate."
+        )
+    confirmation = source.get("TEST_DATABASE_CONFIRMATION", "")
+    if not _valid_database_confirmation(confirmation):
+        raise RuntimeError(
+            "TEST_DATABASE_CONFIRMATION is required for the disposable PostgreSQL test gate."
         )
     test_target = _postgres_database_target(test_database_url, require_user=True)
     if test_target is None:
@@ -253,7 +331,16 @@ def resolve_test_database_url(environment=None):
         raise RuntimeError(
             "TEST_DATABASE_URL cannot be converted to an explicit safe PostgreSQL target."
         )
-    return explicit_test_database_url
+    return PostgreSQLTestGate(
+        database_url=explicit_test_database_url,
+        confirmation=confirmation,
+    )
+
+
+def resolve_test_database_url(environment=None):
+    """Return the explicit disposable PostgreSQL URL without falling back."""
+    gate = resolve_test_database_gate(environment)
+    return None if gate is None else gate.database_url
 
 
 @dataclass

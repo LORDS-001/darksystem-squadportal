@@ -69,18 +69,35 @@ python -m compileall -q server.py api tests
 
 The PostgreSQL Owner gate is opt-in and never reads `DATABASE_URL` as a fallback. It creates a randomly named schema, runs the Owner lifecycle/concurrent setup/session revocation/audit/durable-throttle checks, and drops that schema in cleanup. The concurrency check removes the in-process lock only inside the isolated test, synchronizes two independent database transactions immediately before the conditional setup claim, and verifies that a deliberately non-atomic test mutation would allow two winners. Production locking is not changed. Use a dedicated disposable database, not merely a spare schema in a Production project:
 
+Before the first run, manually create this marker **only after independently verifying that the connected database is disposable**. Generate a unique value with `python -c "import secrets; print(secrets.token_urlsafe(32))"`; do not reuse a Production secret or commit the generated value. In a SQL client connected directly to the disposable database, replace the placeholder with that generated value and run once:
+
+```sql
+CREATE TABLE public.dark_system_disposable_test_marker (
+  marker_name text PRIMARY KEY,
+  confirmation text NOT NULL CHECK (length(confirmation) >= 32)
+);
+INSERT INTO public.dark_system_disposable_test_marker(marker_name, confirmation)
+VALUES ('dark-system-owner-release-gate-v1', '<generated-random-confirmation>');
+```
+
+The automated gate never creates, updates, or drops this public marker. It opens every database connection with `default_transaction_read_only=on`, performs only a parameterized marker `SELECT`, compares the returned value in constant time, and enables writes on that same connection only after an exact match. Thus aliases, CNAMEs, DNS rebinding, and static identity gaps cannot authorize mutation unless the resolved database already carries the out-of-band disposable marker.
+
 ```powershell
 'PGHOST','PGHOSTADDR','PGPORT','PGDATABASE','PGSERVICE','PGSERVICEFILE','PGTARGETSESSIONATTRS','PGLOADBALANCEHOSTS','PGSYSCONFDIR','PGUSER' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
 $env:TEST_DATABASE_URL = '<disposable Supabase/PostgreSQL connection URL>'
+$env:TEST_DATABASE_CONFIRMATION = '<same-generated-random-confirmation>'
 python -m unittest tests.test_owner_postgres_integration -v
 Remove-Item Env:TEST_DATABASE_URL
+Remove-Item Env:TEST_DATABASE_CONFIRMATION
 ```
 
-`TEST_DATABASE_URL` is the only opt-in variable and must contain an explicit database user. Before running, unset `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE`, `PGSERVICE`, `PGSERVICEFILE`, `PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGSYSCONFDIR`, and `PGUSER`; the guard fails closed if any is present, including with an empty value. It uses psycopg conninfo normalization when that package is available and otherwise accepts only a strict, single-host PostgreSQL URI it can compare conservatively. Host names must be canonical IP literals or strict DNS names: decoded authority delimiters and legacy numeric IPv4 aliases such as `127.1`, integer, octal, hex, or mixed forms are rejected. It also refuses keyword DSNs, service/multi-host targets, URI query options that override authority or route host/port/database selection, an unparseable `DATABASE_URL`, and a test target resolving to the same host, port, and database name as `DATABASE_URL`.
+`TEST_DATABASE_URL` and `TEST_DATABASE_CONFIRMATION` are the only opt-in variables; both are required, the URL must contain an explicit database user, and the confirmation must be 32–128 URL-safe characters. `DATABASE_URL` alone never connects. Before running, unset `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE`, `PGSERVICE`, `PGSERVICEFILE`, `PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGSYSCONFDIR`, and `PGUSER`; the guard fails closed if any is present, including with an empty value. It uses psycopg conninfo normalization when that package is available and otherwise accepts only a strict, single-host PostgreSQL URI it can compare conservatively. Host names must be canonical IP literals or strict DNS names: decoded authority delimiters, IPv4-mapped IPv6, and legacy numeric IPv4 aliases such as `127.1`, integer, octal, hex, or mixed forms are rejected. It also refuses keyword DSNs, service/multi-host targets, URI query options that override authority or route host/port/database selection, an unparseable `DATABASE_URL`, and a test target resolving to the same host, port, and database name as `DATABASE_URL`.
 
 For hosted Supabase, direct and dedicated-pooler hosts use `db.<20-character-project-ref>.supabase.co`, while shared pooler users use `<database-user>.<20-character-project-ref>` on `*.pooler.supabase.com`. The guard derives that project reference and treats direct, dedicated, session-pooler, and transaction-pooler URLs for the same project/database as one target despite different hosts or ports. Distinct project references remain valid on the same regional pooler. Ambiguous Supabase forms fail closed. This matches Supabase's [current connection-string formats](https://supabase.com/docs/guides/database/connecting-to-postgres).
 
 The returned connection URI has explicit normalized host, port, database, and user components. Each authority component is re-encoded separately, IPv6 is bracketed, and encoded passwords plus allowed options such as `sslmode` are preserved without logging. All guard failures are generic and do not echo either URL, password, project reference, or ambient value. See PostgreSQL's [libpq environment-variable reference](https://www.postgresql.org/docs/current/libpq-envars.html) for the destination and routing defaults covered by the guard. Do not put connection URLs in source files, shell history shared with others, screenshots, tickets, or test output. With no `TEST_DATABASE_URL`, the integration class must report one safe skip.
+
+Rotate the marker by generating a new value, manually updating only the disposable database row, and replacing `TEST_DATABASE_CONFIRMATION`; the old value then stops authorizing the gate. When retiring the disposable database, remove the row or drop `public.dark_system_disposable_test_marker` manually before deleting the database. Never perform marker creation, rotation, or removal through this test command, and never create the marker in Production.
 
 ### Native Vercel routing smoke
 

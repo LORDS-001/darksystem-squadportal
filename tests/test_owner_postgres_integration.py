@@ -7,7 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import server
-from tests.http_harness import BackendHarness, resolve_test_database_url
+from tests.http_harness import (
+    BackendHarness,
+    connect_validated_test_database,
+    resolve_test_database_gate,
+)
 
 
 class _UnlockedContext:
@@ -73,10 +77,11 @@ class _ClaimBarrierConnection:
 class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.test_database_url = resolve_test_database_url()
-        if cls.test_database_url is None:
+        cls.test_database_gate = resolve_test_database_gate()
+        if cls.test_database_gate is None:
             raise unittest.SkipTest(
-                "TEST_DATABASE_URL is not set; disposable PostgreSQL Owner gate skipped."
+                "TEST_DATABASE_URL and TEST_DATABASE_CONFIRMATION are not set; "
+                "disposable PostgreSQL Owner gate skipped."
             )
 
     @staticmethod
@@ -114,13 +119,19 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
         claim_threads = set()
         claim_threads_lock = threading.Lock()
 
-        def isolated_db():
-            connection = psycopg.connect(
-                self.test_database_url,
+        def validated_connection(autocommit=False):
+            return connect_validated_test_database(
+                psycopg,
+                self.test_database_gate.database_url,
+                self.test_database_gate.confirmation,
+                autocommit=autocommit,
                 row_factory=dict_row,
                 connect_timeout=10,
                 prepare_threshold=None,
             )
+
+        def isolated_db():
+            connection = validated_connection()
             connection.execute(
                 sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
             )
@@ -135,7 +146,7 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                 non_atomic_claim,
             )
 
-        with psycopg.connect(self.test_database_url, autocommit=True) as admin:
+        with validated_connection(autocommit=True) as admin:
             admin.execute(
                 sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
             )
@@ -305,7 +316,7 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     "the synchronized harness must expose a deliberately non-atomic setup claim",
                 )
         finally:
-            with psycopg.connect(self.test_database_url, autocommit=True) as admin:
+            with validated_connection(autocommit=True) as admin:
                 admin.execute(
                     sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
                         sql.Identifier(schema_name)
