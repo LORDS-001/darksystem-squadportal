@@ -2,6 +2,7 @@ import hashlib
 import json
 import time
 import unittest
+from html.parser import HTMLParser
 from unittest.mock import patch
 
 from fastapi import Request
@@ -9,6 +10,20 @@ from fastapi import Request
 import server
 from api.index import invoke_existing_backend
 from tests.http_harness import BackendHarness
+
+
+class OwnerAdminAssetParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stylesheet_urls = []
+        self.script_urls = []
+
+    def handle_starttag(self, tag, attributes):
+        values = dict(attributes)
+        if tag == "link" and values.get("rel") == "stylesheet":
+            self.stylesheet_urls.append(values.get("href"))
+        elif tag == "script":
+            self.script_urls.append((values.get("src"), "defer" in values))
 
 
 class OwnerFoundationTests(unittest.TestCase):
@@ -533,3 +548,20 @@ class OwnerFoundationTests(unittest.TestCase):
         public_entry = (server.ROOT / "index.html").read_text(encoding="utf-8")
 
         self.assertNotIn("/owner-admin", public_entry)
+
+    def test_owner_admin_trailing_slash_uses_root_relative_assets(self):
+        page = self.backend.request("GET", "/owner-admin/")
+        parser = OwnerAdminAssetParser()
+        parser.feed(page.body.decode("utf-8"))
+
+        self.assertEqual(parser.stylesheet_urls, ["/style.css", "/owner-admin.css"])
+        self.assertEqual(parser.script_urls, [("/owner-admin.js", True)])
+
+        for asset_path in parser.stylesheet_urls:
+            native = self.backend.request("GET", asset_path)
+            adapter = self.adapter_request("GET", asset_path)
+
+            self.assertEqual(native.status, 200)
+            self.assertTrue(native.headers["Content-Type"].startswith("text/css"))
+            self.assertEqual(adapter.status_code, 200)
+            self.assertTrue(adapter.headers["content-type"].startswith("text/css"))
