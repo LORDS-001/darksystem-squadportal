@@ -6,28 +6,75 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import server
 from fastapi import Request
 
 
 _MISSING = object()
+_TARGET_QUERY_OPTIONS = {
+    "dbname",
+    "host",
+    "hostaddr",
+    "port",
+    "service",
+    "servicefile",
+}
+
+
+def _psycopg_conninfo(database_url):
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except ImportError:
+        return {}
+    try:
+        return conninfo_to_dict(database_url)
+    except Exception:
+        return None
 
 
 def _postgres_database_identity(database_url):
     try:
         parsed = urlsplit(database_url)
+        query_options = {
+            str(key).lower()
+            for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+        host = unquote(parsed.hostname or "").lower().rstrip(".")
         port = parsed.port or 5432
     except (TypeError, ValueError):
         return None
-    if parsed.scheme not in ("postgres", "postgresql") or not parsed.hostname:
+    if (
+        parsed.scheme.lower() not in ("postgres", "postgresql")
+        or not host
+        or parsed.fragment
+        or "," in host
+        or query_options.intersection(_TARGET_QUERY_OPTIONS)
+    ):
         return None
     database_name = unquote(parsed.path.lstrip("/")).strip()
-    if not database_name:
+    if not database_name or "/" in database_name:
         return None
+    normalized = _psycopg_conninfo(database_url)
+    if normalized is None:
+        return None
+    if normalized:
+        if normalized.get("service") or normalized.get("servicefile"):
+            return None
+        normalized_host = unquote(str(normalized.get("host", host))).lower().rstrip(".")
+        normalized_port = str(normalized.get("port", port))
+        normalized_database = str(normalized.get("dbname", database_name))
+        if "," in normalized_host or "," in normalized_port:
+            return None
+        try:
+            port = int(normalized_port)
+        except ValueError:
+            return None
+        host = normalized_host
+        database_name = normalized_database
     return (
-        parsed.hostname.lower(),
+        host,
         port,
         database_name,
     )
@@ -39,15 +86,17 @@ def resolve_test_database_url(environment=None):
     test_database_url = str(source.get("TEST_DATABASE_URL", "")).strip()
     if not test_database_url:
         return None
-    if str(source.get("TEST_DATABASE_DISPOSABLE", "")).strip() != "1":
-        raise RuntimeError(
-            "PostgreSQL integration requires explicit disposable test database confirmation."
-        )
     test_identity = _postgres_database_identity(test_database_url)
     if test_identity is None:
-        raise RuntimeError("TEST_DATABASE_URL must identify a PostgreSQL database.")
+        raise RuntimeError(
+            "TEST_DATABASE_URL must be a single explicit PostgreSQL URI whose target can be safely verified."
+        )
     production_database_url = str(source.get("DATABASE_URL", "")).strip()
     production_identity = _postgres_database_identity(production_database_url)
+    if production_database_url and production_identity is None:
+        raise RuntimeError(
+            "DATABASE_URL cannot be safely compared with TEST_DATABASE_URL."
+        )
     if production_database_url and (
         test_database_url == production_database_url
         or (production_identity is not None and test_identity == production_identity)

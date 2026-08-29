@@ -67,17 +67,15 @@ node --check owner-admin.js
 python -m compileall -q server.py api tests
 ```
 
-The PostgreSQL Owner gate is opt-in and never reads `DATABASE_URL` as a fallback. It creates a randomly named schema, runs the Owner lifecycle/concurrent setup/session revocation/audit/durable-throttle checks, and drops that schema in cleanup. Use a dedicated disposable database, not merely a spare schema in a Production project:
+The PostgreSQL Owner gate is opt-in and never reads `DATABASE_URL` as a fallback. It creates a randomly named schema, runs the Owner lifecycle/concurrent setup/session revocation/audit/durable-throttle checks, and drops that schema in cleanup. The concurrency check removes the in-process lock only inside the isolated test, synchronizes two independent database transactions immediately before the conditional setup claim, and verifies that a deliberately non-atomic test mutation would allow two winners. Production locking is not changed. Use a dedicated disposable database, not merely a spare schema in a Production project:
 
 ```powershell
 $env:TEST_DATABASE_URL = '<disposable Supabase/PostgreSQL connection URL>'
-$env:TEST_DATABASE_DISPOSABLE = '1'
 python -m unittest tests.test_owner_postgres_integration -v
 Remove-Item Env:TEST_DATABASE_URL
-Remove-Item Env:TEST_DATABASE_DISPOSABLE
 ```
 
-The guard refuses to run without both variables and refuses a test database that resolves to the same host, port, and database name as `DATABASE_URL`, even when a different database user is supplied. Do not put connection URLs in source files, shell history shared with others, screenshots, tickets, or test output. With no `TEST_DATABASE_URL`, the integration class must report one safe skip.
+`TEST_DATABASE_URL` is the only opt-in variable. The guard uses psycopg conninfo normalization when that package is available and otherwise accepts only a strict, single-host PostgreSQL URI it can compare conservatively. It refuses keyword DSNs, service/multi-host targets, URI query options that override host/hostaddr/port/database/service, an unparseable `DATABASE_URL`, and a test target resolving to the same host, port, and database name as `DATABASE_URL`, even when a different database user, host case, percent encoding, or omitted default port is supplied. All guard failures are generic and do not echo either URL. Do not put connection URLs in source files, shell history shared with others, screenshots, tickets, or test output. With no `TEST_DATABASE_URL`, the integration class must report one safe skip.
 
 ### Native Vercel routing smoke
 

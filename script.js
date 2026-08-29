@@ -93,7 +93,7 @@ if(!db.members.some(m=>String(m.ign||'').toLowerCase()==='newbie')){
 const demo=db.members.find(m=>String(m.ign||'').toLowerCase()==='newbie');
 if(demo){demo.gameId='444444';demo.serverId='4444';demo.accessCode='SQM-DEMO1';demo.role='Squad Member';demo.profileComplete=false;demo.accountActivated=false;demo.status='Offline';}
 if(!DARK_BACKEND) save();
-let current=null,tab='overview',presence;
+let current=null,tab='overview',presence,squadLogoutRequest=null;
 
 function save(){const snapshot=structuredClone(db);(snapshot.members||[]).forEach(m=>{delete m.password;delete m.passwordHash;delete m.resetCode;delete m.resetExpires});if(!DARK_BACKEND) localStorage.setItem(K,JSON.stringify(snapshot)); backendSync()}
 
@@ -163,7 +163,7 @@ function switchToSquad(){
   communityCurrent=null; current=m; m.status='Online'; m.lastLogin=new Date().toISOString(); save(); close(); openApp(); refreshSiteMenu();
 }
 if(!DARK_BACKEND) enforceTournamentManagerEligibility();
-let communityCurrent=null;
+let communityCurrent=null,communityLogoutRequest=null;
 function goHome(){
   document.getElementById('communityPage').classList.add('hidden');
   document.getElementById('home').classList.remove('hidden');
@@ -232,7 +232,7 @@ function communityForgot(){
 function openCommunityApp(){
   document.getElementById('public').classList.add('hidden');document.querySelector('footer').classList.add('hidden');document.getElementById('app').classList.add('hidden');document.getElementById('communityApp').classList.remove('hidden');renderCommunityApp();window.scrollTo(0,0);
 }
-async function communityLogout(){if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}communityCurrent=null;refreshSiteMenu();document.getElementById('communityApp').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();goHome();return true}
+function communityLogout(){if(communityLogoutRequest)return communityLogoutRequest;const request=(async()=>{if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}communityCurrent=null;refreshSiteMenu();document.getElementById('communityApp').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();goHome();return true})();communityLogoutRequest=request;const clearRequest=()=>{if(communityLogoutRequest===request)communityLogoutRequest=null};request.then(clearRequest,clearRequest);return request}
 function renderCommunityApp(){
   const regs=communityDb.registrations.filter(r=>r.accountId===communityCurrent.id);
   const open=communityDb.tournaments.filter(t=>isTournamentVisibleInAvailable(t));
@@ -365,7 +365,7 @@ function openApp(){
   render(); startPresence();
 }
 function startPresence(){clearInterval(presence);presence=setInterval(()=>{if(!current)return;const m=db.members.find(x=>x.id===current.id);if(m){m.status='Online';save();if(tab==='overview')render();}},10000)}
-async function logout(){if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}clearInterval(presence);if(current){const m=db.members.find(x=>x.id===current.id);if(m){m.status='Offline';save()}}current=null;refreshSiteMenu();document.getElementById('app').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();window.scrollTo(0,0);return true}
+function logout(){if(squadLogoutRequest)return squadLogoutRequest;const request=(async()=>{if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}clearInterval(presence);if(current){const m=db.members.find(x=>x.id===current.id);if(m){m.status='Offline';save()}}current=null;refreshSiteMenu();document.getElementById('app').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();window.scrollTo(0,0);return true})();squadLogoutRequest=request;const clearRequest=()=>{if(squadLogoutRequest===request)squadLogoutRequest=null};request.then(clearRequest,clearRequest);return request}
 
 function renderPublic(){
   const publicMembers=communityDb.accounts;

@@ -1,5 +1,6 @@
 import json
 import secrets
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +8,66 @@ from unittest.mock import patch
 
 import server
 from tests.http_harness import BackendHarness, resolve_test_database_url
+
+
+class _UnlockedContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _ClaimBarrierConnection:
+    def __init__(
+        self,
+        connection,
+        barrier,
+        claim_threads,
+        claim_threads_lock,
+        non_atomic_claim=False,
+    ):
+        self.connection = connection
+        self.barrier = barrier
+        self.claim_threads = claim_threads
+        self.claim_threads_lock = claim_threads_lock
+        self.non_atomic_claim = non_atomic_claim
+
+    def execute(self, statement, params=()):
+        normalized = " ".join(statement.lower().split())
+        if normalized == (
+            "update app_state set value='true' where key='owner_setup_complete' "
+            "and value='false'"
+        ):
+            observed = None
+            if self.non_atomic_claim:
+                observed = self.connection.execute(
+                    "SELECT value FROM app_state WHERE key='owner_setup_complete'"
+                ).fetchone()
+            with self.claim_threads_lock:
+                self.claim_threads.add(threading.get_ident())
+            self.barrier.wait(timeout=10)
+            if self.non_atomic_claim:
+                if observed and observed["value"] == "false":
+                    return self.connection.execute(
+                        "UPDATE app_state SET value='true' "
+                        "WHERE key='owner_setup_complete'"
+                    )
+                return self.connection.execute(
+                    "UPDATE app_state SET value='true' "
+                    "WHERE key='owner_setup_complete' AND 1=0"
+                )
+        return self.connection.execute(statement, params)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self.connection.__exit__(exc_type, exc, traceback)
 
 
 class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
@@ -48,6 +109,10 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
         from psycopg.rows import dict_row
 
         schema_name = f"dark_system_gate_{secrets.token_hex(8)}"
+        claim_barrier = None
+        non_atomic_claim = False
+        claim_threads = set()
+        claim_threads_lock = threading.Lock()
 
         def isolated_db():
             connection = psycopg.connect(
@@ -59,7 +124,16 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
             connection.execute(
                 sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
             )
-            return server.PostgresCompat(connection)
+            compatible = server.PostgresCompat(connection)
+            if claim_barrier is None:
+                return compatible
+            return _ClaimBarrierConnection(
+                compatible,
+                claim_barrier,
+                claim_threads,
+                claim_threads_lock,
+                non_atomic_claim,
+            )
 
         with psycopg.connect(self.test_database_url, autocommit=True) as admin:
             admin.execute(
@@ -83,16 +157,24 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     self.payload("postgres-owner-a", "PostgresOwnerA", "111111"),
                     self.payload("postgres-owner-b", "PostgresOwnerB", "222222"),
                 ]
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    responses = list(
-                        executor.map(
-                            lambda candidate: self.request(
-                                "POST", "/api/owner/setup", candidate
-                            ),
-                            candidates,
+                claim_barrier = threading.Barrier(2)
+                try:
+                    with (
+                        patch.object(server, "LOCK", _UnlockedContext()),
+                        ThreadPoolExecutor(max_workers=2) as executor,
+                    ):
+                        responses = list(
+                            executor.map(
+                                lambda candidate: self.request(
+                                    "POST", "/api/owner/setup", candidate
+                                ),
+                                candidates,
+                            )
                         )
-                    )
+                finally:
+                    claim_barrier = None
 
+                self.assertEqual(len(claim_threads), 2)
                 self.assertEqual(
                     sorted(response.status_code for response in responses),
                     [200, 409],
@@ -175,6 +257,52 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     {
                         "error": "Too many login attempts. Please wait a few minutes and try again."
                     },
+                )
+
+                with server.LOCK, server.db() as connection:
+                    for table in (
+                        "sessions",
+                        "audit_log",
+                        "owner_accounts",
+                        "squad_members",
+                        "login_throttle",
+                    ):
+                        connection.execute(f"DELETE FROM {table}")
+                    connection.execute(
+                        "UPDATE app_state SET value='false' "
+                        "WHERE key='owner_setup_complete'"
+                    )
+                    connection.commit()
+
+                claim_threads.clear()
+                claim_barrier = threading.Barrier(2)
+                non_atomic_claim = True
+                mutated_candidates = [
+                    self.payload("mutated-owner-a", "MutatedOwnerA", "333333"),
+                    self.payload("mutated-owner-b", "MutatedOwnerB", "444444"),
+                ]
+                try:
+                    with (
+                        patch.object(server, "LOCK", _UnlockedContext()),
+                        ThreadPoolExecutor(max_workers=2) as executor,
+                    ):
+                        mutated_responses = list(
+                            executor.map(
+                                lambda candidate: self.request(
+                                    "POST", "/api/owner/setup", candidate
+                                ),
+                                mutated_candidates,
+                            )
+                        )
+                finally:
+                    claim_barrier = None
+                    non_atomic_claim = False
+
+                self.assertEqual(len(claim_threads), 2)
+                self.assertEqual(
+                    sorted(response.status_code for response in mutated_responses),
+                    [200, 200],
+                    "the synchronized harness must expose a deliberately non-atomic setup claim",
                 )
         finally:
             with psycopg.connect(self.test_database_url, autocommit=True) as admin:

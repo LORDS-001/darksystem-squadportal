@@ -2,6 +2,7 @@
 
 const ownerRoot = document.getElementById("ownerRoot");
 let activeOwnerSession = null;
+let activeOwnerLogoutRequest = null;
 
 function ownerElement(tagName, className, text) {
   const element = document.createElement(tagName);
@@ -296,20 +297,31 @@ function renderOwnerDashboard(data) {
   setOwnerRoot(dashboard);
 }
 
-async function ownerLogout() {
-  const logoutButton = document.querySelector(".owner-admin__dashboard .owner-admin__button--secondary");
-  const logoutError = document.querySelector(".owner-admin__dashboard .owner-admin__logout-error");
-  if (logoutError) setOwnerError(logoutError, "");
-  if (logoutButton) setOwnerBusy(logoutButton, true, "Logout");
-  try {
-    await ownerApi("/api/logout", { method: "POST" });
-    activeOwnerSession = null;
-    renderOwnerLogin("You have been logged out.");
-  } catch (requestError) {
-    if (logoutError) setOwnerError(logoutError, requestError.message);
-  } finally {
-    if (activeOwnerSession && logoutButton) setOwnerBusy(logoutButton, false, "Logout");
-  }
+function ownerLogout() {
+  if (activeOwnerLogoutRequest) return activeOwnerLogoutRequest;
+  const request = (async () => {
+    const logoutButton = document.querySelector(".owner-admin__dashboard .owner-admin__button--secondary");
+    const logoutError = document.querySelector(".owner-admin__dashboard .owner-admin__logout-error");
+    if (logoutError) setOwnerError(logoutError, "");
+    if (logoutButton) setOwnerBusy(logoutButton, true, "Logout");
+    try {
+      await ownerApi("/api/logout", { method: "POST" });
+      activeOwnerSession = null;
+      renderOwnerLogin("You have been logged out.");
+      return true;
+    } catch (requestError) {
+      if (logoutError) setOwnerError(logoutError, requestError.message);
+      return false;
+    } finally {
+      if (activeOwnerSession && logoutButton) setOwnerBusy(logoutButton, false, "Logout");
+    }
+  })();
+  activeOwnerLogoutRequest = request;
+  const clearRequest = () => {
+    if (activeOwnerLogoutRequest === request) activeOwnerLogoutRequest = null;
+  };
+  request.then(clearRequest, clearRequest);
+  return request;
 }
 
 async function loadOwnerEntry() {

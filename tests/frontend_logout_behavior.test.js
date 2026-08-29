@@ -218,6 +218,14 @@ function jsonResponse(ok, payload) {
   return { ok, json: async () => payload };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function makeContext(scriptName, initialFetch) {
   const document = new TestDocument();
   let fetchImplementation = initialFetch;
@@ -380,4 +388,96 @@ test("Squad logout failure preserves authenticated state, presence, and visible 
   assert.equal(harness.document.getElementById("app").classList.contains("hidden"), false);
   assert.equal(harness.document.getElementById("public").classList.contains("hidden"), true);
   assert.match(harness.document.getElementById("modalBody").innerHTML, /LOGOUT FAILED/);
+});
+
+test("Owner concurrent logout calls share one successful revocation", async () => {
+  const harness = ownerHarness();
+  await new Promise((resolve) => setImmediate(resolve));
+  vm.runInContext(`
+    activeOwnerSession = { id: "owner-1", role: "Overall Owner" };
+    renderOwnerDashboard({ health: { backend: "healthy", database: "healthy" }, counts: {}, pending: {}, recentAudit: [] });
+  `, harness.context);
+  const response = deferred();
+  let fetchCount = 0;
+  harness.setFetch(() => {
+    fetchCount += 1;
+    return response.promise;
+  });
+
+  const first = vm.runInContext("ownerLogout()", harness.context);
+  const second = vm.runInContext("ownerLogout()", harness.context);
+  response.resolve(jsonResponse(true, { ok: true }));
+  const results = await Promise.all([first, second]);
+
+  assert.equal(fetchCount, 1);
+  assert.deepEqual(results, [true, true]);
+  assert.equal(vm.runInContext("activeOwnerSession", harness.context), null);
+  assert.ok(harness.ownerRoot.querySelector(".owner-admin__auth-shell"));
+});
+
+test("Community concurrent logout cannot surface a late failure after success", async () => {
+  const harness = await publicHarness();
+  harness.document.getElementById("communityApp").classList.remove("hidden");
+  harness.document.getElementById("public").classList.add("hidden");
+  vm.runInContext('communityCurrent = { id: "community-1", ign: "Tester", email: "tester@example.test" }; current = null;', harness.context);
+  const success = deferred();
+  const lateFailure = deferred();
+  let fetchCount = 0;
+  harness.setFetch(() => {
+    fetchCount += 1;
+    return fetchCount === 1 ? success.promise : lateFailure.promise;
+  });
+
+  const first = vm.runInContext("communityLogout()", harness.context);
+  const second = vm.runInContext("communityLogout()", harness.context);
+  success.resolve(jsonResponse(true, { ok: true }));
+  await new Promise((resolve) => setImmediate(resolve));
+  lateFailure.resolve(jsonResponse(false, { error: "Late logout failure." }));
+  const results = await Promise.all([first, second]);
+
+  assert.equal(fetchCount, 1);
+  assert.deepEqual(results, [true, true]);
+  assert.equal(vm.runInContext("communityCurrent", harness.context), null);
+  assert.equal(harness.document.getElementById("public").classList.contains("hidden"), false);
+  assert.equal(harness.document.getElementById("modal").classList.contains("open"), false);
+});
+
+test("Squad concurrent logout failure preserves state and permits one retry after settlement", async () => {
+  const harness = await publicHarness();
+  harness.document.getElementById("app").classList.remove("hidden");
+  harness.document.getElementById("public").classList.add("hidden");
+  vm.runInContext(`
+    current = { id: "squad-1", ign: "SquadTester", role: "Squad Member", profileComplete: true };
+    db.members.push({ id: "squad-1", ign: "SquadTester", status: "Online" });
+  `, harness.context);
+  const failure = deferred();
+  let logoutFetchCount = 0;
+  harness.setFetch((requestPath) => {
+    if (requestPath === "/api/logout") {
+      logoutFetchCount += 1;
+      return failure.promise;
+    }
+    return Promise.resolve(jsonResponse(true, { ok: true }));
+  });
+
+  const first = vm.runInContext("logout()", harness.context);
+  const second = vm.runInContext("logout()", harness.context);
+  failure.resolve(jsonResponse(false, { error: "Logout is temporarily unavailable." }));
+  const failedResults = await Promise.all([first, second]);
+
+  assert.equal(logoutFetchCount, 1);
+  assert.deepEqual(failedResults, [false, false]);
+  assert.equal(vm.runInContext("current.id", harness.context), "squad-1");
+  assert.equal(vm.runInContext('db.members.find((member) => member.id === "squad-1").status', harness.context), "Online");
+
+  harness.setFetch(async (requestPath) => {
+    if (requestPath === "/api/logout") logoutFetchCount += 1;
+    return jsonResponse(true, { ok: true });
+  });
+  const retried = await vm.runInContext("logout()", harness.context);
+
+  assert.equal(retried, true);
+  assert.equal(logoutFetchCount, 2);
+  assert.equal(vm.runInContext("current", harness.context), null);
+  assert.equal(harness.document.getElementById("public").classList.contains("hidden"), false);
 });
