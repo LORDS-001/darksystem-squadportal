@@ -5,6 +5,7 @@ request into the existing handler contract so the established UI/API behavior
 is preserved while running as a Vercel Python function.
 """
 import io
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,16 @@ if str(ROOT) not in sys.path:
 import server  # noqa: E402
 
 app = FastAPI(title="Dark System Backend", docs_url=None, redoc_url=None)
+database_ready = False
+
+def ensure_database() -> None:
+    """Initialize persistence once per warm Vercel function instance."""
+    global database_ready
+    if database_ready:
+        return
+    server.init_db()
+    database_ready = True
+
 
 class CaptureHandler(server.Handler):
     """A lightweight Handler instance backed by an in-memory request/response."""
@@ -77,12 +88,24 @@ def invoke_existing_backend(request: Request, body: bytes) -> Response:
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
 async def catch_all(request: Request, full_path: str):
     body = await request.body()
-    return invoke_existing_backend(request, body)
-
-@app.on_event("startup")
-def startup():
-    # Vercel instances may be reused, so initialize idempotently.
-    if server.SESSION_SECRET == "change-this-in-production" and server.os.getenv("DARK_SYSTEM_ALLOW_DEFAULT_SECRET", "0") != "1":
-        # Do not hard-fail local imports; actual requests will still require a real secret.
-        return
-    server.init_db()
+    path = request.url.path
+    try:
+        # Health and static files do not depend on the database. Keeping them
+        # available makes configuration failures diagnosable instead of
+        # crashing the complete serverless function during startup.
+        if path.startswith("/api/") and path != "/api/health":
+            if server.SESSION_SECRET == "change-this-in-production":
+                return Response(
+                    content=b'{"error":"Server configuration is incomplete."}',
+                    status_code=503,
+                    media_type="application/json",
+                )
+            ensure_database()
+        return invoke_existing_backend(request, body)
+    except Exception:
+        logging.exception("Dark System request failed: %s %s", request.method, path)
+        return Response(
+            content=b'{"error":"The backend database is temporarily unavailable."}',
+            status_code=503,
+            media_type="application/json",
+        )

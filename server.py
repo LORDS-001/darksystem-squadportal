@@ -82,7 +82,7 @@ def db():
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError('PostgreSQL mode requires psycopg[binary].') from exc
-        return PostgresCompat(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+        return PostgresCompat(psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10, prepare_threshold=None))
     c = sqlite3.connect(DB_PATH, timeout=10, factory=ClosingSQLiteConnection)
     c.row_factory = sqlite3.Row
     return c
