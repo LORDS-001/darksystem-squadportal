@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import tempfile
@@ -6,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import server
+from fastapi import Request
+
+
+_MISSING = object()
 
 
 @dataclass
@@ -40,11 +45,13 @@ class _HandlerServer:
 class BackendHarness:
     _active_lock = threading.Lock()
     _active = False
+    OWNER_SETUP_SECRET = "test-owner-setup-secret"
 
     def __init__(self):
         self._original_db_path = server.DB_PATH
         self._original_database_url = server.DATABASE_URL
         self._original_session_secret = server.SESSION_SECRET
+        self._original_owner_setup_secret = getattr(server, "OWNER_SETUP_SECRET", _MISSING)
         self._temporary_directory = None
         self._closed = True
         with BackendHarness._active_lock:
@@ -56,12 +63,14 @@ class BackendHarness:
             server.DB_PATH = Path(self._temporary_directory.name) / "dark-system.sqlite3"
             server.DATABASE_URL = ""
             server.SESSION_SECRET = "test-owner-session-secret"
+            server.OWNER_SETUP_SECRET = self.OWNER_SETUP_SECRET
             server.init_db()
         except Exception:
             try:
                 server.DB_PATH = self._original_db_path
                 server.DATABASE_URL = self._original_database_url
                 server.SESSION_SECRET = self._original_session_secret
+                self._restore_owner_setup_secret()
                 if self._temporary_directory:
                     self._temporary_directory.cleanup()
             finally:
@@ -88,6 +97,49 @@ class BackendHarness:
         server.Handler(connection, ("127.0.0.1", 50000), _HandlerServer())
         return self._parse_response(connection.wfile.getvalue())
 
+    def adapter_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        cookie: str = "",
+        forwarded_proto: str = "https",
+    ):
+        from api import index as adapter
+
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        headers = [(b"host", b"test.local")]
+        if forwarded_proto:
+            headers.append((b"x-forwarded-proto", forwarded_proto.encode("ascii")))
+        if cookie:
+            headers.append((b"cookie", cookie.encode("ascii")))
+        if payload is not None:
+            headers.extend(
+                (
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                )
+            )
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "https" if forwarded_proto == "https" else "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 50000),
+            "server": ("test.local", 443 if forwarded_proto == "https" else 80),
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(scope, receive)
+        return asyncio.run(adapter.catch_all(request, path.lstrip("/")))
+
     def close(self):
         if self._closed:
             return
@@ -95,11 +147,19 @@ class BackendHarness:
             server.DB_PATH = self._original_db_path
             server.DATABASE_URL = self._original_database_url
             server.SESSION_SECRET = self._original_session_secret
+            self._restore_owner_setup_secret()
             self._temporary_directory.cleanup()
         finally:
             self._closed = True
             with BackendHarness._active_lock:
                 BackendHarness._active = False
+
+    def _restore_owner_setup_secret(self):
+        if self._original_owner_setup_secret is _MISSING:
+            if hasattr(server, "OWNER_SETUP_SECRET"):
+                delattr(server, "OWNER_SETUP_SECRET")
+        else:
+            server.OWNER_SETUP_SECRET = self._original_owner_setup_secret
 
     @staticmethod
     def _parse_response(raw_response: bytes) -> BackendResponse:

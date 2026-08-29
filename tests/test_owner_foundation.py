@@ -44,6 +44,7 @@ class OwnerFoundationTests(unittest.TestCase):
         self.assertEqual(fresh_status.json, {"setupComplete": False})
 
         original_setup_payload = {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
             "username": "overall-owner",
             "password": "owner-password-123",
             "squadOwner": {
@@ -57,6 +58,7 @@ class OwnerFoundationTests(unittest.TestCase):
         self.assertEqual(setup.status, 200)
 
         replacement_setup_payload = {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
             "username": "replacement-owner",
             "password": "replacement-password-456",
             "squadOwner": {
@@ -139,6 +141,7 @@ class OwnerFoundationTests(unittest.TestCase):
             "POST",
             "/api/owner/setup",
             {
+                "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
                 "username": "overall-owner",
                 "password": "owner-password-123",
                 "squadOwner": {

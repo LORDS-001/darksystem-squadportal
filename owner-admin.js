@@ -108,6 +108,7 @@ function renderOwnerSetup() {
   const error = ownerElement("p", "owner-admin__error-banner");
   error.hidden = true;
   error.setAttribute("role", "alert");
+  const setupSecret = ownerField({ id: "owner-setup-secret", name: "setupSecret", label: "Owner setup secret", type: "password", autocomplete: "off", hint: "Enter the private setup secret configured for this deployment." });
   const ownerHeading = ownerElement("h2", "owner-admin__form-heading", "Overall Owner credentials");
   const username = ownerField({ id: "owner-setup-username", name: "username", label: "Owner username", autocomplete: "username" });
   const password = ownerField({ id: "owner-setup-password", name: "password", label: "Owner password", type: "password", autocomplete: "new-password", hint: "Use at least 10 characters." });
@@ -119,25 +120,28 @@ function renderOwnerSetup() {
   const accessCode = ownerField({ id: "owner-setup-access-code", name: "accessCode", label: "Squad access code", type: "password", autocomplete: "new-password" });
   const submit = ownerElement("button", "owner-admin__button", "Complete secure setup");
   submit.type = "submit";
-  form.append(error, ownerHeading, username.field, password.field, passwordConfirmation.field, squadHeading, ign.field, gameId.field, serverId.field, accessCode.field, submit);
+  form.append(error, setupSecret.field, ownerHeading, username.field, password.field, passwordConfirmation.field, squadHeading, ign.field, gameId.field, serverId.field, accessCode.field, submit);
   card.append(form);
   setOwnerRoot(shell);
+
+  function clearOwnerSetupSecrets() {
+    setupSecret.input.value = "";
+    password.input.value = "";
+    passwordConfirmation.input.value = "";
+    accessCode.input.value = "";
+  }
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     setOwnerError(error, "");
     if (password.input.value !== passwordConfirmation.input.value) {
-      password.input.value = "";
-      passwordConfirmation.input.value = "";
-      accessCode.input.value = "";
+      clearOwnerSetupSecrets();
       setOwnerError(error, "Owner password confirmation must match.");
       password.input.focus();
       return;
     }
     if (!form.reportValidity()) {
-      password.input.value = "";
-      passwordConfirmation.input.value = "";
-      accessCode.input.value = "";
+      clearOwnerSetupSecrets();
       return;
     }
     setOwnerBusy(submit, true, "Complete secure setup");
@@ -146,6 +150,7 @@ function renderOwnerSetup() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          setupSecret: setupSecret.input.value,
           username: username.input.value.trim(),
           password: password.input.value,
           squadOwner: {
@@ -160,9 +165,7 @@ function renderOwnerSetup() {
     } catch (requestError) {
       setOwnerError(error, requestError.message);
     } finally {
-      password.input.value = "";
-      passwordConfirmation.input.value = "";
-      accessCode.input.value = "";
+      clearOwnerSetupSecrets();
       setOwnerBusy(submit, false, "Complete secure setup");
     }
   });

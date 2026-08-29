@@ -26,6 +26,7 @@ class OwnerStaticContractTests(unittest.TestCase):
 
     def test_setup_form_collects_owner_and_initial_squad_credentials(self):
         for field in (
+            'name: "setupSecret"',
             'name: "username"',
             'name: "password"',
             'name: "passwordConfirmation"',
@@ -35,6 +36,11 @@ class OwnerStaticContractTests(unittest.TestCase):
             'name: "accessCode"',
         ):
             self.assertIn(field, self.js)
+
+    def test_setup_secret_is_submitted_and_cleared_on_every_form_exit(self):
+        self.assertIn("setupSecret: setupSecret.input.value", self.js)
+        self.assertIn("function clearOwnerSetupSecrets()", self.js)
+        self.assertGreaterEqual(self.js.count("clearOwnerSetupSecrets();"), 3)
 
     def test_login_form_uses_owner_credentials_with_correct_autocomplete(self):
         self.assertIn('autocomplete: "username"', self.js)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, hashlib, hmac, json, os, secrets, smtplib, sqlite3, threading, time
+import base64, hashlib, hmac, json, logging, os, secrets, smtplib, sqlite3, threading, time
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,12 +25,33 @@ DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
 PORT = int(os.getenv('PORT') or '8080')
 HOST = os.getenv('HOST', '0.0.0.0')
 SESSION_SECRET = os.getenv('DARK_SYSTEM_SESSION_SECRET', 'change-this-in-production')
+OWNER_SETUP_SECRET = os.getenv('OWNER_SETUP_SECRET', '').strip()
 DEMO_DATA = os.getenv('DARK_SYSTEM_DEMO_DATA', '0') == '1'
 COOKIE_NAME = 'dark_system_session'
 SESSION_TTL = 60 * 60 * 24 * 7
 RATE_LIMIT_WINDOW = 300
 RATE_LIMIT_MAX = 12
 RATE_LIMITS = {}
+
+PUBLIC_STATIC_FILES = {
+    '/': 'index.html',
+    '/index.html': 'index.html',
+    '/owner-admin': 'owner-admin.html',
+    '/owner-admin/': 'owner-admin.html',
+    '/style.css': 'style.css',
+    '/script.js': 'script.js',
+    '/owner-admin.css': 'owner-admin.css',
+    '/owner-admin.js': 'owner-admin.js',
+    '/assets/mlbb/birthday-mage.jpg': 'assets/mlbb/birthday-mage.jpg',
+    '/assets/mlbb/bunny-gunner.jpg': 'assets/mlbb/bunny-gunner.jpg',
+    '/assets/mlbb/cafe-welcome.jpg': 'assets/mlbb/cafe-welcome.jpg',
+    '/assets/mlbb/celestial-mage.jpg': 'assets/mlbb/celestial-mage.jpg',
+    '/assets/mlbb/dark-archer.jpg': 'assets/mlbb/dark-archer.jpg',
+    '/assets/mlbb/hero-dragon.jpg': 'assets/mlbb/hero-dragon.jpg',
+    '/assets/mlbb/ice-archer.jpg': 'assets/mlbb/ice-archer.jpg',
+    '/assets/mlbb/neon-warrior.jpg': 'assets/mlbb/neon-warrior.jpg',
+    '/assets/mlbb/pink-mage.jpg': 'assets/mlbb/pink-mage.jpg',
+}
 
 LOCK = threading.RLock()
 
@@ -120,17 +141,37 @@ def unsign(value):
 def session_token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
-def create_session(user_type, user_id, role='Community Member'):
+def create_session_record(connection, user_type, user_id, role='Community Member'):
     token = secrets.token_urlsafe(32)
     expires = int(time.time()) + SESSION_TTL
+    connection.execute(
+        'INSERT INTO sessions(token,type,user_id,role,expires) VALUES(?,?,?,?,?)',
+        (session_token_hash(token), user_type, str(user_id), role, expires),
+    )
+    connection.execute('DELETE FROM sessions WHERE expires<=?', (int(time.time()),))
+    return token
+
+def create_session(user_type, user_id, role='Community Member'):
     with LOCK, db() as c:
-        c.execute(
-            'INSERT INTO sessions(token,type,user_id,role,expires) VALUES(?,?,?,?,?)',
-            (session_token_hash(token), user_type, str(user_id), role, expires),
-        )
-        c.execute('DELETE FROM sessions WHERE expires<=?', (int(time.time()),))
+        token = create_session_record(c, user_type, user_id, role)
         c.commit()
     return token
+
+def insert_audit(connection, session, action, target_type='', target_id='', details=None):
+    connection.execute(
+        'INSERT INTO audit_log(id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details) VALUES(?,?,?,?,?,?,?,?,?)',
+        (
+            'A'+secrets.token_hex(8),
+            session.get('type'),
+            str(session.get('id')),
+            session.get('role'),
+            action,
+            target_type,
+            str(target_id or ''),
+            now_iso(),
+            json.dumps(details or {}, separators=(',', ':')),
+        ),
+    )
 
 def init_db():
     with LOCK, db() as c:
@@ -153,6 +194,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, type TEXT, user_id TEXT, role TEXT, expires INTEGER);
         CREATE TABLE IF NOT EXISTS owner_accounts (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor_type TEXT, actor_id TEXT, actor_role TEXT, action TEXT, target_type TEXT, target_id TEXT, created_at TEXT NOT NULL, details TEXT);
+        CREATE TABLE IF NOT EXISTS login_throttle (key TEXT PRIMARY KEY, window_started INTEGER NOT NULL, attempts INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS login_throttle_window_started_idx ON login_throttle(window_started);
         CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, domain TEXT NOT NULL, payload TEXT NOT NULL);
         ''')
         count = c.execute('SELECT COUNT(*) AS n FROM squad_members').fetchone()['n']
@@ -253,7 +296,36 @@ def auth_from_cookie(handler):
             connection.execute('DELETE FROM sessions WHERE token=?', (token_hash,))
             connection.commit()
             return None
-    return {'type': row['type'], 'id': str(row['user_id']), 'role': row['role'], 'exp': int(row['expires'])}
+        user_type = row['type']
+        user_id = str(row['user_id'])
+        if user_type == 'owner':
+            account = connection.execute(
+                'SELECT id FROM owner_accounts WHERE id=?', (user_id,)
+            ).fetchone()
+            current_role = 'Overall Owner' if account else None
+        elif user_type == 'squad':
+            account = connection.execute(
+                'SELECT role,status FROM squad_members WHERE id=?', (user_id,)
+            ).fetchone()
+            disabled = account and str(account['status'] or '').strip().lower() == 'disabled'
+            current_role = (account['role'] or 'Squad Member') if account and not disabled else None
+        elif user_type == 'community':
+            account = connection.execute(
+                'SELECT role FROM community_accounts WHERE id=?', (user_id,)
+            ).fetchone()
+            current_role = (account['role'] or 'Community Member') if account else None
+        else:
+            current_role = None
+        if current_role is None:
+            connection.execute('DELETE FROM sessions WHERE token=?', (token_hash,))
+            connection.commit()
+            return None
+        if row['role'] != current_role:
+            connection.execute(
+                'UPDATE sessions SET role=? WHERE token=?', (current_role, token_hash)
+            )
+            connection.commit()
+    return {'type': user_type, 'id': user_id, 'role': current_role, 'exp': int(row['expires'])}
 
 def revoke_session(handler):
     raw = request_header(handler, 'Cookie')
@@ -352,6 +424,35 @@ def rate_limited(h, bucket):
         hits.append(now); RATE_LIMITS[key]=hits
         return len(hits) > RATE_LIMIT_MAX
 
+def durable_rate_limited(h, bucket):
+    now = int(time.time())
+    cutoff = now - RATE_LIMIT_WINDOW
+    durable_key = hashlib.sha256(
+        f'{request_ip(h)}\0{bucket}'.encode('utf-8')
+    ).hexdigest()
+    with LOCK, db() as connection:
+        connection.execute(
+            'DELETE FROM login_throttle WHERE window_started<=?',
+            (now - (RATE_LIMIT_WINDOW * 2),),
+        )
+        row = connection.execute(
+            '''INSERT INTO login_throttle(key,window_started,attempts)
+               VALUES(?,?,1)
+               ON CONFLICT(key) DO UPDATE SET
+                 attempts=CASE
+                   WHEN login_throttle.window_started<=? THEN 1
+                   ELSE login_throttle.attempts+1
+                 END,
+                 window_started=CASE
+                   WHEN login_throttle.window_started<=? THEN excluded.window_started
+                   ELSE login_throttle.window_started
+                 END
+               RETURNING attempts''',
+            (durable_key, now, cutoff, cutoff),
+        ).fetchone()
+        connection.commit()
+    return int(row['attempts']) > RATE_LIMIT_MAX
+
 def valid_origin(h):
     origin=request_header(h, 'Origin')
     if not origin: return True
@@ -382,7 +483,9 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         if method in ('POST','PUT','DELETE') and not valid_origin(self):
             return json_response(self, {'error':'Cross-origin request blocked.'}, 403)
-        if path in ('/api/owner/login','/api/community/login','/api/squad/login') and method=='POST' and rate_limited(self, path):
+        if path=='/api/owner/login' and method=='POST' and durable_rate_limited(self, path):
+            return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
+        if path in ('/api/community/login','/api/squad/login') and method=='POST' and rate_limited(self, path):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
         if path=='/api/community/forgot' and method=='POST' and rate_limited(self, path):
             return json_response(self, {'error':'Too many password reset requests. Please wait a few minutes and try again.'}, 429)
@@ -398,9 +501,9 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/squad/role' and method=='POST': return self.squad_role_change()
         if path=='/api/logout' and method=='POST':
             session = auth_from_cookie(self)
-            revoke_session(self)
             if session and session.get('type') == 'owner':
-                self.audit(session, 'owner_logout', 'owner', session['id'])
+                return self.owner_logout(session)
+            revoke_session(self)
             return json_response(self, {'ok':True}, 200, {'Set-Cookie':clear_session_cookie(self)})
         if path=='/api/community/register' and method=='POST': return self.community_register()
         if path=='/api/community/login' and method=='POST': return self.community_login()
@@ -438,11 +541,16 @@ class Handler(BaseHTTPRequestHandler):
     def audit(self, session, action, target_type='', target_id='', details=None):
         try:
             with LOCK, db() as c:
-                c.execute('INSERT INTO audit_log(id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details) VALUES(?,?,?,?,?,?,?,?,?)',
-                          ('A'+secrets.token_hex(8),session.get('type'),str(session.get('id')),session.get('role'),action,target_type,str(target_id or ''),now_iso(),json.dumps(details or {},separators=(',',':'))))
+                insert_audit(c, session, action, target_type, target_id, details)
                 c.commit()
         except Exception:
-            pass
+            logging.exception(
+                'Failed to write audit record for action=%s target_type=%s',
+                action,
+                target_type,
+            )
+            return False
+        return True
 
     def owner_setup_status(self):
         with LOCK, db() as c:
@@ -452,34 +560,75 @@ class Handler(BaseHTTPRequestHandler):
 
     def owner_setup(self):
         d=read_json(self)
+        if not OWNER_SETUP_SECRET:
+            return json_response(self, {'error':'Owner setup is unavailable because server configuration is incomplete.'},503)
+        supplied_setup_secret=str(d.get('setupSecret',''))
+        if not hmac.compare_digest(supplied_setup_secret, OWNER_SETUP_SECRET):
+            return json_response(self, {'error':'Owner setup authorization failed.'},403)
         username=str(d.get('username','')).strip()
         password=str(d.get('password',''))
         squad=d.get('squadOwner') or {}
         required=['ign','gameId','serverId','accessCode']
         if len(username)<4 or len(password)<10 or any(not str(squad.get(k,'')).strip() for k in required):
             return json_response(self, {'error':'Owner username must be at least 4 characters, password at least 10 characters, and all Squad Owner credentials are required.'},400)
-        with LOCK, db() as c:
-            row=c.execute("SELECT value FROM app_state WHERE key='owner_setup_complete'").fetchone()
-            if row and row['value']=='true': return json_response(self, {'error':'Owner setup has already been completed and is locked.'},409)
-            if c.execute('SELECT 1 FROM owner_accounts WHERE lower(username)=?',(username.lower(),)).fetchone(): return json_response(self, {'error':'That Owner username is already in use.'},409)
-            owner_id='OWNER-'+secrets.token_hex(6)
-            c.execute('INSERT INTO owner_accounts(id,username,password_hash,created_at) VALUES(?,?,?,?)',(owner_id,username,hash_password(password),now_iso()))
-            existing=c.execute("SELECT id FROM squad_members WHERE id='1'").fetchone()
-            if existing:
-                c.execute("UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,access_code=?,role='Squad Owner',account_activated=1,profile_complete=1 WHERE id='1'",('Dark System Owner',str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),str(squad['accessCode']).strip().upper()))
-            else:
-                c.execute("INSERT INTO squad_members(id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated) VALUES('1','Dark System Owner',?,?,?,?,?,'Offline',1,1)",(str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),'Squad Owner',str(squad['accessCode']).strip().upper()))
-            state_set(c,'owner_setup_complete',True); c.commit()
-        self.audit({'type':'owner','id':owner_id,'role':'Overall Owner'},'owner_setup','system',owner_id,{'username':username})
+        try:
+            with LOCK, db() as c:
+                if c.execute('SELECT 1 FROM owner_accounts WHERE lower(username)=?',(username.lower(),)).fetchone():
+                    return json_response(self, {'error':'That Owner username is already in use.'},409)
+                claim=c.execute(
+                    "UPDATE app_state SET value='true' WHERE key='owner_setup_complete' AND value='false'"
+                )
+                if claim.rowcount != 1:
+                    return json_response(self, {'error':'Owner setup has already been completed and is locked.'},409)
+                owner_id='OWNER-'+secrets.token_hex(6)
+                owner_session={'type':'owner','id':owner_id,'role':'Overall Owner'}
+                c.execute('INSERT INTO owner_accounts(id,username,password_hash,created_at) VALUES(?,?,?,?)',(owner_id,username,hash_password(password),now_iso()))
+                existing=c.execute("SELECT id FROM squad_members WHERE id='1'").fetchone()
+                if existing:
+                    c.execute("UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,access_code=?,role='Squad Owner',account_activated=1,profile_complete=1 WHERE id='1'",('Dark System Owner',str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),str(squad['accessCode']).strip().upper()))
+                else:
+                    c.execute("INSERT INTO squad_members(id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated) VALUES('1','Dark System Owner',?,?,?,?,?,'Offline',1,1)",(str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),'Squad Owner',str(squad['accessCode']).strip().upper()))
+                insert_audit(c,owner_session,'owner_setup','system',owner_id,{'username':username})
+                c.commit()
+        except Exception:
+            logging.exception('Owner setup transaction failed.')
+            return json_response(self, {'error':'Owner setup could not be completed.'},503)
         return json_response(self, {'ok':True,'message':'Owner setup completed and locked.'})
 
     def owner_login(self):
         d=read_json(self); username=str(d.get('username','')).strip().lower(); password=str(d.get('password',''))
         with LOCK, db() as c: row=c.execute('SELECT * FROM owner_accounts WHERE lower(username)=?',(username,)).fetchone()
         if not row or not verify_password(password,row['password_hash']): return json_response(self, {'error':'The Owner username or password is incorrect.'},401)
-        token=create_session('owner',row['id'],'Overall Owner')
-        self.audit({'type':'owner','id':row['id'],'role':'Overall Owner'},'owner_login','owner',row['id'])
+        owner_session={'type':'owner','id':row['id'],'role':'Overall Owner'}
+        try:
+            with LOCK, db() as c:
+                if not c.execute('SELECT 1 FROM owner_accounts WHERE id=?',(row['id'],)).fetchone():
+                    return json_response(self, {'error':'The Owner username or password is incorrect.'},401)
+                token=create_session_record(c,'owner',row['id'],'Overall Owner')
+                insert_audit(c,owner_session,'owner_login','owner',row['id'])
+                c.commit()
+        except Exception:
+            logging.exception('Owner login transaction failed.')
+            return json_response(self, {'error':'Owner login could not be completed.'},503)
         return json_response(self, {'ok':True,'role':'Overall Owner'},200,{'Set-Cookie':session_cookie(self, token)})
+
+    def owner_logout(self, session):
+        raw=request_header(self, 'Cookie')
+        cookies=SimpleCookie(); cookies.load(raw)
+        morsel=cookies.get(COOKIE_NAME)
+        try:
+            with LOCK, db() as c:
+                if morsel:
+                    c.execute(
+                        'DELETE FROM sessions WHERE token=?',
+                        (session_token_hash(morsel.value),),
+                    )
+                insert_audit(c,session,'owner_logout','owner',session['id'])
+                c.commit()
+        except Exception:
+            logging.exception('Owner logout transaction failed.')
+            return json_response(self, {'error':'Owner logout could not be completed.'},503)
+        return json_response(self, {'ok':True},200,{'Set-Cookie':clear_session_cookie(self)})
 
     def owner_overview(self):
         s=require_auth(self,['owner'])
@@ -600,7 +749,9 @@ class Handler(BaseHTTPRequestHandler):
         if not row or row['reset_code']!=code or not row['reset_expires'] or int(row['reset_expires'])<int(time.time()): return json_response(self, {'error':'The reset code is invalid or expired.'},400)
         if len(password)<8:return json_response(self, {'error':'Password must be at least 8 characters.'},400)
         with LOCK, db() as c:
-            c.execute('UPDATE community_accounts SET password_hash=?,reset_code=NULL,reset_expires=NULL WHERE id=?',(hash_password(password),row['id'])); c.commit()
+            c.execute('UPDATE community_accounts SET password_hash=?,reset_code=NULL,reset_expires=NULL WHERE id=?',(hash_password(password),row['id']))
+            c.execute('DELETE FROM sessions WHERE type=? AND user_id=?',('community',str(row['id'])))
+            c.commit()
         return json_response(self, {'ok':True})
     def community_profile(self):
         s=require_auth(self,['community'])
@@ -753,6 +904,8 @@ class Handler(BaseHTTPRequestHandler):
             if not owner:
                 vals['role']=row['role']; vals['accessCode']=row['access_code']; vals['profileComplete']=row['profile_complete']; vals['accountActivated']=row['account_activated']
             c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
+            if str(vals['accessCode']).upper() != str(row['access_code']).upper():
+                c.execute('DELETE FROM sessions WHERE type=? AND user_id=?',('squad',mid))
             c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(mid,)).fetchone()
         self.audit(s,'member_update','squad_member',mid)
         return json_response(self, {'member':public_member(row,True)})
@@ -1091,15 +1244,10 @@ class Handler(BaseHTTPRequestHandler):
         self.audit(s,'legacy_state_sync','state','global',{'domains':list(squad.keys())+list(community.keys())})
         return json_response(self, {'ok':True,'authoritative':True})
     def static_or_404(self,path):
-        if path in ('/owner-admin', '/owner-admin/'):
-            rel='owner-admin.html'
-        else:
-            rel='index.html' if path=='/' else path.lstrip('/')
-        file=(ROOT/rel).resolve()
-        try:
-            file.relative_to(ROOT.resolve())
-        except ValueError:
+        rel=PUBLIC_STATIC_FILES.get(path)
+        if not rel:
             return json_response(self,{'error':'Not found'},404)
+        file=ROOT/rel
         if not file.exists() or not file.is_file(): return json_response(self,{'error':'Not found'},404)
         data=file.read_bytes(); ctype='text/plain'
         if file.suffix=='.html':ctype='text/html; charset=utf-8'
