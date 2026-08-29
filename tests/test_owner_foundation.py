@@ -1,9 +1,13 @@
 import hashlib
+import json
 import time
 import unittest
 from unittest.mock import patch
 
+from fastapi import Request
+
 import server
+from api.index import invoke_existing_backend
 from tests.http_harness import BackendHarness
 
 
@@ -52,6 +56,34 @@ class OwnerFoundationTests(unittest.TestCase):
         )
         self.assertEqual(response.status, 200)
         return response.headers["Set-Cookie"].split(";", 1)[0]
+
+    def adapter_request(self, method, path, payload=None, cookie="", forwarded_proto=None):
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        headers = [(b"host", b"test.local")]
+        if forwarded_proto:
+            headers.append((b"x-forwarded-proto", forwarded_proto.encode("ascii")))
+        if cookie:
+            headers.append((b"cookie", cookie.encode("ascii")))
+        if payload is not None:
+            headers.extend(
+                ((b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("ascii")))
+            )
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("ascii"),
+                "query_string": b"",
+                "headers": headers,
+                "client": ("127.0.0.1", 50000),
+                "server": ("test.local", 80),
+            }
+        )
+        return invoke_existing_backend(request, body)
 
     def test_owner_session_is_revoked_on_logout(self):
         self.complete_owner_setup()
@@ -243,3 +275,29 @@ class OwnerFoundationTests(unittest.TestCase):
             self.assertIn("; SameSite=Strict", response.headers["Set-Cookie"])
             self.assertIn(f"; Max-Age={server.SESSION_TTL}", response.headers["Set-Cookie"])
             self.assertIn("; Secure", response.headers["Set-Cookie"])
+
+    def test_adapter_lowercase_forwarded_https_sets_secure_and_http_does_not(self):
+        self.complete_owner_setup()
+        login = self.adapter_request(
+            "POST",
+            "/api/owner/login",
+            {"username": "overall-owner", "password": "owner-password-123"},
+            forwarded_proto="https",
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertIn("; Secure", login.headers["set-cookie"])
+
+        copied_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        logout = self.adapter_request(
+            "POST", "/api/logout", cookie=copied_cookie, forwarded_proto="https"
+        )
+        self.assertEqual(logout.status_code, 200)
+        self.assertIn("; Secure", logout.headers["set-cookie"])
+
+        plain_http_login = self.adapter_request(
+            "POST",
+            "/api/owner/login",
+            {"username": "overall-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(plain_http_login.status_code, 200)
+        self.assertNotIn("; Secure", plain_http_login.headers["set-cookie"])

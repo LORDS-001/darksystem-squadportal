@@ -275,16 +275,23 @@ def require_auth(h, types=None):
         json_response(h, {'error':'Authentication required'}, 401); return None
     return s
 
+def request_is_https(h):
+    forwarded_proto = h.headers.get('X-Forwarded-Proto') or h.headers.get('x-forwarded-proto', '')
+    return forwarded_proto.split(',', 1)[0].strip().lower() == 'https' or h.server.server_address[1] == 443
+
 def session_cookie(h, token):
-    secure = '; Secure' if h.headers.get('X-Forwarded-Proto','').lower() == 'https' or h.server.server_address[1] == 443 else ''
+    secure = '; Secure' if request_is_https(h) else ''
     return f'{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}'
 
 def set_session(h, token):
     h.send_header('Set-Cookie', session_cookie(h, token))
 
+def clear_session_cookie(h):
+    secure = '; Secure' if request_is_https(h) else ''
+    return f'{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}'
+
 def clear_session(h):
-    secure = '; Secure' if h.headers.get('X-Forwarded-Proto','').lower() == 'https' or h.server.server_address[1] == 443 else ''
-    h.send_header('Set-Cookie', f'{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}')
+    h.send_header('Set-Cookie', clear_session_cookie(h))
 
 def request_ip(h):
     return (h.headers.get('X-Forwarded-For','').split(',')[0].strip() or h.client_address[0])
@@ -344,8 +351,7 @@ class Handler(BaseHTTPRequestHandler):
             revoke_session(self)
             if session and session.get('type') == 'owner':
                 self.audit(session, 'owner_logout', 'owner', session['id'])
-            secure = '; Secure' if self.headers.get('X-Forwarded-Proto','').lower() == 'https' or self.server.server_address[1] == 443 else ''
-            return json_response(self, {'ok':True}, 200, {'Set-Cookie':f'{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}'})
+            return json_response(self, {'ok':True}, 200, {'Set-Cookie':clear_session_cookie(self)})
         if path=='/api/community/register' and method=='POST': return self.community_register()
         if path=='/api/community/login' and method=='POST': return self.community_login()
         if path=='/api/community/forgot' and method=='POST': return self.community_forgot()
