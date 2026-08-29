@@ -21,7 +21,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
         self.assertIsNone(resolved)
 
     def test_test_database_url_is_the_only_required_opt_in(self):
-        test_url = "postgresql://test.example/postgres"
+        test_url = "postgresql://gate-user@test.example/postgres"
 
         resolved = self.resolver()({"TEST_DATABASE_URL": test_url})
 
@@ -45,7 +45,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
         self.assertNotIn("shared.example", str(captured.exception))
 
     def test_gate_accepts_an_explicit_separate_postgresql_test_url(self):
-        test_url = "postgresql://test-project.example/postgres"
+        test_url = "postgresql://gate-user@test-project.example/postgres"
 
         resolved = self.resolver()(
             {
@@ -56,7 +56,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
 
         self.assertEqual(
             resolved,
-            "postgresql://test-project.example:5432/postgres",
+            "postgresql://gate-user@test-project.example:5432/postgres",
         )
 
     def test_gate_rejects_non_postgresql_urls_without_exposing_them(self):
@@ -83,7 +83,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"):
             self.resolver()(
                 {
-                    "TEST_DATABASE_URL": "postgresql://test.example/postgres",
+                    "TEST_DATABASE_URL": "postgresql://gate-user@test.example/postgres",
                     "DATABASE_URL": "host=prod.example port=5432 dbname=postgres",
                 }
             )
@@ -103,7 +103,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
                     self.resolver()(
                         {
                             "TEST_DATABASE_URL": (
-                                f"postgresql://test.example/postgres?{override}"
+                                f"postgresql://gate-user@test.example/postgres?{override}"
                             )
                         }
                     )
@@ -111,7 +111,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.resolver()(
                         {
-                            "TEST_DATABASE_URL": "postgresql://test.example/postgres",
+                            "TEST_DATABASE_URL": "postgresql://gate-user@test.example/postgres",
                             "DATABASE_URL": (
                                 f"postgresql://prod.example/postgres?{override}"
                             ),
@@ -155,6 +155,7 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
             "PGTARGETSESSIONATTRS": "sensitive-pgtargetsessionattrs",
             "PGLOADBALANCEHOSTS": "sensitive-pgloadbalancehosts",
             "PGSYSCONFDIR": "sensitive-pgsysconfdir",
+            "PGUSER": "sensitive-pguser",
         }
         for variable, value in target_environment.items():
             environment = {
@@ -200,8 +201,9 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
             )
 
     def test_gate_accepts_and_preserves_ordinary_supabase_pooler_uri(self):
+        project_ref = "abcdefghijklmnopqrst"
         test_url = (
-            "postgresql://postgres.project-ref:encoded%40password@"
+            f"postgresql://postgres.{project_ref}:encoded%40%3A%2F%3F%23password@"
             "aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
         )
 
@@ -221,10 +223,146 @@ class PostgreSQLGateSafetyTests(unittest.TestCase):
                     self.resolver()(
                         {
                             "TEST_DATABASE_URL": (
-                                f"postgresql://test.example/postgres?{option}"
+                                f"postgresql://gate-user@test.example/postgres?{option}"
                             )
                         }
                     )
+
+    def test_gate_rejects_percent_decoded_authority_injection_without_leaking_it(self):
+        encoded_hosts = (
+            "attacker%40prod.example",
+            "attacker%3Aprod.example",
+            "attacker%2Fprod.example",
+            "attacker%3Fprod.example",
+            "attacker%23prod.example",
+        )
+        for encoded_host in encoded_hosts:
+            with self.subTest(encoded_host=encoded_host):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": (
+                                f"postgresql://gate-user@{encoded_host}:5432/postgres"
+                            )
+                        }
+                    )
+                message = str(captured.exception)
+                self.assertNotIn("attacker", message)
+                self.assertNotIn("prod.example", message)
+                self.assertNotIn(encoded_host, message)
+
+    def test_gate_rejects_legacy_ipv4_aliases_of_production(self):
+        aliases = (
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+            "127.0.1",
+            "0x7f.0.0.1",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                with self.assertRaises(RuntimeError):
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": (
+                                f"postgresql://gate-user@{alias}:5432/postgres"
+                            ),
+                            "DATABASE_URL": (
+                                "postgresql://production-user@127.0.0.1:5432/postgres"
+                            ),
+                        }
+                    )
+
+    def test_gate_requires_explicit_test_user_and_rejects_ambient_pguser(self):
+        with self.assertRaises(RuntimeError):
+            self.resolver()(
+                {"TEST_DATABASE_URL": "postgresql://test.example:5432/postgres"}
+            )
+
+        with self.assertRaises(RuntimeError) as captured:
+            self.resolver()(
+                {
+                    "TEST_DATABASE_URL": (
+                        "postgresql://gate-user@test.example:5432/postgres"
+                    ),
+                    "PGUSER": "sensitive-ambient-user",
+                }
+            )
+        self.assertNotIn("sensitive-ambient-user", str(captured.exception))
+
+    def test_gate_treats_supabase_direct_and_pooler_routes_as_one_project(self):
+        project_ref = "abcdefghijklmnopqrst"
+        routes = (
+            (
+                f"postgresql://postgres:test-secret@db.{project_ref}.supabase.co:5432/postgres",
+                f"postgresql://postgres.{project_ref}:prod-secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            ),
+            (
+                f"postgresql://postgres.{project_ref}:test-secret@aws-0-eu-west-1.pooler.supabase.com:5432/postgres",
+                f"postgresql://postgres:prod-secret@db.{project_ref}.supabase.co:6543/postgres",
+            ),
+            (
+                f"postgresql://postgres.{project_ref}:test-secret@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+                f"postgresql://postgres.{project_ref}:prod-secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            ),
+        )
+        for test_url, production_url in routes:
+            with self.subTest(test_host=urlsplit(test_url).hostname):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": test_url,
+                            "DATABASE_URL": production_url,
+                        }
+                    )
+                message = str(captured.exception)
+                self.assertNotIn(project_ref, message)
+                self.assertNotIn("test-secret", message)
+                self.assertNotIn("prod-secret", message)
+
+    def test_gate_allows_separate_projects_on_the_same_supabase_pooler(self):
+        test_ref = "abcdefghijklmnopqrst"
+        production_ref = "zyxwvutsrqponmlkjihg"
+        test_url = (
+            f"postgresql://postgres.{test_ref}:encoded%40password@"
+            "aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
+        )
+
+        resolved = self.resolver()(
+            {
+                "TEST_DATABASE_URL": test_url,
+                "DATABASE_URL": (
+                    f"postgresql://postgres.{production_ref}:production-secret@"
+                    "aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
+                ),
+            }
+        )
+
+        self.assertEqual(resolved, test_url)
+
+    def test_gate_fails_closed_for_ambiguous_supabase_routing_forms(self):
+        ambiguous_urls = (
+            "postgresql://postgres:test-secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            "postgresql://postgres.short:test-secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            "postgresql://postgres:test-secret@db.short.supabase.co:5432/postgres",
+        )
+        for ambiguous_url in ambiguous_urls:
+            with self.subTest(host=urlsplit(ambiguous_url).hostname):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.resolver()({"TEST_DATABASE_URL": ambiguous_url})
+                self.assertNotIn("test-secret", str(captured.exception))
+            with self.subTest(production_host=urlsplit(ambiguous_url).hostname):
+                with self.assertRaises(RuntimeError) as captured:
+                    self.resolver()(
+                        {
+                            "TEST_DATABASE_URL": (
+                                "postgresql://gate-user@test.example:5432/postgres"
+                            ),
+                            "DATABASE_URL": ambiguous_url,
+                        }
+                    )
+                self.assertNotIn("test-secret", str(captured.exception))
 
 
 if __name__ == "__main__":

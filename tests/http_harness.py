@@ -3,6 +3,7 @@ import ipaddress
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ _TARGET_QUERY_OPTIONS = {
     "service",
     "servicefile",
     "target_session_attrs",
+    "user",
+    "password",
 }
 _TARGET_LIBPQ_ENVIRONMENT = {
     "PGDATABASE",
@@ -34,7 +37,25 @@ _TARGET_LIBPQ_ENVIRONMENT = {
     "PGSERVICEFILE",
     "PGSYSCONFDIR",
     "PGTARGETSESSIONATTRS",
+    "PGUSER",
 }
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_NUMERIC_HOST_ALIAS = re.compile(
+    r"^(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*$"
+)
+_SUPABASE_PROJECT_REF = re.compile(r"^[a-z0-9]{20}$")
+_SUPABASE_DIRECT_HOST = re.compile(
+    r"^db\.([a-z0-9]{20})\.supabase\.co$"
+)
+
+
+@dataclass(frozen=True)
+class _PostgresTarget:
+    host: str
+    port: int
+    database: str
+    username: str
+    supabase_project: str
 
 
 def _psycopg_conninfo(database_url):
@@ -48,34 +69,75 @@ def _psycopg_conninfo(database_url):
         return None
 
 
-def _normalize_postgres_host(host):
-    decoded = unquote(str(host)).lower().rstrip(".")
+def _canonical_postgres_host(host):
+    decoded = unquote(str(host)).lower()
+    if decoded.endswith("."):
+        decoded = decoded[:-1]
+    if not decoded or decoded.endswith("."):
+        return None
     try:
-        return ipaddress.ip_address(decoded).compressed
+        address = ipaddress.ip_address(decoded)
     except ValueError:
+        if _NUMERIC_HOST_ALIAS.fullmatch(decoded):
+            return None
+        labels = decoded.split(".")
+        if len(decoded) > 253 or any(
+            not label or not _DNS_LABEL.fullmatch(label) for label in labels
+        ):
+            return None
         return decoded
+    if getattr(address, "scope_id", None):
+        return None
+    return address.compressed
 
 
-def _postgres_database_identity(database_url):
+def _supabase_project_for_target(host, username):
+    direct_match = _SUPABASE_DIRECT_HOST.fullmatch(host)
+    if direct_match:
+        return direct_match.group(1)
+    if host == "supabase.co" or host.endswith(".supabase.co"):
+        return None
+    if host == "pooler.supabase.com" or host.endswith(".pooler.supabase.com"):
+        role, separator, project_ref = username.rpartition(".")
+        if (
+            not separator
+            or not role
+            or not _SUPABASE_PROJECT_REF.fullmatch(project_ref)
+        ):
+            return None
+        return project_ref
+    if host == "supabase.com" or host.endswith(".supabase.com"):
+        return None
+    return ""
+
+
+def _postgres_database_target(database_url, require_user=False):
     try:
         parsed = urlsplit(database_url)
         query_options = {
             str(key).lower()
             for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
         }
-        host = _normalize_postgres_host(parsed.hostname or "")
-        port = parsed.port or 5432
+        host = _canonical_postgres_host(parsed.hostname or "")
+        parsed_port = parsed.port
+        port = 5432 if parsed_port is None else parsed_port
+        username = unquote(parsed.username or "")
     except (TypeError, ValueError):
         return None
     if (
         parsed.scheme.lower() not in ("postgres", "postgresql")
         or not host
+        or not (1 <= port <= 65535)
         or parsed.fragment
+        or parsed.netloc.count("@") > 1
         or "," in host
         or query_options.intersection(_TARGET_QUERY_OPTIONS)
+        or (require_user and not username)
     ):
         return None
-    database_name = unquote(parsed.path.lstrip("/")).strip()
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return None
+    database_name = unquote(parsed.path[1:]).strip()
     if not database_name or "/" in database_name:
         return None
     normalized = _psycopg_conninfo(database_url)
@@ -84,35 +146,56 @@ def _postgres_database_identity(database_url):
     if normalized:
         if normalized.get("service") or normalized.get("servicefile"):
             return None
-        normalized_host = _normalize_postgres_host(normalized.get("host", host))
+        normalized_host = _canonical_postgres_host(normalized.get("host", host))
         normalized_port = str(normalized.get("port", port))
         normalized_database = str(normalized.get("dbname", database_name))
-        if "," in normalized_host or "," in normalized_port:
+        normalized_username = str(normalized.get("user", username))
+        if (
+            not normalized_host
+            or "," in normalized_host
+            or "," in normalized_port
+        ):
             return None
         try:
             port = int(normalized_port)
         except ValueError:
             return None
+        if not (1 <= port <= 65535):
+            return None
         host = normalized_host
         database_name = normalized_database
-    return (
-        host,
-        port,
-        database_name,
+        username = normalized_username
+    if require_user and not username:
+        return None
+    supabase_project = _supabase_project_for_target(host, username)
+    if supabase_project is None:
+        return None
+    return _PostgresTarget(
+        host=host,
+        port=port,
+        database=database_name,
+        username=username,
+        supabase_project=supabase_project,
     )
 
 
-def _explicit_postgres_url(database_url, identity):
+def _postgres_target_identity(target):
+    if target.supabase_project:
+        return ("supabase", target.supabase_project, target.database)
+    return ("postgresql", target.host, target.port, target.database)
+
+
+def _explicit_postgres_url(database_url, target):
     parsed = urlsplit(database_url)
-    if parsed.netloc.count("@") > 1:
-        return None
-    raw_userinfo, separator, _raw_target = parsed.netloc.rpartition("@")
-    userinfo = f"{raw_userinfo}@" if separator else ""
-    host, port, database_name = identity
+    encoded_user = quote(target.username, safe="")
+    encoded_password = ""
+    if parsed.password is not None:
+        encoded_password = f":{quote(unquote(parsed.password), safe='')}"
+    userinfo = f"{encoded_user}{encoded_password}@"
     try:
-        host_literal = ipaddress.ip_address(host)
+        host_literal = ipaddress.ip_address(target.host)
     except ValueError:
-        uri_host = host
+        uri_host = quote(target.host, safe=".-")
     else:
         uri_host = (
             f"[{host_literal.compressed}]"
@@ -122,8 +205,8 @@ def _explicit_postgres_url(database_url, identity):
     return urlunsplit(
         (
             "postgresql",
-            f"{userinfo}{uri_host}:{port}",
-            f"/{quote(database_name, safe='')}",
+            f"{userinfo}{uri_host}:{target.port}",
+            f"/{quote(target.database, safe='')}",
             parsed.query,
             "",
         )
@@ -140,27 +223,31 @@ def resolve_test_database_url(environment=None):
         raise RuntimeError(
             "Target-affecting libpq environment variables must be unset for the PostgreSQL test gate."
         )
-    test_identity = _postgres_database_identity(test_database_url)
-    if test_identity is None:
+    test_target = _postgres_database_target(test_database_url, require_user=True)
+    if test_target is None:
         raise RuntimeError(
             "TEST_DATABASE_URL must be a single explicit PostgreSQL URI whose target can be safely verified."
         )
     production_database_url = str(source.get("DATABASE_URL", "")).strip()
-    production_identity = _postgres_database_identity(production_database_url)
-    if production_database_url and production_identity is None:
+    production_target = _postgres_database_target(production_database_url)
+    if production_database_url and production_target is None:
         raise RuntimeError(
             "DATABASE_URL cannot be safely compared with TEST_DATABASE_URL."
         )
     if production_database_url and (
         test_database_url == production_database_url
-        or (production_identity is not None and test_identity == production_identity)
+        or (
+            production_target is not None
+            and _postgres_target_identity(test_target)
+            == _postgres_target_identity(production_target)
+        )
     ):
         raise RuntimeError(
             "The disposable PostgreSQL test database must differ from DATABASE_URL."
         )
     explicit_test_database_url = _explicit_postgres_url(
         test_database_url,
-        test_identity,
+        test_target,
     )
     if explicit_test_database_url is None:
         raise RuntimeError(
