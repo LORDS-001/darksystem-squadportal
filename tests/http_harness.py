@@ -1,6 +1,7 @@
 import io
 import json
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,15 +38,36 @@ class _HandlerServer:
 
 
 class BackendHarness:
+    _active_lock = threading.Lock()
+    _active = False
+
     def __init__(self):
-        self._temporary_directory = tempfile.TemporaryDirectory()
         self._original_db_path = server.DB_PATH
         self._original_database_url = server.DATABASE_URL
         self._original_session_secret = server.SESSION_SECRET
-        server.DB_PATH = Path(self._temporary_directory.name) / "dark-system.sqlite3"
-        server.DATABASE_URL = ""
-        server.SESSION_SECRET = "test-owner-session-secret"
-        server.init_db()
+        self._temporary_directory = None
+        self._closed = True
+        with BackendHarness._active_lock:
+            if BackendHarness._active:
+                raise RuntimeError("Only one BackendHarness can be active at a time.")
+            BackendHarness._active = True
+        try:
+            self._temporary_directory = tempfile.TemporaryDirectory()
+            server.DB_PATH = Path(self._temporary_directory.name) / "dark-system.sqlite3"
+            server.DATABASE_URL = ""
+            server.SESSION_SECRET = "test-owner-session-secret"
+            server.init_db()
+        except Exception:
+            try:
+                server.DB_PATH = self._original_db_path
+                server.DATABASE_URL = self._original_database_url
+                server.SESSION_SECRET = self._original_session_secret
+                if self._temporary_directory:
+                    self._temporary_directory.cleanup()
+            finally:
+                with BackendHarness._active_lock:
+                    BackendHarness._active = False
+            raise
         self._closed = False
 
     def request(self, method: str, path: str, payload: dict | None = None, cookie: str = "") -> BackendResponse:
@@ -69,11 +91,15 @@ class BackendHarness:
     def close(self):
         if self._closed:
             return
-        server.DB_PATH = self._original_db_path
-        server.DATABASE_URL = self._original_database_url
-        server.SESSION_SECRET = self._original_session_secret
-        self._temporary_directory.cleanup()
-        self._closed = True
+        try:
+            server.DB_PATH = self._original_db_path
+            server.DATABASE_URL = self._original_database_url
+            server.SESSION_SECRET = self._original_session_secret
+            self._temporary_directory.cleanup()
+        finally:
+            self._closed = True
+            with BackendHarness._active_lock:
+                BackendHarness._active = False
 
     @staticmethod
     def _parse_response(raw_response: bytes) -> BackendResponse:

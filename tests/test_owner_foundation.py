@@ -14,3 +14,11 @@ class OwnerFoundationTests(unittest.TestCase):
         response = self.backend.request("GET", "/api/owner/setup/status")
         self.assertEqual(response.status, 200)
         self.assertEqual(response.json, {"setupComplete": False})
+
+    def test_backend_harnesses_require_non_overlapping_lifetimes(self):
+        with self.assertRaises(RuntimeError):
+            BackendHarness()
+        self.backend.close()
+        self.backend = BackendHarness()
+        response = self.backend.request("GET", "/api/owner/setup/status")
+        self.assertEqual(response.json, {"setupComplete": False})
