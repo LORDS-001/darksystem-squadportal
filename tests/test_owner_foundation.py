@@ -38,6 +38,63 @@ class OwnerFoundationTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.json, {"setupComplete": False})
 
+    def test_complete_owner_foundation_lifecycle(self):
+        fresh_status = self.backend.request("GET", "/api/owner/setup/status")
+        self.assertEqual(fresh_status.status, 200)
+        self.assertEqual(fresh_status.json, {"setupComplete": False})
+
+        setup_payload = {
+            "username": "overall-owner",
+            "password": "owner-password-123",
+            "squadOwner": {
+                "ign": "DarkOwner",
+                "gameId": "123456",
+                "serverId": "1234",
+                "accessCode": "DS-OWNER",
+            },
+        }
+        setup = self.backend.request("POST", "/api/owner/setup", setup_payload)
+        self.assertEqual(setup.status, 200)
+
+        repeated_setup = self.backend.request("POST", "/api/owner/setup", setup_payload)
+        self.assertEqual(repeated_setup.status, 409)
+
+        login = self.backend.request(
+            "POST",
+            "/api/owner/login",
+            {"username": "overall-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(login.status, 200)
+        copied_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+        overview = self.backend.request("GET", "/api/owner/overview", cookie=copied_cookie)
+        self.assertEqual(overview.status, 200)
+
+        logout = self.backend.request("POST", "/api/logout", cookie=copied_cookie)
+        self.assertEqual(logout.status, 200)
+
+        rejected_overview = self.backend.request(
+            "GET", "/api/owner/overview", cookie=copied_cookie
+        )
+        self.assertEqual(rejected_overview.status, 401)
+        rejected_auth = self.backend.request("GET", "/api/auth/me", cookie=copied_cookie)
+        self.assertEqual(rejected_auth.json, {"authenticated": False, "session": None})
+
+        with server.LOCK, server.db() as connection:
+            audit_counts = {
+                row["action"]: row["count"]
+                for row in connection.execute(
+                    """SELECT action, COUNT(*) AS count
+                       FROM audit_log
+                       WHERE action IN ('owner_setup', 'owner_login', 'owner_logout')
+                       GROUP BY action"""
+                )
+            }
+        self.assertEqual(
+            audit_counts,
+            {"owner_setup": 1, "owner_login": 1, "owner_logout": 1},
+        )
+
     def test_backend_harnesses_require_non_overlapping_lifetimes(self):
         with self.assertRaises(RuntimeError):
             BackendHarness()

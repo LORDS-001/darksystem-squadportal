@@ -36,6 +36,18 @@ Deploy and test:
 
 The normal website should load from the same Vercel domain, and the API remains same-origin.
 
+### Owner foundation smoke test
+
+After deployment, verify only the Owner foundation flow:
+
+1. Verify `/api/health`.
+2. Verify `/api/owner/setup/status`.
+3. Open `/owner-admin` and confirm it is absent from public navigation.
+4. On a fresh database, complete setup once and confirm a repeat is rejected.
+5. Log in, verify overview counts, log out, and confirm browser Back cannot reopen protected data.
+6. Confirm `/api/owner/overview` returns `401` after logout.
+7. Inspect Vercel logs for uncaught exceptions and confirm none occurred during the smoke test.
+
 ## Owner Setup
 
 Do **not** create real Owner credentials until the deployed site passes the smoke/regression test. Then use the website's one-time Owner Setup screen. Setup locks after successful completion.
