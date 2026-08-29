@@ -1,16 +1,61 @@
 import asyncio
 import io
 import json
+import os
 import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import server
 from fastapi import Request
 
 
 _MISSING = object()
+
+
+def _postgres_database_identity(database_url):
+    try:
+        parsed = urlsplit(database_url)
+        port = parsed.port or 5432
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme not in ("postgres", "postgresql") or not parsed.hostname:
+        return None
+    database_name = unquote(parsed.path.lstrip("/")).strip()
+    if not database_name:
+        return None
+    return (
+        parsed.hostname.lower(),
+        port,
+        database_name,
+    )
+
+
+def resolve_test_database_url(environment=None):
+    """Return the explicit disposable PostgreSQL URL without falling back."""
+    source = os.environ if environment is None else environment
+    test_database_url = str(source.get("TEST_DATABASE_URL", "")).strip()
+    if not test_database_url:
+        return None
+    if str(source.get("TEST_DATABASE_DISPOSABLE", "")).strip() != "1":
+        raise RuntimeError(
+            "PostgreSQL integration requires explicit disposable test database confirmation."
+        )
+    test_identity = _postgres_database_identity(test_database_url)
+    if test_identity is None:
+        raise RuntimeError("TEST_DATABASE_URL must identify a PostgreSQL database.")
+    production_database_url = str(source.get("DATABASE_URL", "")).strip()
+    production_identity = _postgres_database_identity(production_database_url)
+    if production_database_url and (
+        test_database_url == production_database_url
+        or (production_identity is not None and test_identity == production_identity)
+    ):
+        raise RuntimeError(
+            "The disposable PostgreSQL test database must differ from DATABASE_URL."
+        )
+    return test_database_url
 
 
 @dataclass

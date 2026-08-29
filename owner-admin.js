@@ -254,13 +254,18 @@ function renderOwnerDashboard(data) {
   logout.type = "button";
   logout.addEventListener("click", ownerLogout);
   header.append(heading, logout);
-  dashboard.append(header);
+  const logoutError = ownerElement("p", "owner-admin__error-banner owner-admin__logout-error");
+  logoutError.hidden = true;
+  logoutError.setAttribute("role", "alert");
+  dashboard.append(header, logoutError);
 
   const health = data && typeof data.health === "object" ? data.health : {};
   const healthCard = ownerElement("section", "owner-admin__health-card");
-  const healthIndicator = ownerElement("p", "owner-admin__health-indicator", "Database: ");
-  healthIndicator.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.database)));
-  healthCard.append(ownerElement("h2", "owner-admin__section-title", "System health"), healthIndicator);
+  const backendHealth = ownerElement("p", "owner-admin__health-indicator", "Backend: ");
+  backendHealth.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.backend)));
+  const databaseHealth = ownerElement("p", "owner-admin__health-indicator", "Database: ");
+  databaseHealth.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.database)));
+  healthCard.append(ownerElement("h2", "owner-admin__section-title", "System health"), backendHealth, databaseHealth);
   dashboard.append(healthCard);
   appendMetricGroup(dashboard, "System totals", data && data.counts);
   appendMetricGroup(dashboard, "Pending work", data && data.pending);
@@ -293,17 +298,17 @@ function renderOwnerDashboard(data) {
 
 async function ownerLogout() {
   const logoutButton = document.querySelector(".owner-admin__dashboard .owner-admin__button--secondary");
+  const logoutError = document.querySelector(".owner-admin__dashboard .owner-admin__logout-error");
+  if (logoutError) setOwnerError(logoutError, "");
   if (logoutButton) setOwnerBusy(logoutButton, true, "Logout");
-  let notice = "You have been logged out.";
-  let logoutFailed = false;
   try {
     await ownerApi("/api/logout", { method: "POST" });
-  } catch (requestError) {
-    notice = requestError.message;
-    logoutFailed = true;
-  } finally {
     activeOwnerSession = null;
-    renderOwnerLogin(notice, logoutFailed);
+    renderOwnerLogin("You have been logged out.");
+  } catch (requestError) {
+    if (logoutError) setOwnerError(logoutError, requestError.message);
+  } finally {
+    if (activeOwnerSession && logoutButton) setOwnerBusy(logoutButton, false, "Logout");
   }
 }
 

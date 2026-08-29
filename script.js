@@ -232,7 +232,7 @@ function communityForgot(){
 function openCommunityApp(){
   document.getElementById('public').classList.add('hidden');document.querySelector('footer').classList.add('hidden');document.getElementById('app').classList.add('hidden');document.getElementById('communityApp').classList.remove('hidden');renderCommunityApp();window.scrollTo(0,0);
 }
-function communityLogout(){if(DARK_BACKEND)api('/api/logout',{method:'POST'}).catch(()=>{});communityCurrent=null;refreshSiteMenu();document.getElementById('communityApp').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();goHome()}
+async function communityLogout(){if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}communityCurrent=null;refreshSiteMenu();document.getElementById('communityApp').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();goHome();return true}
 function renderCommunityApp(){
   const regs=communityDb.registrations.filter(r=>r.accountId===communityCurrent.id);
   const open=communityDb.tournaments.filter(t=>isTournamentVisibleInAvailable(t));
@@ -365,7 +365,7 @@ function openApp(){
   render(); startPresence();
 }
 function startPresence(){clearInterval(presence);presence=setInterval(()=>{if(!current)return;const m=db.members.find(x=>x.id===current.id);if(m){m.status='Online';save();if(tab==='overview')render();}},10000)}
-function logout(){if(DARK_BACKEND)api('/api/logout',{method:'POST'}).catch(()=>{});clearInterval(presence);if(current){const m=db.members.find(x=>x.id===current.id);if(m){m.status='Offline';save()}}current=null;refreshSiteMenu();document.getElementById('app').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();window.scrollTo(0,0)}
+async function logout(){if(DARK_BACKEND){try{await api('/api/logout',{method:'POST'})}catch(err){error('LOGOUT FAILED',err.message);return false}}clearInterval(presence);if(current){const m=db.members.find(x=>x.id===current.id);if(m){m.status='Offline';save()}}current=null;refreshSiteMenu();document.getElementById('app').classList.add('hidden');document.getElementById('public').classList.remove('hidden');document.querySelector('footer').classList.remove('hidden');renderPublic();window.scrollTo(0,0);return true}
 
 function renderPublic(){
   const publicMembers=communityDb.accounts;
@@ -1408,11 +1408,11 @@ renderTournamentPage=function(){
 const _v64RenderCommunityApp=renderCommunityApp;
 renderCommunityApp=function(){_v64RenderCommunityApp();refreshPortalNavLock();};
 const _v64CommunityLogout=communityLogout;
-communityLogout=function(){_v64CommunityLogout();refreshPortalNavLock();};
+communityLogout=async function(){const loggedOut=await _v64CommunityLogout();refreshPortalNavLock();return loggedOut;};
 const _v64OpenApp=openApp;
 openApp=function(){_v64OpenApp();refreshPortalNavLock();};
 const _v64Logout=logout;
-logout=function(){_v64Logout();refreshPortalNavLock();};
+logout=async function(){const loggedOut=await _v64Logout();refreshPortalNavLock();return loggedOut;};
 refreshPortalNavLock();
 
 /* ================= V12: SQUAD-VS-SQUAD TOURNAMENT WORKFLOW ================= */

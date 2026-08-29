@@ -546,7 +546,10 @@ class OwnerFoundationTests(unittest.TestCase):
         response = self.backend.request("GET", "/api/owner/overview", cookie=owner_cookie)
 
         self.assertEqual(response.status, 200)
-        self.assertIn("health", response.json)
+        self.assertEqual(
+            response.json["health"],
+            {"backend": "healthy", "database": "healthy"},
+        )
         self.assertEqual(
             response.json["counts"],
             {"communityMembers": 1, "squadMembers": 2, "activeTournaments": 1, "completedTournaments": 1},

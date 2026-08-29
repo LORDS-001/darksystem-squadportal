@@ -670,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
                 'squadApprovals':sum(1 for approval in approvals if isinstance(approval,dict) and overview_status(approval.get('status') or 'Pending')=='pending'),
                 'results':sum(1 for tournament in tournaments if isinstance(tournament,dict) for match in (tournament.get('matches') or []) if isinstance(match,dict) and pending_overview_result(match)),
             }
-        return json_response(self,{'health':{'database':'healthy'},'counts':counts,'pending':pending,'recentAudit':audit})
+        return json_response(self,{'health':{'backend':'healthy','database':'healthy'},'counts':counts,'pending':pending,'recentAudit':audit})
 
     def owner_audit(self):
         s=require_auth(self,['owner'])
