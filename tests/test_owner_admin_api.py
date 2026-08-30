@@ -105,8 +105,14 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
 
         self.assertEqual(response.status, 200)
         payload = response.json
-        self.assertEqual(set(payload["community"]), {"tournaments"})
-        self.assertNotIn("accounts", payload["community"])
+        self.assertEqual(set(payload["community"]), {"accounts", "tournaments"})
+        profile = next(
+            item for item in payload["community"]["accounts"]
+            if item["ign"] == "BoundaryMember"
+        )
+        self.assertTrue({"id", "ign", "role", "lane"}.issubset(profile))
+        self.assertNotIn("email", profile)
+        self.assertNotIn("phone", profile)
         self.assertNotIn("registrations", payload["community"])
         self.assertNotIn("tournamentManagers", payload["community"])
         self.assertNotIn("seasonPoints", payload["community"])
@@ -166,10 +172,14 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertNotIn("community-bootstrap@example.test", serialized)
         self.assertNotIn("+234-555-0100", serialized)
 
-    def test_authorized_squad_bootstrap_preserves_management_data_without_access_codes(self):
+    def test_authorized_squad_bootstrap_round_trip_preserves_member_contact_and_access_code_data(self):
         self.setup_owner()
         cookie = self.squad_cookie()
         with server.LOCK, server.db() as connection:
+            connection.execute(
+                "UPDATE squad_members SET email=?,phone=?,birthday=?,access_code=? WHERE id='1'",
+                ("squad-owner@example.test", "+234-555-0199", "2000-01-01", "PRESERVED-ACCESS-CODE"),
+            )
             server.state_set(connection, "reports", [{"id": "report-1", "memberId": "1", "body": "Ready"}])
             server.state_set(connection, "complaints", [{"id": "complaint-1", "memberId": "1", "body": "Private"}])
             server.state_set(connection, "reportConfig", {"title": "Daily Report", "fields": []})
@@ -188,9 +198,29 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertEqual(squad["complaints"][0]["id"], "complaint-1")
         self.assertEqual(squad["reportConfig"]["title"], "Daily Report")
         self.assertEqual(response.json["community"]["tournaments"][0]["matches"][0]["id"], "match-2")
-        serialized = json.dumps(response.json).lower()
-        self.assertNotIn("ds-owner", serialized)
-        self.assertNotIn("accesscode", serialized)
+        member = next(item for item in squad["members"] if item["id"] == "1")
+        self.assertEqual(member["email"], "squad-owner@example.test")
+        self.assertEqual(member["phone"], "+234-555-0199")
+        self.assertEqual(member["birthday"], "2000-01-01")
+        self.assertEqual(member["accessCode"], "PRESERVED-ACCESS-CODE")
+
+        synced = self.backend.request(
+            "PUT", "/api/state", {"squad": squad, "community": response.json["community"]}, cookie=cookie
+        )
+        self.assertEqual(synced.status, 200)
+        with server.LOCK, server.db() as connection:
+            stored = connection.execute(
+                "SELECT email,phone,birthday,access_code FROM squad_members WHERE id='1'"
+            ).fetchone()
+        self.assertEqual(
+            dict(stored),
+            {
+                "email": "squad-owner@example.test",
+                "phone": "+234-555-0199",
+                "birthday": "2000-01-01",
+                "access_code": "PRESERVED-ACCESS-CODE",
+            },
+        )
 
     def test_owner_collections_require_an_overall_owner_session(self):
         community = self.register_community("guard-community@example.test")
@@ -245,6 +275,39 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertNotIn("MEMBER-ACCESS", json.dumps(member))
         self.assertNotIn("COMMUNITY-HASH", json.dumps(account))
         self.assertNotIn("COMMUNITY-RESET", json.dumps(account))
+
+    def test_audit_storage_redacts_secret_keys_and_historical_credential_strings(self):
+        self.setup_owner()
+        with server.LOCK, server.db() as connection:
+            server.insert_audit(
+                connection,
+                {"type": "owner", "id": "owner-1", "role": "Overall Owner"},
+                "audit_string_redaction",
+                "system",
+                "system",
+                {
+                    "code": "HISTORICAL-CODE-123",
+                    "context": "password=historical-password; token: historical-token; access code=HISTORICAL-ACCESS",
+                    "nested": {"recoveryCode": "HISTORICAL-RECOVERY", "summary": "Member disabled"},
+                },
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT details FROM audit_log WHERE action='audit_string_redaction'"
+            ).fetchone()
+
+        details = json.loads(row["details"])
+        serialized = json.dumps(details).lower()
+        for secret in (
+            "historical-code-123",
+            "historical-password",
+            "historical-token",
+            "historical-access",
+            "historical-recovery",
+        ):
+            self.assertNotIn(secret.lower(), serialized)
+        self.assertEqual(details["nested"], {"summary": "Member disabled"})
+        self.assertIn("[redacted]", details["context"])
 
     def test_owner_audit_never_returns_credentials_or_session_tokens(self):
         self.setup_owner()

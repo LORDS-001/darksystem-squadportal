@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, hashlib, hmac, json, logging, os, secrets, smtplib, sqlite3, threading, time
+import base64, hashlib, hmac, json, logging, os, re, secrets, smtplib, sqlite3, threading, time
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -317,11 +317,12 @@ def bootstrap_secret_values(c):
 def bootstrap(session):
     with LOCK, db() as c:
         members = [public_bootstrap_member(r) for r in c.execute('SELECT * FROM squad_members').fetchall()]
+        accounts = [public_bootstrap_account(r) for r in c.execute('SELECT * FROM community_accounts').fetchall()]
         tournaments = [
             item for tournament in state_get(c, 'tournaments', [])
             if (item := public_bootstrap_tournament(tournament)) is not None
         ]
-        community = {'tournaments': tournaments}
+        community = {'accounts': accounts, 'tournaments': tournaments}
         squad = {
             'members': members,
             'announcements': state_get(c, 'announcements', []),
@@ -334,7 +335,6 @@ def bootstrap(session):
         session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
         sanitize=lambda value: sanitize_overview_value(value, secret_values, session_token_hashes)
         safe_state=lambda key, default: sanitize(state_get(c, key, default))
-        accounts=[public_bootstrap_account(row) for row in c.execute('SELECT * FROM community_accounts').fetchall()]
         session_type=session.get('type')
         session_id=str(session.get('id'))
         registrations=safe_state('registrations', [])
@@ -366,6 +366,8 @@ def bootstrap(session):
         }
         if session_type == 'squad':
             privileged=session.get('role') in ('Squad Owner', 'Squad Leader', 'Assistant Squad Leader')
+            if privileged:
+                squad['members']=[public_member(row, True) for row in c.execute('SELECT * FROM squad_members').fetchall()]
             reports=safe_state('reports', [])
             squad.update({
                 'reports':reports if privileged else [item for item in reports if isinstance(item, dict) and str(item.get('memberId')) == session_id],
@@ -486,9 +488,15 @@ def clear_session(h):
 
 def overview_secret_key(key):
     normalized = ''.join(ch for ch in str(key).lower() if ch.isalnum())
-    return any(part in normalized for part in ('password', 'accesscode', 'resetcode', 'token', 'credential', 'secret'))
+    return any(part in normalized for part in ('password', 'accesscode', 'resetcode', 'recoverycode', 'token', 'credential', 'secret', 'code'))
 
 _OVERVIEW_OMIT = object()
+_EMBEDDED_AUDIT_SECRET = re.compile(
+    r'(?i)(\b(?:password|passphrase|token|credential|secret|access[ _-]?code|reset[ _-]?code|recovery[ _-]?code|code)\b\s*(?:=|:)\s*)([^\s,;]+)'
+)
+
+def redact_embedded_audit_secrets(value):
+    return _EMBEDDED_AUDIT_SECRET.sub(r'\1[redacted]', value)
 
 def sanitize_overview_value(value, secret_values, session_token_hashes):
     if isinstance(value, dict):
@@ -502,8 +510,10 @@ def sanitize_overview_value(value, secret_values, session_token_hashes):
         return cleaned
     if isinstance(value, (list, tuple)):
         return [item for value_item in value if (item := sanitize_overview_value(value_item, secret_values, session_token_hashes)) is not _OVERVIEW_OMIT]
-    if isinstance(value, str) and (value in secret_values or session_token_hash(value) in session_token_hashes):
-        return _OVERVIEW_OMIT
+    if isinstance(value, str):
+        if value in secret_values or session_token_hash(value) in session_token_hashes:
+            return _OVERVIEW_OMIT
+        return redact_embedded_audit_secrets(value)
     return value
 
 def overview_details(raw_details, secret_values, session_token_hashes):
