@@ -1333,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('INSERT INTO owner_accounts(id,username,password_hash,created_at) VALUES(?,?,?,?)',(owner_id,username,hash_password(password),now_iso()))
                 existing=c.execute("SELECT id FROM squad_members WHERE id='1'").fetchone()
                 if existing:
-                    c.execute("UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,access_code=?,role='Squad Owner',account_activated=1,profile_complete=1 WHERE id='1'",('Dark System Owner',str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),str(squad['accessCode']).strip().upper()))
+                    c.execute("UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,access_code=?,role='Squad Owner',account_activated=1,profile_complete=1,recovery_pending=0 WHERE id='1'",('Dark System Owner',str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),str(squad['accessCode']).strip().upper()))
                 else:
                     c.execute("INSERT INTO squad_members(id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated) VALUES('1','Dark System Owner',?,?,?,?,?,'Offline',1,1)",(str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),'Squad Owner',str(squad['accessCode']).strip().upper()))
                 c.execute('UPDATE squad_members SET access_code_hash=?,access_code=? WHERE id=?',(hash_password(str(squad['accessCode']).strip().upper()),'','1'))
@@ -1798,7 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
                 new_access_hash=row['access_code_hash']
                 recovery_pending = int(row['recovery_pending'] or 0)
-                if values['status'] == 'Disabled' or ('accountActivated' in data and not account_activated):
+                if values['status'] == 'Disabled' or 'accountActivated' in data:
                     recovery_pending = 0
                 c.execute(
                     '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=?,recovery_pending=? WHERE id=?''',
@@ -1874,7 +1874,7 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT id FROM squad_members WHERE role='Squad Owner' AND id!=?", (member_id,)
                 ).fetchall()
                 c.execute("UPDATE squad_members SET role='Squad Member' WHERE role='Squad Owner' AND id!=?", (member_id,))
-                c.execute("UPDATE squad_members SET role='Squad Owner',status='Offline',account_activated=1 WHERE id=?", (member_id,))
+                c.execute("UPDATE squad_members SET role='Squad Owner',status='Offline',account_activated=1,recovery_pending=0 WHERE id=?", (member_id,))
                 remove_tournament_manager_permission(c, member_id)
                 for former in former_rows:
                     revoke_user_sessions(c, 'squad', former['id'])
@@ -2954,7 +2954,7 @@ class Handler(BaseHTTPRequestHandler):
             row=c.execute('SELECT * FROM squad_members WHERE id=?',(s['id'],)).fetchone()
             if not row:return json_response(self,{'error':'Squad profile not found.'},404)
             if not access_code_matches(d.get('accessCode',''),row):return json_response(self,{'error':'Access code verification failed.'},403)
-            c.execute('UPDATE squad_members SET ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,profile_complete=1,account_activated=1 WHERE id=?',(d.get('ign',''),d.get('gameId',''),d.get('serverId',''),d.get('lane',''),d.get('email',''),d.get('phone',''),d.get('birthday',''),s['id'])); c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(s['id'],)).fetchone()
+            c.execute('UPDATE squad_members SET ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,profile_complete=1,account_activated=1,recovery_pending=0 WHERE id=?',(d.get('ign',''),d.get('gameId',''),d.get('serverId',''),d.get('lane',''),d.get('email',''),d.get('phone',''),d.get('birthday',''),s['id'])); c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(s['id'],)).fetchone()
         return json_response(self, {'member':public_member(row,True)})
     def role_allowed(self, session, *roles):
         return session and session.get('role') in roles
@@ -3062,7 +3062,10 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c,'squad_members',vals['ign'],vals['gameId'],vals['serverId'],mid):
                     return json_response(self,{'error':'A Squad member already uses that IGN, Game ID, or Server ID.'},409)
                 new_access_hash=row['access_code_hash']
-                c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],new_access_hash,vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
+                recovery_pending=int(row['recovery_pending'] or 0)
+                if vals['status']=='Disabled' or (owner and 'accountActivated' in d):
+                    recovery_pending=0
+                c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=?,recovery_pending=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],new_access_hash,vals['status'],vals['profileComplete'],vals['accountActivated'],recovery_pending,mid))
                 if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated']:
                     revoke_user_sessions(c,'squad',mid)
                 if vals['role'] not in ('Squad Leader','Assistant Squad Leader') or vals['status']=='Disabled' or not vals['accountActivated']:
@@ -3479,17 +3482,20 @@ class Handler(BaseHTTPRequestHandler):
                         return reject_sync('A valid Squad status is required.',400)
                     if existing['role']=='Squad Owner' and (status=='Disabled' or not account_activated):
                         return reject_sync('Appoint a replacement before changing the active Squad Owner.',409)
-                    values=(str(m.get('name',existing['name'])).strip(),str(m.get('ign',existing['ign'])).strip(),str(m.get('gameId',existing['game_id'])).strip(),str(m.get('serverId',existing['server_id'])).strip(),str(m.get('lane',existing['lane'] or '')).strip(),str(m.get('email',existing['email'] or '')).strip(),str(m.get('phone',existing['phone'] or '')).strip(),str(m.get('birthday',existing['birthday'] or '')).strip(),status,m.get('lastLogin',existing['last_login']),1 if profile_complete else 0,1 if account_activated else 0,member_id)
+                    recovery_pending=int(existing['recovery_pending'] or 0)
+                    if status=='Disabled' or 'accountActivated' in m:
+                        recovery_pending=0
+                    values=(str(m.get('name',existing['name'])).strip(),str(m.get('ign',existing['ign'])).strip(),str(m.get('gameId',existing['game_id'])).strip(),str(m.get('serverId',existing['server_id'])).strip(),str(m.get('lane',existing['lane'] or '')).strip(),str(m.get('email',existing['email'] or '')).strip(),str(m.get('phone',existing['phone'] or '')).strip(),str(m.get('birthday',existing['birthday'] or '')).strip(),status,m.get('lastLogin',existing['last_login']),1 if profile_complete else 0,1 if account_activated else 0,recovery_pending,member_id)
                     if not all(values[index] for index in (0,1,2,3)):
                         return reject_sync('Synchronized Squad identity fields cannot be empty.',400)
                     if identity_conflict(c,'squad_members',values[1],values[2],values[3],member_id):
                         return reject_sync('A Squad member already uses that IGN, Game ID, or Server ID.',409)
                     changes.append((existing,values))
                 for existing,values in changes:
-                    c.execute('UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,status=?,last_login=?,profile_complete=?,account_activated=? WHERE id=?',values)
+                    c.execute('UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,status=?,last_login=?,profile_complete=?,account_activated=?,recovery_pending=? WHERE id=?',values)
                     if values[8]=='Disabled' or not values[11]:
-                        revoke_user_sessions(c,'squad',values[12])
-                        remove_tournament_manager_permission(c,values[12])
+                        revoke_user_sessions(c,'squad',values[13])
+                        remove_tournament_manager_permission(c,values[13])
             if role=='Squad Owner':
                 for member_id in (squad.get('__deletedMemberIds') or []):
                     row=c.execute('SELECT role FROM squad_members WHERE id=?',(str(member_id),)).fetchone()

@@ -31,6 +31,28 @@ class SquadRecoveryTests(unittest.TestCase):
         value.update(changes)
         return value
 
+    def owner_session_and_invite(self, suffix):
+        self.assertEqual(self.backend.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET, "username": f"owner-{suffix}",
+            "password": "owner-password-123", "squadOwner": {
+                "ign": f"Owner{suffix}", "gameId": f"72{suffix}01", "serverId": f"72{suffix}",
+                "accessCode": "OWNER-INITIAL",
+            },
+        }).status, 200)
+        login = self.backend.request("POST", "/api/owner/login", {
+            "username": f"owner-{suffix}", "password": "owner-password-123",
+        })
+        cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+        identity = {
+            "email": f"pending-{suffix}@example.test", "ign": f"Pending{suffix}",
+            "gameId": f"73{suffix}01", "serverId": f"73{suffix}",
+        }
+        created = self.backend.request("POST", "/api/owner/squad-members", {
+            **identity, "name": f"Pending {suffix}",
+        }, cookie=cookie)
+        self.assertEqual(created.status, 201)
+        return cookie, created.json["member"], identity
+
     def test_forgot_is_enumeration_safe_exact_and_stores_only_a_hash(self):
         deliveries = []
         with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
@@ -168,6 +190,84 @@ class SquadRecoveryTests(unittest.TestCase):
                 "SELECT account_activated,recovery_pending FROM squad_members WHERE id='recover-1'"
             ).fetchone()
         self.assertEqual(row["account_activated"], 0)
+        self.assertEqual(row["recovery_pending"], 0)
+
+    def test_legacy_member_update_clears_pending_recovery_when_deactivated(self):
+        owner_cookie, member, identity = self.owner_session_and_invite("41")
+        changed = self.backend.request("PUT", "/api/squad/members", {
+            "id": member["id"], "accountActivated": False,
+        }, cookie=owner_cookie)
+        self.assertEqual(changed.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT recovery_pending FROM squad_members WHERE id=?", (member["id"],)
+            ).fetchone()
+        self.assertEqual(row["recovery_pending"], 0)
+        deliveries = []
+        with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
+            response = self.backend.request("POST", "/api/squad/forgot", identity)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(deliveries, [])
+
+    def test_state_sync_deactivation_clears_pending_recovery(self):
+        _, member, identity = self.owner_session_and_invite("42")
+        squad_owner_login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "Owner42", "gameId": "724201", "serverId": "7242",
+            "accessCode": "OWNER-INITIAL",
+        })
+        owner_cookie = squad_owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        synced = self.backend.request("PUT", "/api/state", {
+            "squad": {"members": [{
+                "id": member["id"], "name": member["name"], "ign": member["ign"],
+                "gameId": member["gameId"], "serverId": member["serverId"],
+                "status": "Offline", "profileComplete": False, "accountActivated": False,
+            }]}, "community": {},
+        }, cookie=owner_cookie)
+        self.assertEqual(synced.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT account_activated,recovery_pending FROM squad_members WHERE id=?", (member["id"],)
+            ).fetchone()
+        self.assertEqual(row["account_activated"], 0)
+        self.assertEqual(row["recovery_pending"], 0)
+        deliveries = []
+        with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
+            response = self.backend.request("POST", "/api/squad/forgot", identity)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(deliveries, [])
+
+    def test_owner_and_state_explicit_activation_clear_invitation_recovery_state(self):
+        owner_cookie, member, _ = self.owner_session_and_invite("43")
+        activated = self.backend.request(
+            "PATCH", f"/api/owner/squad-members/{member['id']}", {"accountActivated": True},
+            cookie=owner_cookie,
+        )
+        self.assertEqual(activated.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT recovery_pending FROM squad_members WHERE id=?", (member["id"],)
+            ).fetchone()
+        self.assertEqual(row["recovery_pending"], 0)
+
+    def test_state_explicit_activation_clears_invitation_recovery_state(self):
+        _, state_member, _ = self.owner_session_and_invite("44")
+        squad_owner_login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "Owner44", "gameId": "724401", "serverId": "7244",
+            "accessCode": "OWNER-INITIAL",
+        })
+        squad_cookie = squad_owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        synced = self.backend.request("PUT", "/api/state", {
+            "squad": {"members": [{
+                "id": state_member["id"], "name": state_member["name"], "ign": state_member["ign"],
+                "gameId": state_member["gameId"], "serverId": state_member["serverId"],
+                "status": "Offline", "profileComplete": False, "accountActivated": True,
+            }]}, "community": {},
+        }, cookie=squad_cookie)
+        self.assertEqual(synced.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT recovery_pending FROM squad_members WHERE id=?", (state_member["id"],)
+            ).fetchone()
         self.assertEqual(row["recovery_pending"], 0)
 
     def test_reset_rotates_access_code_revokes_sessions_and_is_single_use(self):
