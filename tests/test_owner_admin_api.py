@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import unittest
 
 import server
@@ -926,6 +927,118 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
             row["action"] == "owner_community_account_update" and row["actor_role"] == "Overall Owner"
             for row in audit.json["audit"]
         ))
+
+    def test_every_owner_account_route_rejects_anonymous_and_community_sessions(self):
+        community = self.register_community("route-guard@example.test")
+        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        routes = (
+            ("GET", "/api/owner/squad-members", None),
+            ("POST", "/api/owner/squad-members", {}),
+            ("PATCH", "/api/owner/squad-members/1", {}),
+            ("DELETE", "/api/owner/squad-members/1", {}),
+            ("POST", "/api/owner/squad-owner", {}),
+            ("GET", "/api/owner/community-accounts", None),
+            ("PATCH", f"/api/owner/community-accounts/{community.json['account']['id']}", {}),
+        )
+        for method, path, payload in routes:
+            with self.subTest(path=path, actor="anonymous"):
+                self.assertEqual(self.backend.request(method, path, payload).status, 401)
+            with self.subTest(path=path, actor="community"):
+                self.assertEqual(
+                    self.backend.request(method, path, payload, cookie=community_cookie).status,
+                    403,
+                )
+
+    def test_disabled_or_deactivated_accounts_cannot_log_in_again(self):
+        member = self.create_member()
+        disabled = self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{member['id']}", {"status": "Disabled"}
+        )
+        self.assertEqual(disabled.status, 200)
+        self.assertEqual(self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "NewMember", "gameId": "789012", "serverId": "7890",
+                "accessCode": "NEW-MEMBER-CODE",
+            },
+        ).status, 401)
+        reactivated = self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{member['id']}",
+            {"status": "Offline", "accountActivated": False},
+        )
+        self.assertEqual(reactivated.status, 200)
+        self.assertEqual(self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "NewMember", "gameId": "789012", "serverId": "7890",
+                "accessCode": "NEW-MEMBER-CODE",
+            },
+        ).status, 401)
+        community = self.register_community("disabled-login@example.test")
+        update = self.owner_request(
+            "PATCH", f"/api/owner/community-accounts/{community.json['account']['id']}",
+            {"status": "Disabled"},
+        )
+        self.assertEqual(update.status, 200)
+        self.assertEqual(self.backend.request(
+            "POST", "/api/community/login",
+            {"email": "disabled-login@example.test", "password": "member-password-123"},
+        ).status, 401)
+
+    def test_legacy_member_routes_preserve_owner_invariant_revoke_and_hide_codes_from_overall_owner(self):
+        member = self.create_member()
+        owner_login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER",
+            },
+        )
+        owner_cookie = owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        blocked = self.owner_request("POST", "/api/squad/role", {"memberId": "1", "role": "Squad Member"})
+        self.assertEqual(blocked.status, 409)
+        promoted = self.owner_request("POST", "/api/squad/role", {"memberId": member["id"], "role": "Squad Owner"})
+        self.assertEqual(promoted.status, 200)
+        self.assertNotIn("accessCode", promoted.json["member"])
+        self.assertEqual(self.backend.request("GET", "/api/auth/me", cookie=owner_cookie).json,
+                         {"authenticated": False, "session": None})
+        disabled = self.owner_request(
+            "PUT", "/api/squad/members", {"id": "1", "status": "Disabled"}
+        )
+        self.assertEqual(disabled.status, 200)
+        self.assertNotIn("accessCode", disabled.json["member"])
+        self.assertEqual(self.owner_request(
+            "PUT", "/api/squad/members", {"id": "1", "status": "Unknown"}
+        ).status, 400)
+        self.assertEqual(self.owner_request(
+            "DELETE", "/api/squad/members", {"id": member["id"]}
+        ).status, 409)
+
+    def test_owner_collection_cursor_requires_the_same_filter_and_non_object_payload_is_controlled(self):
+        first = self.create_member("LeaderOne", "400001", "4001", role="Squad Leader")
+        second = self.create_member("LeaderTwo", "400002", "4002", role="Squad Leader")
+        first_page = self.owner_request("GET", "/api/owner/squad-members?role=Squad%20Leader&limit=1")
+        self.assertEqual(first_page.status, 200)
+        second_page = self.owner_request(
+            "GET", "/api/owner/squad-members?role=Squad%20Leader&limit=1&cursor=" + first_page.json["nextCursor"]
+        )
+        self.assertEqual(second_page.status, 200)
+        self.assertEqual(
+            {item["id"] for item in first_page.json["members"] + second_page.json["members"]},
+            {first["id"], second["id"]},
+        )
+        self.assertEqual(
+            self.owner_request("POST", "/api/owner/squad-members", []).status,
+            400,
+        )
+
+    def test_squad_identity_indexes_reject_a_duplicate_insert_at_database_boundary(self):
+        member = self.create_member("DatabaseUnique", "300001", "3001")
+        with server.LOCK, server.db() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT INTO squad_members(id,name,ign,game_id,server_id,role,access_code,status)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("duplicate-identity", "Duplicate", "databaseunique", "999999", "9999",
+                     "Squad Member", "DUPLICATE-CODE", "Offline"),
+                )
+        self.assertIsNotNone(member["id"])
 
 
 if __name__ == "__main__":
