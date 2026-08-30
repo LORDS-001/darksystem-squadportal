@@ -22,7 +22,8 @@ Add these Environment Variables for **Production**:
 
 Keep `OWNER_SETUP_SECRET` private and separate from the Owner password and session secret. Vercel Production deployments refuse Owner setup when it is missing. Enter it only in the private one-time Owner setup form; after setup locks, rotate or remove it from the Production environment.
 
-Optional password-reset email variables can be added later:
+Password recovery is self-service. Configure these for Production before testing
+recovery (all credentials are Secrets; `SMTP_PORT` and `SMTP_TLS` are Config):
 
 - `SMTP_HOST`
 - `SMTP_PORT`
@@ -30,6 +31,14 @@ Optional password-reset email variables can be added later:
 - `SMTP_PASSWORD`
 - `SMTP_FROM`
 - `SMTP_TLS`
+
+Use `SMTP_TLS=1` for STARTTLS (the default). The application does not require a
+separate recovery secret: reset codes are generated randomly, stored only as
+hashes, expire after ten minutes, and are single-use. Never configure
+`DARK_SYSTEM_ALLOW_DEFAULT_SECRET` in Vercel; it is a local-development escape
+hatch. Apply the same variable set deliberately to Preview if Preview is part of
+the release gate. Do not expose any server secret with a `NEXT_PUBLIC_` or other
+client-visible prefix.
 
 Deploy and test:
 
@@ -51,6 +60,72 @@ Use the production release gate below before creating real credentials. The abbr
 6. Confirm `/api/owner/overview` returns `401` after logout.
 7. Inspect Vercel logs for uncaught exceptions and confirm none occurred during the smoke test.
 
+### Database backup and migration
+
+Take a Supabase backup before deploying a commit that changes persistence. On a
+paid project, confirm the latest managed backup is restorable; otherwise use
+`pg_dump` from a trusted machine against the direct connection and store the
+encrypted dump outside the repository. Record the commit and backup timestamp,
+not the connection URL. Test restoration into a separate disposable project at
+least once before relying on the procedure.
+
+Schema initialization and compatible column/index additions run during backend
+startup. Deploy to Preview against a disposable database first, open
+`/api/health`, and inspect runtime logs until initialization completes. Compare
+the expected tables/indexes in Supabase, run the automated release gate, then
+promote the same tested commit. Do not point Preview at Production, manually
+edit application rows during migration, or delete the pre-deployment backup.
+Rollback means restoring the prior tested commit; if persistence changed
+incompatibly, restore the verified backup into a new project and change
+`DATABASE_URL` rather than experimenting on Production.
+
+### Complete `/owner-admin` smoke checklist
+
+Use synthetic records and a dedicated Preview/disposable database first. The
+private route must remain absent from the public navigation. Sign in as Overall
+Owner and verify each dashboard section:
+
+1. **Overview:** health, totals, pending work, recent activity, refresh, loading,
+   empty, and controlled-error states render without revealing secrets.
+2. **Squads:** search/page members, create and edit a member, change role/status,
+   appoint exactly one Squad Owner, and confirm disabling an account revokes its
+   existing session. No access code or hash may appear in responses or logs.
+3. **Community:** search/page accounts, edit identity/preferences, disable and
+   restore a synthetic account, and confirm its session is revoked when disabled.
+4. **Content:** create, edit, list, and delete an announcement, report,
+   complaint, Squad event, and scoped notification. Confirm only the intended
+   audience receives the notification and read state is per recipient.
+5. **Tournaments:** create/edit a tournament, approve two synthetic
+   registrations, generate a bracket, schedule a match, submit and confirm a
+   result, complete/archive it, and separately test cancel/reinstate. Verify
+   Squad approvals and Tournament Manager grant/revoke with synthetic accounts.
+6. **Seasons & Rankings:** create one active season, apply a reasoned point
+   correction, verify ordering/ranks, complete the season once, and confirm a
+   retry creates no duplicate rewards or history.
+7. **Events & History:** create/publish/close/archive an event, record one
+   participant only once, inspect season and tournament Hall of Fame entries,
+   and test a reasoned correction on disposable data.
+8. **Audit:** filter and page by action/actor/target/date; verify the mutations
+   above are present and payloads contain no password, access code, token,
+   cookie, SMTP value, or connection string.
+9. **Settings:** verify the safe settings view, change the Owner password using
+   the current password, confirm other sessions are revoked, and confirm the
+   current session remains valid until explicit Logout.
+10. **Logout:** copy the current cookie before logout, log out, then verify
+    `/api/auth/me` reports unauthenticated and every `/api/owner/*` section read
+    returns `401` with that copied cookie. Browser Back must not restore data.
+
+Run authorization checks for representative read and mutation routes while
+anonymous and while signed in as Community Member, Squad Member/Leader/Owner,
+and Tournament Manager. Expect `401` without a session and `403` for every
+non-Overall-Owner session; the response must not contain administrative data.
+
+For both Community and Squad recovery, request a code for a synthetic account,
+confirm the email is delivered by the configured provider without the password
+or existing access code, use it once, and confirm expiry, replay, and invalid
+codes fail safely. Inspect provider delivery/bounce logs and Vercel runtime logs;
+never paste a real reset code into tickets or deployment notes.
+
 ## Production release gate
 
 Run this gate against either `vercel dev` or an already-created Preview deployment. This procedure does not authorize a deployment. Always use a fresh disposable Supabase/PostgreSQL project; never point the smoke test at Production data.
@@ -61,13 +136,19 @@ Run the local suites first:
 
 ```powershell
 python -m unittest discover -s tests -v
-node --test tests/frontend_logout_behavior.test.js
+node --test tests/frontend_logout_behavior.test.js tests/owner_admin_behavior.test.js
 node --check script.js
 node --check owner-admin.js
-python -m compileall -q server.py api tests
+node --check owner-admin-api.js
+node --check owner-admin-squad.js
+node --check owner-admin-tournaments.js
+node --check owner-admin-seasons.js
+node --check owner-admin-audit.js
+python -B -c "from pathlib import Path; compile(Path('server.py').read_text(encoding='utf-8'),'server.py','exec'); compile(Path('api/index.py').read_text(encoding='utf-8'),'api/index.py','exec')"
+git diff --check
 ```
 
-The PostgreSQL Owner gate is opt-in and never reads `DATABASE_URL` as a fallback. It creates a randomly named schema, runs the Owner lifecycle/concurrent setup/session revocation/audit/durable-throttle checks, and drops that schema in cleanup. The concurrency check removes the in-process lock only inside the isolated test, synchronizes two independent database transactions immediately before the conditional setup claim, and verifies that a deliberately non-atomic test mutation would allow two winners. Production locking is not changed. Use a dedicated disposable database, not merely a spare schema in a Production project:
+The PostgreSQL Owner gate is opt-in and never reads `DATABASE_URL` as a fallback. It creates a randomly named schema; exercises representative Squad, Community, content, tournament, season/ranking, event/history, audit, settings, session-revocation, and durable-throttle CRUD/transaction paths; and drops that schema in cleanup. The concurrency check removes the in-process lock only inside the isolated test, synchronizes two independent database transactions immediately before the conditional setup claim, and verifies that a deliberately non-atomic test mutation would allow two winners. Production locking is not changed. Use a dedicated disposable database, not merely a spare schema in a Production project:
 
 Before the first run, manually create this marker **only after independently verifying that the connected database is disposable**. Generate a unique value with `python -c "import secrets; print(secrets.token_urlsafe(32))"`; do not reuse a Production secret or commit the generated value. In a SQL client connected directly to the disposable database, replace the placeholder with that generated value and run once:
 

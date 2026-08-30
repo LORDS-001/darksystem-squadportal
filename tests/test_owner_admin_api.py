@@ -84,6 +84,21 @@ class OwnerAuditAndSettingsTests(unittest.TestCase):
         rejected = self.backend.request("PATCH", "/api/owner/squad-members/1", {"accessCode": "OWNER-ROTATE"}, cookie=self.cookie)
         self.assertEqual(rejected.status, 400)
 
+        create_payload = {
+            "name": "Recovery Invite", "ign": "RecoveryInvite", "gameId": "880001",
+            "serverId": "8801", "email": "invite@example.test", "accessCode": "OWNER-CHOSEN",
+        }
+        self.assertEqual(self.backend.request("POST", "/api/owner/squad-members", create_payload, cookie=self.cookie).status, 400)
+        create_payload.pop("accessCode")
+        created = self.backend.request("POST", "/api/owner/squad-members", create_payload, cookie=self.cookie)
+        self.assertEqual(created.status, 201)
+        self.assertFalse(created.json["member"]["accountActivated"])
+        with server.LOCK, server.db() as connection:
+            stored = connection.execute("SELECT access_code,access_code_hash FROM squad_members WHERE id=?", (created.json["member"]["id"],)).fetchone()
+        self.assertEqual(stored["access_code"], "")
+        self.assertTrue(stored["access_code_hash"])
+        self.assertFalse(server.verify_password("OWNER-CHOSEN", stored["access_code_hash"]))
+
     def test_owner_events_reject_impossible_calendar_dates(self):
         created = self.backend.request("POST", "/api/owner/events", {"title": "Impossible", "date": "2026-02-30"}, cookie=self.cookie)
         self.assertEqual(created.status, 400)
@@ -884,10 +899,18 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
     def create_member(self, ign="NewMember", game_id="789012", server_id="7890", **extra):
         payload = {
             "name": "New Member", "ign": ign, "gameId": game_id,
-            "serverId": server_id, "accessCode": "NEW-MEMBER-CODE",
+            "serverId": server_id, "email": f"{ign.lower()}@example.test",
         }
         payload.update(extra)
         response = self.owner_request("POST", "/api/owner/squad-members", payload)
+        if response.status == 201:
+            with server.LOCK, server.db() as connection:
+                connection.execute(
+                    "UPDATE squad_members SET access_code_hash=?,account_activated=1 WHERE id=?",
+                    (server.hash_password("NEW-MEMBER-CODE"), response.json["member"]["id"]),
+                )
+                connection.commit()
+            response.json["member"]["accountActivated"] = True
         self.assertEqual(response.status, 201)
         self.assertNotIn("NEW-MEMBER-CODE", json.dumps(response.json))
         return response.json["member"]
@@ -954,7 +977,7 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
         duplicate = self.owner_request(
             "POST", "/api/owner/squad-members", {
                 "name": "Duplicate", "ign": "AnotherName", "gameId": "900001",
-                "serverId": "9002", "accessCode": "DUPLICATE-CODE",
+                "serverId": "9002", "email": "duplicate@example.test",
             },
         )
         self.assertEqual(duplicate.status, 409)
@@ -1237,7 +1260,7 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
         with patch.object(server, "identity_conflict", return_value=False):
             race = self.owner_request("POST", "/api/owner/squad-members", {
                 "name": "Race", "ign": "BooleanTarget", "gameId": "990001", "serverId": "9901",
-                "accessCode": "RACE-CODE",
+                "email": "race@example.test",
             })
         self.assertEqual(race.status, 409)
 
@@ -1387,10 +1410,13 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         """Removing generated notifications, their persistence, or secret sanitization breaks this flow."""
         created = self.owner_request("POST", "/api/owner/squad-members", {
             "name": "Notice Member", "ign": "NoticeMember", "gameId": "777777", "serverId": "7777",
-            "accessCode": "NOTICE-MEMBER-CODE",
+            "email": "notice-member@example.test",
         })
         self.assertEqual(created.status, 201)
         member_id = created.json["member"]["id"]
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE squad_members SET account_activated=1 WHERE id=?", (member_id,))
+            connection.commit()
         changed = self.owner_request(
             "PATCH", f"/api/owner/squad-members/{member_id}",
             {"role": "Squad Leader"},
@@ -1400,7 +1426,7 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         self.assertEqual(appointed.status, 200)
         deletable = self.owner_request("POST", "/api/owner/squad-members", {
             "name": "Delete Member", "ign": "DeleteMember", "gameId": "777778", "serverId": "7778",
-            "accessCode": "DELETE-MEMBER-CODE",
+            "email": "delete-member@example.test",
         })
         self.assertEqual(deletable.status, 201)
         self.assertEqual(
@@ -1539,9 +1565,12 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         """Mutating a broadcast payload must not mark it read for every Squad recipient."""
         member = self.owner_request("POST", "/api/owner/squad-members", {
             "name": "Second Recipient", "ign": "SecondRecipient", "gameId": "919191", "serverId": "9191",
-            "accessCode": "SECOND-RECIPIENT-CODE",
+            "email": "second-recipient@example.test",
         })
         self.assertEqual(member.status, 201)
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE squad_members SET access_code_hash=?,account_activated=1 WHERE id=?", (server.hash_password("SECOND-RECIPIENT-CODE"), member.json["member"]["id"]))
+            connection.commit()
         owner_squad = self.backend.request("POST", "/api/squad/login", {
             "ign": "ContentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-CONTENT-OWNER",
         })
@@ -1589,7 +1618,7 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         with patch.object(server, "insert_audit", side_effect=RuntimeError("audit unavailable")):
             failed = self.owner_request("POST", "/api/owner/squad-members", {
                 "name": "Rollback Member", "ign": "RollbackMember", "gameId": "929292", "serverId": "9292",
-                "accessCode": "ROLLBACK-MEMBER-CODE",
+                "email": "rollback-member@example.test",
             })
         self.assertEqual(failed.status, 503)
         with server.LOCK, server.db() as connection:
@@ -1822,8 +1851,11 @@ class OwnerTournamentAdministrationTests(unittest.TestCase):
         """Approval decisions and Manager grants must be validated, secret-safe, notified, and audited."""
         member = self.owner_request("POST", "/api/owner/squad-members", {
             "name": "Tournament Lead", "ign": "TournamentLead", "gameId": "990001", "serverId": "9901",
-            "accessCode": "TOURNAMENT-LEAD-CODE", "role": "Squad Leader",
+            "email": "tournament-lead@example.test", "role": "Squad Leader",
         }).json["member"]
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE squad_members SET account_activated=1 WHERE id=?", (member["id"],))
+            connection.commit()
         granted = self.owner_request(
             "POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "grant"},
         )
@@ -1891,9 +1923,12 @@ class OwnerTournamentAdministrationTests(unittest.TestCase):
             response = self.owner_request("POST", "/api/owner/squad-members", {
                 "name": f"Manager {suffix}", "ign": f"Manager{suffix}",
                 "gameId": f"77{suffix:04d}", "serverId": f"7{suffix:03d}",
-                "accessCode": f"MANAGER-{suffix}-CODE", "role": "Squad Leader",
+                "email": f"manager-{suffix}@example.test", "role": "Squad Leader",
             })
             self.assertEqual(response.status, 201)
+            with server.LOCK, server.db() as connection:
+                connection.execute("UPDATE squad_members SET access_code_hash=?,account_activated=1 WHERE id=?", (server.hash_password(f"MANAGER-{suffix}-CODE"), response.json["member"]["id"]))
+                connection.commit()
             member = response.json["member"]
             self.assertEqual(self.owner_request(
                 "POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "grant"},
@@ -2260,6 +2295,150 @@ class OwnerSeasonEventHistoryAdministrationTests(unittest.TestCase):
             failed = self.owner_request("POST", "/api/owner/seasons", {"name": "Rollback Season"})
         self.assertEqual(failed.status, 503)
         self.assertIsNone(self.owner_request("GET", "/api/owner/seasons").json["currentSeason"])
+
+
+class OwnerCompleteLifecycleAcceptanceTests(unittest.TestCase):
+    """One release-level journey across every Overall Owner administration domain."""
+
+    def setUp(self):
+        self.backend = BackendHarness()
+
+    def tearDown(self):
+        self.backend.close()
+
+    def request(self, method, path, payload=None, cookie=""):
+        return self.backend.request(method, path, payload, cookie=cookie)
+
+    def test_complete_owner_lifecycle_and_every_copied_cookie_is_revoked(self):
+        setup = self.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+            "username": "release-owner", "password": "owner-password-123",
+            "squadOwner": {
+                "ign": "ReleaseOwner", "gameId": "990001", "serverId": "9901",
+                "accessCode": "RELEASE-OWNER-CODE",
+            },
+        })
+        self.assertEqual(setup.status, 200)
+        first_login = self.request("POST", "/api/owner/login", {
+            "username": "release-owner", "password": "owner-password-123",
+        })
+        second_login = self.request("POST", "/api/owner/login", {
+            "username": "release-owner", "password": "owner-password-123",
+        })
+        first_cookie = first_login.headers["Set-Cookie"].split(";", 1)[0]
+        copied_cookie = second_login.headers["Set-Cookie"].split(";", 1)[0]
+
+        squad = self.request("POST", "/api/owner/squad-members", {
+            "name": "Release Leader", "ign": "ReleaseLeader", "gameId": "990002",
+            "serverId": "9902", "email": "release-leader@example.test", "role": "Squad Leader",
+        }, first_cookie)
+        self.assertEqual(squad.status, 201)
+        community_responses = []
+        for number in (1, 2):
+            registered = self.request("POST", "/api/community/register", {
+                "email": f"release-player-{number}@example.test",
+                "password": "member-password-123", "ign": f"ReleasePlayer{number}",
+                "gameId": f"99100{number}", "serverId": f"991{number}",
+            })
+            self.assertEqual(registered.status, 200)
+            community_responses.append(registered)
+        first_account = community_responses[0].json["account"]
+        self.assertEqual(self.request(
+            "PATCH", f"/api/owner/community-accounts/{first_account['id']}",
+            {"emailNotifications": False}, first_cookie,
+        ).status, 200)
+
+        content = self.request(
+            "POST", "/api/owner/squad-content/announcements/release-announcement",
+            {"title": "Release notice", "body": "Owner lifecycle acceptance."}, first_cookie,
+        )
+        self.assertEqual(content.status, 201)
+
+        season = self.request("POST", "/api/owner/seasons", {
+            "name": "Release Season", "requestId": "release-season",
+        }, first_cookie)
+        self.assertEqual(season.status, 201)
+        tournament = self.request("POST", "/api/owner/tournaments", {
+            "title": "Release Cup", "game": "MLBB", "format": "1v1",
+            "date": "2099-12-20", "slots": 4,
+        }, first_cookie)
+        self.assertEqual(tournament.status, 201)
+        tournament_id = tournament.json["tournament"]["id"]
+        player_cookies = {}
+        for registered in community_responses:
+            account = registered.json["account"]
+            player_cookie = registered.headers["Set-Cookie"].split(";", 1)[0]
+            player_cookies[account["id"]] = player_cookie
+            joined = self.request("POST", "/api/tournaments/register", {
+                "tournamentId": tournament_id,
+            }, player_cookie)
+            registration = next(
+                item for item in joined.json["registrations"]
+                if item["accountId"] == account["id"]
+            )
+            self.assertEqual(self.request(
+                "POST", f"/api/owner/tournaments/{tournament_id}/registrations/{registration['id']}/decision",
+                {"action": "approve"}, first_cookie,
+            ).status, 200)
+        bracket = self.request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/bracket", {}, first_cookie,
+        )
+        match = bracket.json["tournament"]["matches"][0]
+        self.assertEqual(self.request("POST", "/api/tournaments/result", {
+            "tournamentId": tournament_id, "matchId": match["id"],
+            "result": {"winner": match["player1"]},
+        }, player_cookies[match["player1"]]).status, 200)
+        self.assertEqual(self.request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result",
+            {"action": "confirm"}, first_cookie,
+        ).status, 200)
+        self.assertEqual(self.request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/complete", {}, first_cookie,
+        ).status, 200)
+
+        event = self.request("POST", "/api/owner/events", {
+            "title": "Release Event", "date": "2099-12-21", "rewardPoints": 10,
+        }, first_cookie)
+        self.assertEqual(event.status, 201)
+        event_id = event.json["event"]["id"]
+        self.assertEqual(self.request(
+            "POST", f"/api/owner/events/{event_id}/publish", {}, first_cookie,
+        ).status, 200)
+        self.assertEqual(self.request(
+            "POST", f"/api/owner/events/{event_id}/participation",
+            {"accountId": first_account["id"]}, first_cookie,
+        ).status, 201)
+        completed_season = self.request(
+            "POST", f"/api/owner/seasons/{season.json['season']['id']}/complete", {}, first_cookie,
+        )
+        self.assertEqual(completed_season.status, 200)
+        self.assertTrue(self.request("GET", "/api/owner/history", cookie=first_cookie).json["seasonHallOfFame"])
+        audit = self.request("GET", "/api/owner/audit?limit=100", cookie=first_cookie)
+        self.assertEqual(audit.status, 200)
+        actions = {entry["action"] for entry in audit.json["audit"]}
+        self.assertTrue({"owner_squad_member_create", "owner_tournament_create", "owner_season_complete"}.issubset(actions))
+
+        changed = self.request("PATCH", "/api/owner/settings", {
+            "currentPassword": "owner-password-123", "newPassword": "owner-password-456",
+        }, first_cookie)
+        self.assertEqual(changed.status, 200)
+        self.assertFalse(self.request("GET", "/api/auth/me", cookie=copied_cookie).json["authenticated"])
+        self.assertEqual(self.request("POST", "/api/logout", cookie=first_cookie).status, 200)
+
+        protected_reads = (
+            "/api/owner/overview", "/api/owner/squad-members",
+            "/api/owner/community-accounts", "/api/owner/squad-content?domain=announcements",
+            "/api/owner/tournaments", "/api/owner/seasons", "/api/owner/events",
+            "/api/owner/history", "/api/owner/audit", "/api/owner/settings",
+        )
+        for stale_cookie in (first_cookie, copied_cookie):
+            self.assertEqual(
+                self.request("GET", "/api/auth/me", cookie=stale_cookie).json,
+                {"authenticated": False, "session": None},
+            )
+            for path in protected_reads:
+                with self.subTest(cookie=stale_cookie, path=path):
+                    self.assertEqual(self.request("GET", path, cookie=stale_cookie).status, 401)
 
 
 if __name__ == "__main__":

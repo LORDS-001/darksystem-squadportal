@@ -219,6 +219,105 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     {"backend": "healthy", "database": "healthy"},
                 )
 
+                # Representative release CRUD across every Owner domain. All writes
+                # remain inside the randomly named schema created above.
+                squad_member = self.request(
+                    "POST", "/api/owner/squad-members",
+                    {
+                        "name": "Postgres Gate Leader", "ign": "PostgresGateLeader",
+                        "gameId": "555001", "serverId": "5551",
+                        "email": "postgres-gate-leader@example.test", "role": "Squad Leader",
+                    }, owner_cookie,
+                )
+                self.assertEqual(squad_member.status_code, 201)
+                community = self.request(
+                    "POST", "/api/community/register",
+                    {
+                        "email": "postgres-gate-player@example.test",
+                        "password": "member-password-123", "ign": "PostgresGatePlayer",
+                        "gameId": "555002", "serverId": "5552",
+                    },
+                )
+                self.assertEqual(community.status_code, 200)
+                community_body = json.loads(community.body)
+                account_id = community_body["account"]["id"]
+                self.assertEqual(self.request(
+                    "PATCH", f"/api/owner/community-accounts/{account_id}",
+                    {"emailNotifications": False}, owner_cookie,
+                ).status_code, 200)
+
+                content_path = "/api/owner/squad-content/announcements/postgres-gate-note"
+                self.assertEqual(self.request(
+                    "POST", content_path,
+                    {"title": "PostgreSQL gate", "body": "Representative content CRUD."},
+                    owner_cookie,
+                ).status_code, 201)
+                self.assertEqual(self.request(
+                    "PATCH", content_path,
+                    {"title": "PostgreSQL gate updated", "body": "Transaction verified."},
+                    owner_cookie,
+                ).status_code, 200)
+                self.assertEqual(self.request(
+                    "DELETE", content_path, {}, owner_cookie,
+                ).status_code, 200)
+
+                season_response = self.request(
+                    "POST", "/api/owner/seasons",
+                    {"name": "PostgreSQL Gate Season", "requestId": "postgres-gate-season"},
+                    owner_cookie,
+                )
+                self.assertEqual(season_response.status_code, 201)
+                season_id = json.loads(season_response.body)["season"]["id"]
+                event_response = self.request(
+                    "POST", "/api/owner/events",
+                    {"title": "PostgreSQL Gate Event", "date": "2099-12-20", "rewardPoints": 5},
+                    owner_cookie,
+                )
+                self.assertEqual(event_response.status_code, 201)
+                event_id = json.loads(event_response.body)["event"]["id"]
+                self.assertEqual(self.request(
+                    "POST", f"/api/owner/events/{event_id}/publish", {}, owner_cookie,
+                ).status_code, 200)
+                self.assertEqual(self.request(
+                    "POST", f"/api/owner/events/{event_id}/participation",
+                    {"accountId": account_id}, owner_cookie,
+                ).status_code, 201)
+
+                tournament_response = self.request(
+                    "POST", "/api/owner/tournaments",
+                    {
+                        "title": "PostgreSQL Gate Cup", "game": "MLBB", "format": "1v1",
+                        "date": "2099-12-21", "slots": 4,
+                    }, owner_cookie,
+                )
+                self.assertEqual(tournament_response.status_code, 201)
+                tournament_id = json.loads(tournament_response.body)["tournament"]["id"]
+                self.assertEqual(self.request(
+                    "PATCH", f"/api/owner/tournaments/{tournament_id}",
+                    {"reward": "Gate Trophy"}, owner_cookie,
+                ).status_code, 200)
+                self.assertEqual(self.request(
+                    "POST", f"/api/owner/tournaments/{tournament_id}/cancel", {}, owner_cookie,
+                ).status_code, 200)
+                self.assertEqual(self.request(
+                    "POST", f"/api/owner/tournaments/{tournament_id}/reinstate", {}, owner_cookie,
+                ).status_code, 200)
+
+                self.assertEqual(self.request(
+                    "POST", f"/api/owner/seasons/{season_id}/complete", {}, owner_cookie,
+                ).status_code, 200)
+                history = self.request("GET", "/api/owner/history", cookie=owner_cookie)
+                self.assertEqual(history.status_code, 200)
+                self.assertTrue(json.loads(history.body)["seasonHallOfFame"])
+                self.assertEqual(
+                    self.request("GET", "/api/owner/audit?limit=100", cookie=owner_cookie).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    self.request("GET", "/api/owner/settings", cookie=owner_cookie).status_code,
+                    200,
+                )
+
                 logout = self.request("POST", "/api/logout", cookie=owner_cookie)
                 self.assertEqual(logout.status_code, 200)
                 revoked = self.request("GET", "/api/auth/me", cookie=owner_cookie)

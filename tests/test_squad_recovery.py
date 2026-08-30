@@ -82,6 +82,40 @@ class SquadRecoveryTests(unittest.TestCase):
             }).status)
         self.assertEqual(statuses[-1], 429)
 
+    def test_owner_created_member_activates_only_through_recovery(self):
+        self.assertEqual(self.backend.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET, "username": "recovery-owner",
+            "password": "owner-password-123", "squadOwner": {
+                "ign": "RecoveryOwner", "gameId": "700001", "serverId": "7001", "accessCode": "OWNER-INITIAL",
+            },
+        }).status, 200)
+        owner_login = self.backend.request("POST", "/api/owner/login", {
+            "username": "recovery-owner", "password": "owner-password-123",
+        })
+        owner_cookie = owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        identity = {"email": "owner-created@example.test", "ign": "OwnerCreated", "gameId": "700002", "serverId": "7002"}
+        created = self.backend.request("POST", "/api/owner/squad-members", {
+            **identity, "name": "Owner Created",
+        }, cookie=owner_cookie)
+        self.assertEqual(created.status, 201)
+        self.assertFalse(created.json["member"]["accountActivated"])
+        self.assertEqual(self.backend.request("POST", "/api/squad/login", {
+            **identity, "accessCode": "GUESSED-CODE",
+        }).status, 401)
+        deliveries = []
+        with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
+            self.assertEqual(self.backend.request("POST", "/api/squad/forgot", identity).status, 200)
+        code = deliveries[0][2].split(" is ", 1)[1].split(".", 1)[0]
+        self.assertEqual(self.backend.request("POST", "/api/squad/reset", {
+            **identity, "code": code, "accessCode": "SELF-CHOSEN-CODE",
+        }).status, 200)
+        self.assertEqual(self.backend.request("POST", "/api/squad/login", {
+            **identity, "accessCode": "SELF-CHOSEN-CODE",
+        }).status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute("SELECT account_activated FROM squad_members WHERE id=?", (created.json["member"]["id"],)).fetchone()
+        self.assertEqual(row["account_activated"], 1)
+
     def test_reset_rotates_access_code_revokes_sessions_and_is_single_use(self):
         login = self.backend.request("POST", "/api/squad/login", {
             **self.identity(), "accessCode": "OLD-CODE",
