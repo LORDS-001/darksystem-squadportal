@@ -681,7 +681,14 @@ class OwnerFoundationTests(unittest.TestCase):
         parser.feed(page.body.decode("utf-8"))
 
         self.assertEqual(parser.stylesheet_urls, ["/style.css", "/owner-admin.css"])
-        self.assertEqual(parser.script_urls, [("/owner-admin.js", True)])
+        self.assertEqual(parser.script_urls, [
+            ("/owner-admin-api.js", True),
+            ("/owner-admin-squad.js", True),
+            ("/owner-admin-tournaments.js", True),
+            ("/owner-admin-seasons.js", True),
+            ("/owner-admin-audit.js", True),
+            ("/owner-admin.js", True),
+        ])
 
         for asset_path in parser.stylesheet_urls:
             native = self.backend.request("GET", asset_path)

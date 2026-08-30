@@ -9,6 +9,7 @@ class OwnerStaticContractTests(unittest.TestCase):
     def setUp(self):
         self.html = (ROOT / "owner-admin.html").read_text(encoding="utf-8")
         self.js = (ROOT / "owner-admin.js").read_text(encoding="utf-8")
+        self.css = (ROOT / "owner-admin.css").read_text(encoding="utf-8")
 
     def test_owner_shell_defers_the_owner_script(self):
         self.assertIn('<script src="/owner-admin.js" defer>', self.html)
@@ -74,6 +75,14 @@ class OwnerStaticContractTests(unittest.TestCase):
 
     def test_owner_client_does_not_log_responses_or_credentials(self):
         self.assertNotIn("console.", self.js)
+
+    def test_owner_workspace_keeps_responsive_sharp_established_visual_contract(self):
+        self.assertIn("@media (max-width: 850px)", self.css)
+        self.assertIn("@media (max-width: 560px)", self.css)
+        self.assertIn("grid-template-columns: 1fr", self.css)
+        self.assertIn("border-radius: 0 !important", self.css)
+        self.assertIn("Orbitron", self.css)
+        self.assertIn("Rajdhani", self.css)
 
 
 if __name__ == "__main__":

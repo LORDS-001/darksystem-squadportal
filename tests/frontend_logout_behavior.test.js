@@ -126,6 +126,15 @@ class Element {
     return true;
   }
 
+  reset() {
+    for (const node of descendants(this.children)) if ("value" in node) node.value = "";
+  }
+
+  matches(selector) {
+    if (selector === '[data-secret="true"]') return this.getAttribute("data-secret") === "true";
+    return matches(this, selector);
+  }
+
   remove() {
     if (!this.parentNode) return;
     this.parentNode.children = this.parentNode.children.filter((child) => child !== this);
@@ -202,6 +211,7 @@ function matches(element, selector) {
 }
 
 function querySelectorAllFrom(nodes, selector) {
+  if (selector.includes(",")) return selector.split(",").flatMap((part) => querySelectorAllFrom(nodes, part.trim()));
   const parts = selector.trim().split(/\s+/);
   let candidates = descendants(nodes).filter((element) => matches(element, parts[0]));
   for (const part of parts.slice(1)) {
@@ -230,6 +240,15 @@ async function submitAsBrowser(form) {
   if (!form.noValidate && !form.reportValidity()) return false;
   await form.listeners.get("submit")({ preventDefault() {} });
   return true;
+}
+
+function formByHeading(root, heading) {
+  const title = descendants([root]).find((node) => node.textContent === heading);
+  return title && title.parentNode && title.parentNode.querySelector("form");
+}
+
+function fillForm(form, values) {
+  for (const control of descendants(form.children)) if (control.name && Object.hasOwn(values, control.name)) control.value = String(values[control.name]);
 }
 
 function makeContext(scriptName, initialFetch) {
@@ -619,6 +638,71 @@ test("Owner guarded row action surfaces a safe panel error and restores its butt
   const disable = descendants([harness.ownerRoot]).find((node) => node.textContent === "Disable"); await disable.listeners.get("click")();
   const alert = harness.ownerRoot.querySelector(".owner-admin__workspace").querySelector('[role="alert"]'); assert.equal(alert.hidden, false); assert.equal(alert.textContent, "Account update failed safely.");
   assert.equal(disable.disabled, false); assert.equal(disable.textContent, "Disable");
+});
+
+test("Owner navigation loads all nine administration sections", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async (path) => {
+    if (String(path).startsWith("/api/owner/squad-members")) return jsonResponse(true, { members: [], nextCursor: null });
+    if (String(path).startsWith("/api/owner/community-accounts")) return jsonResponse(true, { accounts: [], nextCursor: null });
+    if (String(path).startsWith("/api/owner/squad-content")) return jsonResponse(true, { items: [] });
+    if (path === "/api/owner/tournaments") return jsonResponse(true, { tournaments: [] });
+    if (path === "/api/owner/seasons") return jsonResponse(true, { currentSeason: null, leaderboard: [], seasons: [] });
+    if (path === "/api/owner/events") return jsonResponse(true, { events: [], participation: [] });
+    if (path === "/api/owner/history") return jsonResponse(true, { seasonHistory: [], seasonHallOfFame: [], hallOfFame: [] });
+    if (String(path).startsWith("/api/owner/audit")) return jsonResponse(true, { audit: [], nextCursor: "" });
+    if (path === "/api/owner/settings") return jsonResponse(true, { settings: { username: "owner" } });
+    if (path === "/api/owner/overview") return jsonResponse(true, { health: {}, counts: {}, pending: {}, recentAudit: [] });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  for (const section of ["overview", "squads", "community", "content", "tournaments", "seasons", "history", "audit", "settings"]) {
+    await vm.runInContext(`openOwnerSection(${JSON.stringify(section)})`, harness.context);
+    const alert = harness.ownerRoot.querySelector(".owner-admin__workspace").querySelector('[role="alert"]');
+    assert.equal(alert.hidden, true, `${section} should load without an error`);
+  }
+});
+
+test("Owner representative edit and create forms send domain-correct payloads", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve)); const writes = [];
+  harness.setFetch(async (path, options = {}) => {
+    if (options.body) writes.push([path, options.method, JSON.parse(options.body)]);
+    if (String(path).startsWith("/api/owner/community-accounts")) return jsonResponse(true, { accounts: [{ id: "C-1", ign: "One", status: "Active" }], nextCursor: "C-next", account: {} });
+    if (String(path).startsWith("/api/owner/squad-content")) return jsonResponse(true, { items: [] });
+    if (path === "/api/owner/tournaments") return jsonResponse(true, { tournaments: [] });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("community")`, harness.context);
+  const communityForm = formByHeading(harness.ownerRoot, "Edit Community profile"); fillForm(communityForm, { accountId: "C-1", ign: "Updated", email: "updated@example.com" }); await submitAsBrowser(communityForm);
+  const communityNext = descendants([harness.ownerRoot]).find((node) => node.textContent === "Next" && !node.disabled); await communityNext.listeners.get("click")();
+  await vm.runInContext(`openOwnerSection("content")`, harness.context); const domain = harness.document.getElementById("owner-content-domain"); domain.value = "events"; await domain.listeners.get("change")();
+  const contentForm = formByHeading(harness.ownerRoot, "Create Events"); fillForm(contentForm, { title: "Squad Day", date: "2099-05-04", time: "12:30", description: "Meet" }); await submitAsBrowser(contentForm);
+  await vm.runInContext(`openOwnerSection("tournaments")`, harness.context); const tournamentForm = formByHeading(harness.ownerRoot, "Create tournament"); fillForm(tournamentForm, { title: "Cup", game: "MLBB", format: "1v1", date: "2099-06-01" }); await submitAsBrowser(tournamentForm);
+  assert.ok(writes.some(([path, method, body]) => path === "/api/owner/community-accounts/C-1" && method === "PATCH" && body.ign === "Updated"));
+  assert.ok(writes.some(([path, method, body]) => path === "/api/owner/squad-content/events" && method === "POST" && body.date === "2099-05-04"));
+  assert.ok(writes.some(([path, method, body]) => path === "/api/owner/tournaments" && method === "POST" && body.title === "Cup"));
+});
+
+test("Owner audit cursor, history IDs, bracket object, and secret clearing follow backend contracts", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve)); const requests = [];
+  harness.setFetch(async (path, options = {}) => {
+    requests.push([path, options]);
+    if (String(path).startsWith("/api/owner/audit")) return jsonResponse(true, { audit: [{ id: "AU-1", action: "owner_event_update" }], nextCursor: "CUR-2" });
+    if (path === "/api/owner/events") return jsonResponse(true, { events: [], participation: [] });
+    if (path === "/api/owner/history") return jsonResponse(true, { seasonHistory: [{ id: "SH-1", seasonId: "S-1" }], hallOfFame: [{ id: "H-1" }], seasonHallOfFame: [{ id: "SF-1" }] });
+    if (path === "/api/owner/tournaments") return jsonResponse(true, { tournaments: [{ id: "T-1", title: "Cup" }] });
+    if (path === "/api/owner/tournaments/T-1") return jsonResponse(true, { tournament: { id: "T-1" }, registrations: [{ id: "R-W", status: "Withdrawn" }, { id: "R-A", status: "Approved" }], approvals: [], bracket: { ready: true, generatedAt: "now", matches: [{ id: "BM-1" }] }, matches: [], resultSubmissions: [], disputes: [] });
+    if (path === "/api/owner/settings" && options.method === "PATCH") return jsonResponse(true, { settings: { username: "owner" } });
+    if (path === "/api/owner/settings") return jsonResponse(true, { settings: { username: "owner" } });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("audit")`, harness.context); const auditForm = formByHeading(harness.ownerRoot, "Filter audit records"); fillForm(auditForm, { action: "owner_event_update", actor: "owner", target: "event", from: "2026-01-01", to: "2026-12-31", limit: 25 }); await submitAsBrowser(auditForm); const next = descendants([harness.ownerRoot]).find((node) => node.textContent === "Next" && !node.disabled); await next.listeners.get("click")();
+  assert.ok(requests.some(([path]) => String(path).includes("cursor=CUR-2") && String(path).includes("actor=owner") && String(path).includes("limit=25")));
+  await vm.runInContext(`openOwnerSection("history")`, harness.context); let text = descendants([harness.ownerRoot]).map((node) => node.textContent).join(" "); for (const id of ["SH-1", "H-1", "SF-1"]) assert.match(text, new RegExp(id));
+  await vm.runInContext(`openOwnerSection("tournaments")`, harness.context); const details = descendants([harness.ownerRoot]).find((node) => node.textContent === "View details"); await details.listeners.get("click")(); text = descendants([harness.ownerRoot]).map((node) => node.textContent).join(" "); for (const label of ["BM-1", "Reinstate", "Withdraw"]) assert.match(text, new RegExp(label));
+  await vm.runInContext(`openOwnerSection("settings")`, harness.context); const settingsForm = formByHeading(harness.ownerRoot, "Change Owner password"); fillForm(settingsForm, { currentPassword: "old-secret", newPassword: "new-secret-123", passwordConfirmation: "new-secret-123" }); await submitAsBrowser(settingsForm); for (const input of descendants(settingsForm.children).filter((node) => node.getAttribute("data-secret") === "true")) assert.equal(input.value, "");
 });
 
 test("Squad leader registration sends the typed invitation code to the server", async () => {

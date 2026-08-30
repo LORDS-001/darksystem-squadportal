@@ -454,8 +454,8 @@ async function renderOwnerSquads(shell) {
       }, { confirmText: `Remove ${member.ign}? This cannot be undone.` }));
     }));
     const pager = ownerElement("div", "owner-admin__pager");
-    const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length;
-    const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor;
+    const previous = ownerActionButton(shell, "Previous", async () => { cursor = cursors.pop() || ""; await draw(); }); previous.disabled = !cursors.length;
+    const next = ownerActionButton(shell, "Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }); next.disabled = !data.nextCursor;
     pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
   shell.content.append(ownerQueryForm((value) => { search = value; cursor = ""; cursors.length = 0; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Create Squad member", [
@@ -477,8 +477,8 @@ async function renderOwnerCommunity(shell) {
     records.append(ownerRows(data.accounts, ["id", "ign", "gameId", "serverId", "email", "role", "status"], (account, cell) => cell.append(ownerActionButton(shell, account.status === "Disabled" ? "Activate" : "Disable", async () => {
       await ownerRequest(`${OwnerAdminSquad.endpoints.community}/${encodeURIComponent(account.id)}`, OwnerAdminApi.json("PATCH", { status: account.status === "Disabled" ? "Active" : "Disabled" })); await draw();
     }, { confirmText: account.status === "Disabled" ? "" : `Disable ${account.ign}? Their active sessions will be revoked.` }))));
-    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length;
-    const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
+    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerActionButton(shell, "Previous", async () => { cursor = cursors.pop() || ""; await draw(); }); previous.disabled = !cursors.length;
+    const next = ownerActionButton(shell, "Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
   shell.content.append(ownerQueryForm((value) => { search = value; cursor = ""; cursors.length = 0; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Edit Community profile", [
     { name: "accountId", label: "Account ID" }, { name: "ign", label: "IGN", required: false }, { name: "gameId", label: "Game ID", required: false }, { name: "serverId", label: "Server ID", required: false }, { name: "email", label: "Email", type: "email", required: false }, { name: "phone", label: "Phone", required: false }, { name: "lane", label: "Lane", required: false }, { name: "status", label: "Status", required: false },
@@ -527,10 +527,17 @@ async function renderOwnerTournaments(shell) {
     const old = shell.content.querySelector(".owner-admin__tournament-detail"); if (old) old.remove();
     const detail = ownerElement("section", "owner-admin__card owner-admin__tournament-detail");
     detail.append(ownerElement("h2", "owner-admin__section-title", `Tournament detail: ${id}`), ownerRows([data.tournament || {}], ["id", "title", "status", "format", "registrationDeadline"]));
+    const registrationActions = (item, cell) => {
+      const status = String(item.status || "").toLowerCase();
+      const actions = status === "approved" ? ["withdraw"] : (status === "withdrawn" || status === "rejected") ? ["reinstate"] : ["approve", "reject", "withdraw"];
+      for (const action of actions) cell.append(ownerActionButton(shell, ownerLabel(action), async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action })); await showDetail(id); }, { confirmText: ["reject", "withdraw"].includes(action) ? `${ownerLabel(action)} registration ${item.id}?` : "" }));
+    };
+    const bracket = data.bracket && !Array.isArray(data.bracket) ? data.bracket : null;
+    if (bracket) detail.append(ownerRows([{ ready: bracket.ready, generatedAt: bracket.generatedAt }], ["ready", "generatedAt"]));
     const groups = [
-      ["Registrations", data.registrations, ["id", "accountId", "status"], (item, cell) => cell.append(ownerActionButton(shell, "Approve", async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "approve" })); await showDetail(id); }), ownerActionButton(shell, "Reject", async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "reject" })); await showDetail(id); }, { confirmText: `Reject registration ${item.id}?` }))],
+      ["Registrations", data.registrations, ["id", "accountId", "status"], registrationActions],
       ["Squad approvals", data.approvals, ["id", "leaderAccountId", "status"], (item, cell) => cell.append(ownerActionButton(shell, "Approve", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "approve" })); await showDetail(id); }), ownerActionButton(shell, "Reject", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "reject" })); await showDetail(id); }, { confirmText: `Reject Squad approval ${item.id}?` }))],
-      ["Bracket", Array.isArray(data.bracket) ? data.bracket : (data.bracket ? [data.bracket] : []), ["id", "round", "player1", "player2"]],
+      ["Bracket", Array.isArray(data.bracket) ? data.bracket : (bracket && Array.isArray(bracket.matches) ? bracket.matches : []), ["id", "round", "player1", "player2"]],
       ["Matches", data.matches || (data.tournament && data.tournament.matches), ["id", "round", "player1", "player2", "winner", "status"]],
       ["Result submissions", data.resultSubmissions, ["id", "matchId", "winner", "status"]],
       ["Disputes", data.disputes, ["id", "matchId", "status", "reason"]],
@@ -545,7 +552,7 @@ async function renderOwnerTournaments(shell) {
     records.append(ownerRows(data.tournaments, ["id", "title", "game", "format", "date", "status"], (item, cell) => {
       cell.append(ownerActionButton(shell, "View details", () => showDetail(item.id)));
       for (const action of OwnerAdminTournaments.transitions) cell.append(ownerActionButton(shell, ownerLabel(action), async () => {
-        await ownerRequest(OwnerAdminTournaments.transitionPath(item.id, action), OwnerAdminApi.json("POST", {})); await draw();
+        await ownerRequest(OwnerAdminTournaments.transitionPath(item.id, action), OwnerAdminApi.json("POST", {})); await draw(); await showDetail(item.id);
       }, { confirmText: OwnerAdminTournaments.needsConfirmation(action) ? `${ownerLabel(action)} ${item.title}?` : "" }));
     })); shell.content.append(records);
   };
@@ -591,7 +598,7 @@ async function renderOwnerHistory(shell) {
     const records = ownerElement("section", "owner-admin__records");
     records.append(ownerElement("h2", "owner-admin__section-title", "Events"), ownerRows(events.events, ["id", "title", "date", "time", "status", "rewardPoints"], (item, cell) => {
       for (const action of ["publish", "close", "archive"]) cell.append(ownerActionButton(shell, ownerLabel(action), async () => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(item.id)}/${action}`, OwnerAdminApi.json("POST", {})); await draw(); }, { confirmText: action === "archive" ? "Archive this event?" : "" }));
-    }), ownerElement("h2", "owner-admin__section-title", "Tournament history"), ownerRows(history.hallOfFame, ["title", "champion", "runnerUp", "date"]), ownerElement("h2", "owner-admin__section-title", "Season Hall of Fame"), ownerRows(history.seasonHallOfFame, ["seasonName", "ign", "points", "completedAt"])); shell.content.append(records);
+    }), ownerElement("h2", "owner-admin__section-title", "Season history"), ownerRows(history.seasonHistory, ["id", "seasonId", "name", "completedAt"]), ownerElement("h2", "owner-admin__section-title", "Tournament history"), ownerRows(history.hallOfFame, ["id", "title", "champion", "runnerUp", "date"]), ownerElement("h2", "owner-admin__section-title", "Season Hall of Fame"), ownerRows(history.seasonHallOfFame, ["id", "seasonId", "seasonName", "ign", "points", "completedAt"])); shell.content.append(records);
   };
   shell.content.append(ownerForm("Create event", [{ name: "title", label: "Title" }, { name: "date", label: "Date", type: "date" }, { name: "time", label: "Time", type: "time" }, { name: "description", label: "Description" }, { name: "rules", label: "Rules" }, { name: "rewardPoints", label: "Reward points", type: "number" }], "Create event", async (values, form) => { values.rewardPoints = Number(values.rewardPoints); await ownerRequest(OwnerAdminSeasons.endpoints.events, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Event created (audit: owner_event_create)."); await draw(); }), ownerForm("Edit event", [{ name: "eventId", label: "Event ID" }, { name: "title", label: "Title", required: false }, { name: "date", label: "Date", type: "date", required: false }, { name: "time", label: "Time", type: "time", required: false }, { name: "description", label: "Description", required: false }, { name: "rules", label: "Rules", required: false }, { name: "rewardPoints", label: "Reward points", type: "number", required: false }], "Save event", async (values) => { const id = values.eventId; delete values.eventId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; }); if (values.rewardPoints !== undefined) values.rewardPoints = Number(values.rewardPoints); await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, "Event updated (audit: owner_event_update)."); await draw(); }), ownerForm("Record event participation", [{ name: "eventId", label: "Event ID" }, { name: "accountId", label: "Community account ID" }], "Award participation", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(values.eventId)}/participation`, OwnerAdminApi.json("POST", { accountId: values.accountId })); await draw(); }), ownerForm("Correct Hall of Fame", [{ name: "domain", label: "Domain (hall-of-fame or season-hall-of-fame)", value: "hall-of-fame" }, { name: "entryId", label: "Entry ID" }, { name: "field", label: "Field to correct", value: "champion" }, { name: "value", label: "Corrected value" }, { name: "reason", label: "Correction reason" }], "Save history correction", async (values) => {
     const body = { reason: values.reason, [values.field]: values.field === "points" ? Number(values.value) : values.value };
@@ -606,7 +613,7 @@ async function renderOwnerAudit(shell) {
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
     records.append(ownerRows(data.audit, ["actor_id", "actor_role", "action", "target_type", "target_id", "created_at", "details"]));
-    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length; const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
+    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerActionButton(shell, "Previous", async () => { cursor = cursors.pop() || ""; await draw(); }); previous.disabled = !cursors.length; const next = ownerActionButton(shell, "Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
   const filterForm = ownerForm("Filter audit records", [{ name: "action", label: "Action" , required: false }, { name: "actor", label: "Actor / role", required: false }, { name: "target", label: "Target", required: false }, { name: "from", label: "From", type: "date", required: false }, { name: "to", label: "To", type: "date", required: false }, { name: "limit", label: "Rows per page", type: "number", value: "25" }], "Apply audit filters", async (values) => { Object.assign(filters, values, { limit: Number(values.limit) || 25 }); cursor = ""; cursors.length = 0; await draw(); });
   shell.content.append(filterForm); await draw();
