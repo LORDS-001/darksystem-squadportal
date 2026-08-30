@@ -172,6 +172,47 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertNotIn("community-bootstrap@example.test", serialized)
         self.assertNotIn("+234-555-0100", serialized)
 
+    def test_authenticated_tournament_bootstrap_preserves_approval_access_codes_for_legacy_hydration(self):
+        community = self.register_community("approval-leader@example.test")
+        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        self.setup_owner()
+        squad_cookie = self.squad_cookie()
+        approvals = [{
+            "id": "approval-1", "tournamentId": "squad-tournament",
+            "leaderAccountId": community.json["account"]["id"],
+            "leaderAccessCode": "LEADER-WORKFLOW-CODE", "memberAccessCode": "MEMBER-WORKFLOW-CODE",
+        }]
+        tournaments = [{
+            "id": "squad-tournament", "leaderAccessCode": "TOURNAMENT-LEADER-CODE",
+            "memberAccessCode": "TOURNAMENT-MEMBER-CODE",
+        }]
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "squadTournamentApprovals", approvals)
+            server.state_set(connection, "tournaments", tournaments)
+            connection.commit()
+
+        community_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=community_cookie)
+        squad_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=squad_cookie)
+
+        self.assertEqual(community_bootstrap.status, 200)
+        self.assertEqual(
+            community_bootstrap.json["community"]["squadTournamentApprovals"][0]["memberAccessCode"],
+            "MEMBER-WORKFLOW-CODE",
+        )
+        self.assertEqual(
+            squad_bootstrap.json["community"]["tournaments"][0]["leaderAccessCode"],
+            "TOURNAMENT-LEADER-CODE",
+        )
+        synced = self.backend.request(
+            "PUT", "/api/state",
+            {"squad": squad_bootstrap.json["squad"], "community": squad_bootstrap.json["community"]},
+            cookie=squad_cookie,
+        )
+        self.assertEqual(synced.status, 200)
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(server.state_get(connection, "squadTournamentApprovals", [])[0]["memberAccessCode"], "MEMBER-WORKFLOW-CODE")
+            self.assertEqual(server.state_get(connection, "tournaments", [])[0]["leaderAccessCode"], "TOURNAMENT-LEADER-CODE")
+
     def test_authorized_squad_bootstrap_round_trip_preserves_member_contact_and_access_code_data(self):
         self.setup_owner()
         cookie = self.squad_cookie()
@@ -287,7 +328,7 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
                 "system",
                 {
                     "code": "HISTORICAL-CODE-123",
-                    "context": "password=historical-password; token: historical-token; access code=HISTORICAL-ACCESS",
+                    "context": "password is historical-password; token was historical-token; access code: HISTORICAL-ACCESS",
                     "nested": {"recoveryCode": "HISTORICAL-RECOVERY", "summary": "Member disabled"},
                 },
             )

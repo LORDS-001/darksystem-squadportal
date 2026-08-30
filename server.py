@@ -335,10 +335,11 @@ def bootstrap(session):
         session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
         sanitize=lambda value: sanitize_overview_value(value, secret_values, session_token_hashes)
         safe_state=lambda key, default: sanitize(state_get(c, key, default))
+        safe_workflow_state=lambda key, default: sanitize_workflow_value(state_get(c, key, default), secret_values, session_token_hashes)
         session_type=session.get('type')
         session_id=str(session.get('id'))
         registrations=safe_state('registrations', [])
-        approvals=safe_state('squadTournamentApprovals', [])
+        approvals=safe_workflow_state('squadTournamentApprovals', [])
         notifications=safe_state('community_notifications', [])
         event_participation=safe_state('eventParticipation', [])
         community_privileged=session_type == 'squad' or session.get('role') == 'Tournament Manager'
@@ -352,7 +353,7 @@ def bootstrap(session):
         ]
         community={
             'accounts':accounts,
-            'tournaments':safe_state('tournaments', []),
+            'tournaments':safe_workflow_state('tournaments', []),
             'registrations':registrations,
             'tournamentManagers':safe_state('tournamentManagers', []),
             'notifications':notifications,
@@ -492,7 +493,7 @@ def overview_secret_key(key):
 
 _OVERVIEW_OMIT = object()
 _EMBEDDED_AUDIT_SECRET = re.compile(
-    r'(?i)(\b(?:password|passphrase|token|credential|secret|access[ _-]?code|reset[ _-]?code|recovery[ _-]?code|code)\b\s*(?:=|:)\s*)([^\s,;]+)'
+    r'(?i)(\b(?:password|passphrase|token|credential|secret|access[ _-]?code|reset[ _-]?code|recovery[ _-]?code|code)\b\s*(?:=|:|\bis\b|\bwas\b)\s*)([^\s,;]+)'
 )
 
 def redact_embedded_audit_secrets(value):
@@ -510,6 +511,29 @@ def sanitize_overview_value(value, secret_values, session_token_hashes):
         return cleaned
     if isinstance(value, (list, tuple)):
         return [item for value_item in value if (item := sanitize_overview_value(value_item, secret_values, session_token_hashes)) is not _OVERVIEW_OMIT]
+    if isinstance(value, str):
+        if value in secret_values or session_token_hash(value) in session_token_hashes:
+            return _OVERVIEW_OMIT
+        return redact_embedded_audit_secrets(value)
+    return value
+
+_WORKFLOW_ACCESS_CODE_KEYS = {'leaderAccessCode', 'memberAccessCode'}
+
+def sanitize_workflow_value(value, secret_values, session_token_hashes):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key in _WORKFLOW_ACCESS_CODE_KEYS and isinstance(item, str):
+                cleaned[str(key)] = item
+                continue
+            if overview_secret_key(key):
+                continue
+            safe_item = sanitize_workflow_value(item, secret_values, session_token_hashes)
+            if safe_item is not _OVERVIEW_OMIT:
+                cleaned[str(key)] = safe_item
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [item for value_item in value if (item := sanitize_workflow_value(value_item, secret_values, session_token_hashes)) is not _OVERVIEW_OMIT]
     if isinstance(value, str):
         if value in secret_values or session_token_hash(value) in session_token_hashes:
             return _OVERVIEW_OMIT
