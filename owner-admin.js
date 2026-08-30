@@ -314,6 +314,18 @@ function ownerButton(label, onClick, secondary = false) {
   return button;
 }
 
+function ownerActionButton(shell, label, work, { confirmText = "", secondary = true } = {}) {
+  let button;
+  button = ownerButton(label, async () => {
+    if (confirmText && !confirm(confirmText)) return;
+    setOwnerError(shell.error, ""); setOwnerBusy(button, true, label);
+    try { await work(); }
+    catch (error) { ownerSetNotice(shell, error.message, true); }
+    finally { if (button.isConnected !== false) setOwnerBusy(button, false, label); }
+  }, secondary);
+  return button;
+}
+
 function ownerStatusRegion() {
   const status = ownerElement("p", "owner-admin__notice");
   status.setAttribute("role", "status");
@@ -352,7 +364,7 @@ function ownerForm(title, fields, submitLabel, onSubmit) {
   for (const field of fields) {
     const built = ownerField({ ...field, id: `owner-${title.toLowerCase().replace(/[^a-z]+/g, "-")}-${field.name}` });
     if (field.value !== undefined) built.input.value = field.value;
-    if (field.secret) built.input.dataset.secret = "true";
+    if (field.secret) built.input.setAttribute("data-secret", "true");
     form.append(built.field);
   }
   const submit = ownerElement("button", "owner-admin__button", submitLabel);
@@ -426,74 +438,115 @@ function renderOwnerOverviewSection(shell, data) {
 }
 
 async function renderOwnerSquads(shell) {
-  let search = "";
+  let search = "", cursor = ""; const cursors = [];
   const draw = async () => {
-    const query = new URLSearchParams({ limit: "100" }); if (search) query.set("search", search);
+    const query = new URLSearchParams({ limit: "25" }); if (search) query.set("search", search); if (cursor) query.set("cursor", cursor);
     const data = await ownerRequest(`${OwnerAdminSquad.endpoints.squads}?${query}`);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerRows(data.members, ["name", "ign", "gameId", "serverId", "role", "status"], (member, cell) => {
-      cell.append(ownerButton(member.status === "Disabled" ? "Activate" : "Disable", async () => {
+    records.append(ownerRows(data.members, ["id", "name", "ign", "gameId", "serverId", "role", "status"], (member, cell) => {
+      cell.append(ownerActionButton(shell, member.status === "Disabled" ? "Activate" : "Disable", async () => {
         await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(member.id)}`, OwnerAdminApi.json("PATCH", { status: member.status === "Disabled" ? "Offline" : "Disabled" })); await draw();
-      }, true), ownerButton("Appoint Owner", async () => {
-        if (!confirm(`Appoint ${member.ign} as Squad Owner?`)) return;
+      }, { confirmText: member.status === "Disabled" ? "" : `Disable ${member.ign}? Their active sessions will be revoked.` }), ownerActionButton(shell, "Appoint Owner", async () => {
         await ownerRequest("/api/owner/squad-owner", OwnerAdminApi.json("POST", { memberId: member.id })); await draw();
-      }, true), ownerButton("Remove", async () => {
-        if (!confirm(`Remove ${member.ign}? This cannot be undone.`)) return;
+      }, { confirmText: `Appoint ${member.ign} as Squad Owner?` }), ownerActionButton(shell, "Remove", async () => {
         await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(member.id)}`, { method: "DELETE" }); await draw();
-      }, true));
-    })); shell.content.append(records);
+      }, { confirmText: `Remove ${member.ign}? This cannot be undone.` }));
+    }));
+    const pager = ownerElement("div", "owner-admin__pager");
+    const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length;
+    const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor;
+    pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
-  shell.content.append(ownerQueryForm((value) => { search = value; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Create Squad member", [
+  shell.content.append(ownerQueryForm((value) => { search = value; cursor = ""; cursors.length = 0; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Create Squad member", [
     { name: "name", label: "Name" }, { name: "ign", label: "IGN" }, { name: "gameId", label: "Game ID" }, { name: "serverId", label: "Server ID" },
     { name: "email", label: "Email", type: "email", required: false }, { name: "role", label: "Role", value: "Squad Member" }, { name: "accessCode", label: "Access code", type: "password", secret: true },
-  ], "Create member", async (values, form) => { await ownerRequest(OwnerAdminSquad.endpoints.squads, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Squad member created."); await draw(); }));
+  ], "Create member", async (values, form) => { await ownerRequest(OwnerAdminSquad.endpoints.squads, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Squad member created (audit: owner_squad_member_create)."); await draw(); }), ownerForm("Edit Squad member or role", [
+    { name: "memberId", label: "Member ID" }, { name: "name", label: "Name", required: false }, { name: "ign", label: "IGN", required: false }, { name: "role", label: "Role", required: false }, { name: "status", label: "Status", required: false },
+  ], "Save Squad member", async (values) => { const id = values.memberId; delete values.memberId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; }); await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, "Squad member updated (audit: owner_squad_member_update)."); await draw(); }));
   await draw();
 }
 
 async function renderOwnerCommunity(shell) {
-  let search = "";
+  let search = "", cursor = ""; const cursors = [];
   const draw = async () => {
-    const query = new URLSearchParams({ limit: "100" }); if (search) query.set("search", search);
+    const query = new URLSearchParams({ limit: "25" }); if (search) query.set("search", search); if (cursor) query.set("cursor", cursor);
     const data = await ownerRequest(`${OwnerAdminSquad.endpoints.community}?${query}`);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerRows(data.accounts, ["ign", "gameId", "serverId", "email", "role", "status"], (account, cell) => cell.append(ownerButton(account.status === "Disabled" ? "Activate" : "Disable", async () => {
+    records.append(ownerRows(data.accounts, ["id", "ign", "gameId", "serverId", "email", "role", "status"], (account, cell) => cell.append(ownerActionButton(shell, account.status === "Disabled" ? "Activate" : "Disable", async () => {
       await ownerRequest(`${OwnerAdminSquad.endpoints.community}/${encodeURIComponent(account.id)}`, OwnerAdminApi.json("PATCH", { status: account.status === "Disabled" ? "Active" : "Disabled" })); await draw();
-    }, true)))); shell.content.append(records);
+    }, { confirmText: account.status === "Disabled" ? "" : `Disable ${account.ign}? Their active sessions will be revoked.` }))));
+    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length;
+    const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
-  shell.content.append(ownerQueryForm((value) => { search = value; draw().catch((e) => ownerSetNotice(shell, e.message, true)); })); await draw();
+  shell.content.append(ownerQueryForm((value) => { search = value; cursor = ""; cursors.length = 0; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Edit Community profile", [
+    { name: "accountId", label: "Account ID" }, { name: "ign", label: "IGN", required: false }, { name: "gameId", label: "Game ID", required: false }, { name: "serverId", label: "Server ID", required: false }, { name: "email", label: "Email", type: "email", required: false }, { name: "phone", label: "Phone", required: false }, { name: "lane", label: "Lane", required: false }, { name: "status", label: "Status", required: false },
+  ], "Save Community profile", async (values) => { const id = values.accountId; delete values.accountId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; }); await ownerRequest(`${OwnerAdminSquad.endpoints.community}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, "Community account updated (audit: owner_community_account_update)."); await draw(); })); await draw();
 }
 
 async function renderOwnerContent(shell) {
   const domain = ownerElement("select", "owner-admin__input"); domain.id = "owner-content-domain";
   for (const name of OwnerAdminSquad.contentDomains()) { const option = ownerElement("option", "", ownerLabel(name)); option.value = name; domain.append(option); }
   const label = ownerElement("label", "owner-admin__field-label", "Content type"); label.htmlFor = domain.id;
+  function fieldsForDomain() {
+    if (domain.value === "events") return [{ name: "title", label: "Title" }, { name: "date", label: "Date", type: "date" }, { name: "time", label: "Time", type: "time", required: false }, { name: "description", label: "Description", required: false }, { name: "rules", label: "Rules", required: false }];
+    if (domain.value === "notifications") return [{ name: "title", label: "Title" }, { name: "message", label: "Message" }, { name: "audienceType", label: "Audience type", value: "squad" }, { name: "audienceId", label: "Audience ID", required: false }];
+    if (domain.value === "complaints") return [{ name: "subject", label: "Subject", required: false }, { name: "body", label: "Complaint" }];
+    return [{ name: "title", label: "Title", required: domain.value === "announcements" }, { name: "body", label: "Body" }];
+  }
+  function rebuildForms() {
+    const old = shell.content.querySelector(".owner-admin__content-forms"); if (old) old.remove();
+    const forms = ownerElement("div", "owner-admin__content-forms");
+    const create = ownerForm(`Create ${ownerLabel(domain.value)}`, fieldsForDomain(), "Save content", async (values, form) => {
+      await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}`, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, `Content saved (audit: owner_squad_content_create / ${domain.value}).`); await draw();
+    });
+    const editFields = [{ name: "itemId", label: "Content ID" }, ...fieldsForDomain().map((field) => ({ ...field, required: false }))];
+    const edit = ownerForm(`Edit ${ownerLabel(domain.value)}`, editFields, "Update content", async (values) => {
+      const id = values.itemId; delete values.itemId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; });
+      await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, `Content updated (audit: owner_squad_content_update / ${domain.value}).`); await draw();
+    });
+    forms.append(create, edit); shell.content.append(forms);
+  }
   const draw = async () => {
     const data = await ownerRequest(`${OwnerAdminSquad.endpoints.content}?domain=${encodeURIComponent(domain.value)}`);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerRows(data.items, ["title", "status", "audienceType", "createdAt"], (item, cell) => cell.append(ownerButton("Delete", async () => {
-      if (!confirm("Delete this content item?")) return;
+    records.append(ownerRows(data.items, ["id", "title", "subject", "date", "status", "audienceType", "createdAt"], (item, cell) => cell.append(ownerActionButton(shell, "Delete", async () => {
       await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}/${encodeURIComponent(item.id)}`, { method: "DELETE" }); await draw();
-    }, true)))); shell.content.append(records);
+    }, { confirmText: "Delete this content item?" })))); shell.content.append(records);
   };
-  domain.addEventListener("change", () => draw().catch((e) => ownerSetNotice(shell, e.message, true)));
-  shell.content.append(label, domain, ownerForm("Create content", [{ name: "title", label: "Title" }, { name: "body", label: "Body" }, { name: "audienceType", label: "Audience type", value: "squad", required: false }, { name: "audienceId", label: "Audience ID", required: false }], "Publish content", async (values, form) => {
-    await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}`, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Content saved."); await draw();
-  })); await draw();
+  domain.value = "announcements";
+  domain.addEventListener("change", () => { rebuildForms(); draw().catch((e) => ownerSetNotice(shell, e.message, true)); });
+  shell.content.append(label, domain); rebuildForms(); await draw();
 }
 
 async function renderOwnerTournaments(shell) {
+  const showDetail = async (id) => {
+    const data = await ownerRequest(`${OwnerAdminTournaments.endpoint}/${encodeURIComponent(id)}`);
+    const old = shell.content.querySelector(".owner-admin__tournament-detail"); if (old) old.remove();
+    const detail = ownerElement("section", "owner-admin__card owner-admin__tournament-detail");
+    detail.append(ownerElement("h2", "owner-admin__section-title", `Tournament detail: ${id}`), ownerRows([data.tournament || {}], ["id", "title", "status", "format", "registrationDeadline"]));
+    const groups = [
+      ["Registrations", data.registrations, ["id", "accountId", "status"], (item, cell) => cell.append(ownerActionButton(shell, "Approve", async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "approve" })); await showDetail(id); }), ownerActionButton(shell, "Reject", async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "reject" })); await showDetail(id); }, { confirmText: `Reject registration ${item.id}?` }))],
+      ["Squad approvals", data.approvals, ["id", "leaderAccountId", "status"], (item, cell) => cell.append(ownerActionButton(shell, "Approve", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "approve" })); await showDetail(id); }), ownerActionButton(shell, "Reject", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "reject" })); await showDetail(id); }, { confirmText: `Reject Squad approval ${item.id}?` }))],
+      ["Bracket", Array.isArray(data.bracket) ? data.bracket : (data.bracket ? [data.bracket] : []), ["id", "round", "player1", "player2"]],
+      ["Matches", data.matches || (data.tournament && data.tournament.matches), ["id", "round", "player1", "player2", "winner", "status"]],
+      ["Result submissions", data.resultSubmissions, ["id", "matchId", "winner", "status"]],
+      ["Disputes", data.disputes, ["id", "matchId", "status", "reason"]],
+    ];
+    for (const [title, rows, columns, actions] of groups) detail.append(ownerElement("h3", "owner-admin__section-title", title), ownerRows(rows, columns, actions));
+    shell.content.append(detail);
+  };
   const draw = async () => {
     const data = await ownerRequest(OwnerAdminTournaments.endpoint);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerRows(data.tournaments, ["title", "game", "format", "date", "status"], (item, cell) => {
-      for (const action of OwnerAdminTournaments.transitions) cell.append(ownerButton(ownerLabel(action), async () => {
-        if (OwnerAdminTournaments.needsConfirmation(action) && !confirm(`${ownerLabel(action)} ${item.title}?`)) return;
+    records.append(ownerRows(data.tournaments, ["id", "title", "game", "format", "date", "status"], (item, cell) => {
+      cell.append(ownerActionButton(shell, "View details", () => showDetail(item.id)));
+      for (const action of OwnerAdminTournaments.transitions) cell.append(ownerActionButton(shell, ownerLabel(action), async () => {
         await ownerRequest(OwnerAdminTournaments.transitionPath(item.id, action), OwnerAdminApi.json("POST", {})); await draw();
-      }, true));
+      }, { confirmText: OwnerAdminTournaments.needsConfirmation(action) ? `${ownerLabel(action)} ${item.title}?` : "" }));
     })); shell.content.append(records);
   };
   shell.content.append(ownerForm("Create tournament", [{ name: "title", label: "Title" }, { name: "game", label: "Game" }, { name: "format", label: "Format" }, { name: "date", label: "Date", type: "date" }, { name: "registrationDeadline", label: "Registration deadline", type: "date", required: false }], "Create tournament", async (values, form) => {
@@ -512,9 +565,10 @@ async function renderOwnerTournaments(shell) {
     if (action === "delete") { if (!confirm("Delete this match?")) return; await ownerRequest(path, { method: "DELETE" }); }
     else { const body = {}; if (values.scheduledAt) body.scheduledAt = values.scheduledAt; if (values.status) body.status = values.status; await ownerRequest(path, OwnerAdminApi.json("PATCH", body)); }
     await draw();
-  }), ownerForm("Review match result", [{ name: "tournamentId", label: "Tournament ID" }, { name: "matchId", label: "Match ID" }, { name: "action", label: "Action (confirm, reject, dispute)", value: "confirm" }, { name: "winner", label: "Winner", required: false }, { name: "reason", label: "Reason", required: false }], "Review result", async (values) => {
+  }), ownerForm("Review match result", [{ name: "tournamentId", label: "Tournament ID" }, { name: "matchId", label: "Match ID" }, { name: "action", label: "Action (confirm, correct, resolve, or reject)", value: "confirm" }, { name: "winner", label: "Winner", required: false }, { name: "reason", label: "Reason", required: false }], "Review result", async (values) => {
     const { tournamentId, matchId, ...body } = values; await ownerRequest(OwnerAdminTournaments.resultPath(tournamentId, matchId), OwnerAdminApi.json("POST", body)); await draw();
   }), ownerForm("Tournament Manager permission", [{ name: "memberId", label: "Squad member ID" }, { name: "action", label: "Action (grant or revoke)", value: "grant" }], "Update permission", async (values) => {
+    if (values.action === "revoke" && !confirm("Revoke Tournament Manager permission? Active sessions will be revoked.")) return;
     await ownerRequest(`/api/owner/tournament-managers/${encodeURIComponent(values.memberId)}`, OwnerAdminApi.json("POST", { action: values.action })); ownerSetNotice(shell, "Tournament Manager permission updated.");
   })); await draw();
 }
@@ -535,33 +589,32 @@ async function renderOwnerHistory(shell) {
     const [events, history] = await Promise.all([ownerRequest(OwnerAdminSeasons.endpoints.events), ownerRequest(OwnerAdminSeasons.endpoints.history)]);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerElement("h2", "owner-admin__section-title", "Events"), ownerRows(events.events, ["title", "date", "time", "status", "rewardPoints"], (item, cell) => {
-      for (const action of ["publish", "close", "archive"]) cell.append(ownerButton(ownerLabel(action), async () => { if (action === "archive" && !confirm("Archive this event?")) return; await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(item.id)}/${action}`, OwnerAdminApi.json("POST", {})); await draw(); }, true));
+    records.append(ownerElement("h2", "owner-admin__section-title", "Events"), ownerRows(events.events, ["id", "title", "date", "time", "status", "rewardPoints"], (item, cell) => {
+      for (const action of ["publish", "close", "archive"]) cell.append(ownerActionButton(shell, ownerLabel(action), async () => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(item.id)}/${action}`, OwnerAdminApi.json("POST", {})); await draw(); }, { confirmText: action === "archive" ? "Archive this event?" : "" }));
     }), ownerElement("h2", "owner-admin__section-title", "Tournament history"), ownerRows(history.hallOfFame, ["title", "champion", "runnerUp", "date"]), ownerElement("h2", "owner-admin__section-title", "Season Hall of Fame"), ownerRows(history.seasonHallOfFame, ["seasonName", "ign", "points", "completedAt"])); shell.content.append(records);
   };
-  shell.content.append(ownerForm("Create event", [{ name: "title", label: "Title" }, { name: "date", label: "Date", type: "date" }, { name: "time", label: "Time", type: "time" }, { name: "description", label: "Description" }, { name: "rules", label: "Rules" }, { name: "rewardPoints", label: "Reward points", type: "number" }], "Create event", async (values, form) => { values.rewardPoints = Number(values.rewardPoints); await ownerRequest(OwnerAdminSeasons.endpoints.events, OwnerAdminApi.json("POST", values)); form.reset(); await draw(); }), ownerForm("Record event participation", [{ name: "eventId", label: "Event ID" }, { name: "accountId", label: "Community account ID" }], "Award participation", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(values.eventId)}/participation`, OwnerAdminApi.json("POST", { accountId: values.accountId })); await draw(); }), ownerForm("Correct Hall of Fame", [{ name: "domain", label: "Domain (hall-of-fame or season-hall-of-fame)", value: "hall-of-fame" }, { name: "entryId", label: "Entry ID" }, { name: "field", label: "Field to correct", value: "champion" }, { name: "value", label: "Corrected value" }, { name: "reason", label: "Correction reason" }], "Save history correction", async (values) => {
+  shell.content.append(ownerForm("Create event", [{ name: "title", label: "Title" }, { name: "date", label: "Date", type: "date" }, { name: "time", label: "Time", type: "time" }, { name: "description", label: "Description" }, { name: "rules", label: "Rules" }, { name: "rewardPoints", label: "Reward points", type: "number" }], "Create event", async (values, form) => { values.rewardPoints = Number(values.rewardPoints); await ownerRequest(OwnerAdminSeasons.endpoints.events, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Event created (audit: owner_event_create)."); await draw(); }), ownerForm("Edit event", [{ name: "eventId", label: "Event ID" }, { name: "title", label: "Title", required: false }, { name: "date", label: "Date", type: "date", required: false }, { name: "time", label: "Time", type: "time", required: false }, { name: "description", label: "Description", required: false }, { name: "rules", label: "Rules", required: false }, { name: "rewardPoints", label: "Reward points", type: "number", required: false }], "Save event", async (values) => { const id = values.eventId; delete values.eventId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; }); if (values.rewardPoints !== undefined) values.rewardPoints = Number(values.rewardPoints); await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, "Event updated (audit: owner_event_update)."); await draw(); }), ownerForm("Record event participation", [{ name: "eventId", label: "Event ID" }, { name: "accountId", label: "Community account ID" }], "Award participation", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(values.eventId)}/participation`, OwnerAdminApi.json("POST", { accountId: values.accountId })); await draw(); }), ownerForm("Correct Hall of Fame", [{ name: "domain", label: "Domain (hall-of-fame or season-hall-of-fame)", value: "hall-of-fame" }, { name: "entryId", label: "Entry ID" }, { name: "field", label: "Field to correct", value: "champion" }, { name: "value", label: "Corrected value" }, { name: "reason", label: "Correction reason" }], "Save history correction", async (values) => {
     const body = { reason: values.reason, [values.field]: values.field === "points" ? Number(values.value) : values.value };
     await ownerRequest(OwnerAdminSeasons.historyCorrectionPath(values.domain, values.entryId), OwnerAdminApi.json("PATCH", body)); await draw();
   })); await draw();
 }
 
 async function renderOwnerAudit(shell) {
-  let page = 1, search = "", action = "";
+  let cursor = ""; const cursors = []; const filters = { action: "", actor: "", target: "", from: "", to: "", limit: 25 };
   const draw = async () => {
-    const data = await ownerRequest(OwnerAdminAudit.query({ search, action, page, pageSize: 25 }));
+    const data = await ownerRequest(OwnerAdminAudit.query({ ...filters, cursor }));
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
     records.append(ownerRows(data.audit, ["actor_id", "actor_role", "action", "target_type", "target_id", "created_at", "details"]));
-    const pager = ownerElement("div", "owner-admin__pager"); pager.append(ownerButton("Previous", () => { page = Math.max(1, page - 1); draw(); }, true), ownerElement("span", "", `Page ${page}`), ownerButton("Next", () => { page += 1; draw(); }, true)); records.append(pager); shell.content.append(records);
+    const pager = ownerElement("div", "owner-admin__pager"); const previous = ownerButton("Previous", async () => { cursor = cursors.pop() || ""; await draw(); }, true); previous.disabled = !cursors.length; const next = ownerButton("Next", async () => { if (!data.nextCursor) return; cursors.push(cursor); cursor = data.nextCursor; await draw(); }, true); next.disabled = !data.nextCursor; pager.append(previous, next); records.append(pager); shell.content.append(records);
   };
-  const filters = ownerQueryForm((value) => { search = value; page = 1; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }, { placeholder: "Actor, target, or detail" });
-  const actionLabel = ownerElement("label", "owner-admin__field-label", "Action filter"); const actionInput = ownerElement("input", "owner-admin__input"); actionInput.addEventListener("change", () => { action = actionInput.value.trim(); page = 1; draw(); });
-  filters.append(actionLabel, actionInput); shell.content.append(filters); await draw();
+  const filterForm = ownerForm("Filter audit records", [{ name: "action", label: "Action" , required: false }, { name: "actor", label: "Actor / role", required: false }, { name: "target", label: "Target", required: false }, { name: "from", label: "From", type: "date", required: false }, { name: "to", label: "To", type: "date", required: false }, { name: "limit", label: "Rows per page", type: "number", value: "25" }], "Apply audit filters", async (values) => { Object.assign(filters, values, { limit: Number(values.limit) || 25 }); cursor = ""; cursors.length = 0; await draw(); });
+  shell.content.append(filterForm); await draw();
 }
 
 async function renderOwnerSettings(shell) {
   const data = await ownerRequest("/api/owner/settings");
-  shell.content.append(ownerRows([data.owner || data.account || data], ["username", "createdAt", "sessionCount"]), ownerForm("Change Owner password", [{ name: "currentPassword", label: "Current password", type: "password", secret: true }, { name: "newPassword", label: "New password", type: "password", secret: true }, { name: "passwordConfirmation", label: "Confirm new password", type: "password", secret: true }], "Update password", async (values) => {
+  shell.content.append(ownerRows([data.settings || data.owner || data.account || data], ["username", "createdAt", "sessionTtlSeconds", "recoveryCodeTtlSeconds"]), ownerForm("Change Owner password", [{ name: "currentPassword", label: "Current password", type: "password", secret: true }, { name: "newPassword", label: "New password", type: "password", secret: true }, { name: "passwordConfirmation", label: "Confirm new password", type: "password", secret: true }], "Update password", async (values) => {
     if (values.newPassword !== values.passwordConfirmation) throw new Error("New password confirmation must match.");
     await ownerRequest("/api/owner/settings", OwnerAdminApi.json("PATCH", { currentPassword: values.currentPassword, newPassword: values.newPassword, revokeOtherSessions: true })); ownerSetNotice(shell, "Owner password updated and other sessions revoked.");
   }));

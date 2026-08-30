@@ -59,8 +59,8 @@ test("history helper builds correction paths", () => {
 
 test("audit query safely encodes filters and pagination", () => {
   assert.equal(
-    audit.query({ search: "owner action", action: "member.update", page: 2, pageSize: 25 }),
-    "/api/owner/audit?search=owner+action&action=member.update&page=2&pageSize=25",
+    audit.query({ actor: "owner action", action: "member.update", target: "member", from: "2026-01-01", to: "2026-01-31", cursor: "next+page", limit: 25 }),
+    "/api/owner/audit?action=member.update&actor=owner+action&target=member&from=2026-01-01&to=2026-01-31&cursor=next%2Bpage&limit=25",
   );
 });
 

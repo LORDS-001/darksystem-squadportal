@@ -6,7 +6,7 @@
   "use strict";
   function query(filters = {}) {
     const params = new URLSearchParams();
-    for (const key of ["search", "action", "actor", "target", "page", "pageSize"]) {
+    for (const key of ["action", "actor", "target", "from", "to", "cursor", "limit"]) {
       if (filters[key] !== undefined && filters[key] !== "") params.set(key, String(filters[key]));
     }
     const suffix = params.toString();

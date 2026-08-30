@@ -276,14 +276,23 @@ function ownerHarness() {
   let fetchImplementation = async () => jsonResponse(true, { setupComplete: false });
   const sandbox = {
     console,
+    confirm: () => true,
     document,
     fetch: (...args) => fetchImplementation(...args),
     Headers,
+    URLSearchParams,
+    FormData: class FormData {
+      constructor(form) { this.values = descendants([form]).filter((node) => node.name).map((node) => [node.name, node.value || ""]); }
+      entries() { return this.values[Symbol.iterator](); }
+    },
     setTimeout,
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
   const context = vm.createContext(sandbox);
+  for (const moduleName of ["owner-admin-api.js", "owner-admin-squad.js", "owner-admin-tournaments.js", "owner-admin-seasons.js", "owner-admin-audit.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(ROOT, moduleName), "utf8"), context, { filename: moduleName });
+  }
   vm.runInContext(fs.readFileSync(path.join(ROOT, "owner-admin.js"), "utf8"), context, { filename: "owner-admin.js" });
   return {
     context,
@@ -534,6 +543,82 @@ test("Squad concurrent logout failure preserves state and permits one retry afte
   assert.equal(logoutFetchCount, 2);
   assert.equal(vm.runInContext("current", harness.context), null);
   assert.equal(harness.document.getElementById("public").classList.contains("hidden"), false);
+});
+
+test("Owner tournament section renders detail identifiers and administration queues", async () => {
+  const harness = ownerHarness();
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async (path) => {
+    if (path === "/api/owner/tournaments") return jsonResponse(true, { tournaments: [{ id: "T-1", title: "Finals", game: "MLBB", format: "1v1", date: "2099-01-01", status: "Open" }] });
+    if (path === "/api/owner/tournaments/T-1") return jsonResponse(true, { tournament: { id: "T-1", title: "Finals" }, registrations: [{ id: "R-1", accountId: "C-1", status: "Pending" }], approvals: [{ id: "A-1", status: "Pending" }], bracket: [{ id: "B-1" }], matches: [{ id: "M-1", player1: "C-1", player2: "C-2" }], resultSubmissions: [{ id: "RS-1" }], disputes: [{ id: "D-1" }] });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("tournaments")`, harness.context);
+  const view = harness.ownerRoot.querySelector(".owner-admin__workspace");
+  assert.match(descendants([view]).map((node) => node.textContent).join(" "), /T-1/);
+  const detailButton = descendants([view]).find((node) => node.textContent === "View details");
+  assert.ok(detailButton);
+  await detailButton.listeners.get("click")();
+  const text = descendants([view]).map((node) => node.textContent).join(" ");
+  for (const expected of ["R-1", "A-1", "B-1", "M-1", "RS-1", "D-1"]) assert.match(text, new RegExp(expected));
+});
+
+test("Owner Squad section uses backend cursor pagination and guarded destructive action", async () => {
+  const harness = ownerHarness();
+  await new Promise((resolve) => setImmediate(resolve));
+  const requests = [];
+  harness.setFetch(async (path, options = {}) => {
+    requests.push([path, options.method || "GET"]);
+    if (String(path).startsWith("/api/owner/squad-members")) return jsonResponse(true, { members: [{ id: "S-1", name: "Alpha", ign: "Alpha", role: "Squad Member", status: "Offline" }], nextCursor: "S-1" });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("squads")`, harness.context);
+  const view = harness.ownerRoot.querySelector(".owner-admin__workspace");
+  const next = descendants([view]).find((node) => node.textContent === "Next");
+  assert.ok(next);
+  await next.listeners.get("click")();
+  assert.ok(requests.some(([path]) => String(path).includes("cursor=S-1")));
+  const disable = descendants([view]).find((node) => node.textContent === "Disable");
+  assert.ok(disable);
+  await disable.listeners.get("click")();
+  assert.ok(requests.some(([path, method]) => path === "/api/owner/squad-members/S-1" && method === "PATCH"));
+});
+
+test("Owner content forms switch to domain-specific event and notification fields", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async () => jsonResponse(true, { items: [] }));
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("content")`, harness.context);
+  const domain = harness.document.getElementById("owner-content-domain");
+  domain.value = "events"; await domain.listeners.get("change")();
+  let text = descendants([harness.ownerRoot]).map((node) => node.textContent).join(" ");
+  assert.match(text, /Date/);
+  domain.value = "notifications"; await domain.listeners.get("change")();
+  text = descendants([harness.ownerRoot]).map((node) => node.textContent).join(" ");
+  assert.match(text, /Message/); assert.match(text, /Audience type/);
+});
+
+test("Owner settings renders the backend settings envelope", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async (path) => path === "/api/owner/settings" ? jsonResponse(true, { settings: { username: "root-owner", createdAt: "now", sessionTtlSeconds: 900, recoveryCodeTtlSeconds: 600 } }) : jsonResponse(true, {}));
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("settings")`, harness.context);
+  assert.match(descendants([harness.ownerRoot]).map((node) => node.textContent).join(" "), /root-owner/);
+});
+
+test("Owner guarded row action surfaces a safe panel error and restores its button", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async (path, options = {}) => {
+    if ((options.method || "GET") === "PATCH") return jsonResponse(false, { error: "Account update failed safely." });
+    return jsonResponse(true, { members: [{ id: "S-1", name: "Alpha", ign: "Alpha", role: "Squad Member", status: "Offline" }], nextCursor: null });
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("squads")`, harness.context);
+  const disable = descendants([harness.ownerRoot]).find((node) => node.textContent === "Disable"); await disable.listeners.get("click")();
+  const alert = harness.ownerRoot.querySelector(".owner-admin__workspace").querySelector('[role="alert"]'); assert.equal(alert.hidden, false); assert.equal(alert.textContent, "Account update failed safely.");
+  assert.equal(disable.disabled, false); assert.equal(disable.textContent, "Disable");
 });
 
 test("Squad leader registration sends the typed invitation code to the server", async () => {
