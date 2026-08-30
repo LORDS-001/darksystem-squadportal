@@ -684,6 +684,24 @@ test("Owner representative edit and create forms send domain-correct payloads", 
   assert.ok(writes.some(([path, method, body]) => path === "/api/owner/tournaments" && method === "POST" && body.title === "Cup"));
 });
 
+test("Owner Squad creation requires registered email and never submits an access code", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve)); const writes = [];
+  harness.setFetch(async (path, options = {}) => {
+    if (options.body) writes.push([path, JSON.parse(options.body)]);
+    return jsonResponse(true, String(path).startsWith("/api/owner/squad-members?") ? { members: [], nextCursor: null } : { member: { id: "S-NEW" } });
+  });
+  vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("squads")`, harness.context);
+  const form = formByHeading(harness.ownerRoot, "Create Squad member");
+  const names = descendants(form.children).filter((node) => node.name).map((node) => node.name);
+  assert.ok(names.includes("email")); assert.ok(!names.includes("accessCode"));
+  fillForm(form, { name: "New Member", ign: "New", gameId: "G-1", serverId: "SV-1", email: "new@example.com", role: "Squad Member" });
+  await submitAsBrowser(form);
+  const payload = writes.find(([path]) => path === "/api/owner/squad-members")[1];
+  assert.equal(payload.email, "new@example.com"); assert.equal(Object.hasOwn(payload, "accessCode"), false);
+  assert.match(descendants([harness.ownerRoot]).map((node) => node.textContent).join(" "), /recovery required/i);
+});
+
 test("Owner audit cursor, history IDs, bracket object, and secret clearing follow backend contracts", async () => {
   const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve)); const requests = [];
   harness.setFetch(async (path, options = {}) => {

@@ -84,6 +84,12 @@ class OwnerStaticContractTests(unittest.TestCase):
         self.assertIn("Orbitron", self.css)
         self.assertIn("Rajdhani", self.css)
 
+    def test_owner_squad_creation_uses_registered_email_and_recovery_not_credentials(self):
+        create_block = self.js.split('ownerForm("Create Squad member"', 1)[1].split('ownerForm("Edit Squad member', 1)[0]
+        self.assertIn('{ name: "email", label: "Registered email", type: "email" }', create_block)
+        self.assertNotIn('name: "accessCode"', create_block)
+        self.assertIn("recovery required", create_block.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

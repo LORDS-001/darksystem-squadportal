@@ -460,8 +460,8 @@ async function renderOwnerSquads(shell) {
   };
   shell.content.append(ownerQueryForm((value) => { search = value; cursor = ""; cursors.length = 0; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Create Squad member", [
     { name: "name", label: "Name" }, { name: "ign", label: "IGN" }, { name: "gameId", label: "Game ID" }, { name: "serverId", label: "Server ID" },
-    { name: "email", label: "Email", type: "email", required: false }, { name: "role", label: "Role", value: "Squad Member" }, { name: "accessCode", label: "Access code", type: "password", secret: true },
-  ], "Create member", async (values, form) => { await ownerRequest(OwnerAdminSquad.endpoints.squads, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Squad member created (audit: owner_squad_member_create)."); await draw(); }), ownerForm("Edit Squad member or role", [
+    { name: "email", label: "Registered email", type: "email" }, { name: "role", label: "Role", value: "Squad Member" },
+  ], "Create member", async (values, form) => { await ownerRequest(OwnerAdminSquad.endpoints.squads, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Squad account created; recovery required. The member must use self-service recovery to set their access code (audit: owner_squad_member_create)."); await draw(); }), ownerForm("Edit Squad member or role", [
     { name: "memberId", label: "Member ID" }, { name: "name", label: "Name", required: false }, { name: "ign", label: "IGN", required: false }, { name: "role", label: "Role", required: false }, { name: "status", label: "Status", required: false },
   ], "Save Squad member", async (values) => { const id = values.memberId; delete values.memberId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; }); await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); ownerSetNotice(shell, "Squad member updated (audit: owner_squad_member_update)."); await draw(); }));
   await draw();
