@@ -335,17 +335,35 @@ def bootstrap(session):
         session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
         sanitize=lambda value: sanitize_overview_value(value, secret_values, session_token_hashes)
         safe_state=lambda key, default: sanitize(state_get(c, key, default))
-        safe_workflow_state=lambda key, default: sanitize_workflow_value(state_get(c, key, default), secret_values, session_token_hashes)
         session_type=session.get('type')
         session_id=str(session.get('id'))
+        tournament_managers=safe_state('tournamentManagers', [])
+        tournament_admin=tournament_manager_identity(session, tournament_managers)
         registrations=safe_state('registrations', [])
-        approvals=safe_workflow_state('squadTournamentApprovals', [])
+        raw_approvals=state_get(c, 'squadTournamentApprovals', [])
+        if session_type == 'community' and not tournament_admin:
+            raw_approvals=[
+                item for item in raw_approvals
+                if isinstance(item, dict) and str(item.get('leaderAccountId')) == session_id
+            ]
+            approvals=[
+                sanitize_workflow_value(
+                    item,
+                    secret_values,
+                    session_token_hashes,
+                    {'memberAccessCode'} if item.get('status') == 'Approved' else frozenset(),
+                )
+                for item in raw_approvals
+            ]
+        else:
+            approval_code_keys=_WORKFLOW_ACCESS_CODE_KEYS if tournament_admin else frozenset()
+            approvals=sanitize_workflow_value(
+                raw_approvals, secret_values, session_token_hashes, approval_code_keys
+            )
         notifications=safe_state('community_notifications', [])
         event_participation=safe_state('eventParticipation', [])
-        community_privileged=session_type == 'squad' or session.get('role') == 'Tournament Manager'
-        if session_type == 'community' and not community_privileged:
+        if session_type == 'community' and not tournament_admin:
             registrations=[item for item in registrations if isinstance(item, dict) and str(item.get('accountId')) == session_id]
-            approvals=[item for item in approvals if isinstance(item, dict) and str(item.get('leaderAccountId')) == session_id]
             event_participation=[item for item in event_participation if isinstance(item, dict) and str(item.get('accountId')) == session_id]
         notifications=[
             item for item in notifications
@@ -353,9 +371,14 @@ def bootstrap(session):
         ]
         community={
             'accounts':accounts,
-            'tournaments':safe_workflow_state('tournaments', []),
+            'tournaments':sanitize_workflow_value(
+                state_get(c, 'tournaments', []),
+                secret_values,
+                session_token_hashes,
+                {'leaderAccessCode'} if tournament_admin else frozenset(),
+            ),
             'registrations':registrations,
-            'tournamentManagers':safe_state('tournamentManagers', []),
+            'tournamentManagers':tournament_managers,
             'notifications':notifications,
             'seasonPoints':safe_state('seasonPoints', {}),
             'seasonHistory':safe_state('seasonHistory', []),
@@ -519,21 +542,21 @@ def sanitize_overview_value(value, secret_values, session_token_hashes):
 
 _WORKFLOW_ACCESS_CODE_KEYS = {'leaderAccessCode', 'memberAccessCode'}
 
-def sanitize_workflow_value(value, secret_values, session_token_hashes):
+def sanitize_workflow_value(value, secret_values, session_token_hashes, allowed_code_keys=frozenset()):
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
-            if key in _WORKFLOW_ACCESS_CODE_KEYS and isinstance(item, str):
+            if key in allowed_code_keys and isinstance(item, str):
                 cleaned[str(key)] = item
                 continue
             if overview_secret_key(key):
                 continue
-            safe_item = sanitize_workflow_value(item, secret_values, session_token_hashes)
+            safe_item = sanitize_workflow_value(item, secret_values, session_token_hashes, allowed_code_keys)
             if safe_item is not _OVERVIEW_OMIT:
                 cleaned[str(key)] = safe_item
         return cleaned
     if isinstance(value, (list, tuple)):
-        return [item for value_item in value if (item := sanitize_workflow_value(value_item, secret_values, session_token_hashes)) is not _OVERVIEW_OMIT]
+        return [item for value_item in value if (item := sanitize_workflow_value(value_item, secret_values, session_token_hashes, allowed_code_keys)) is not _OVERVIEW_OMIT]
     if isinstance(value, str):
         if value in secret_values or session_token_hash(value) in session_token_hashes:
             return _OVERVIEW_OMIT
@@ -558,6 +581,22 @@ def pending_overview_result(match):
     return overview_status(match.get('resultStatus')) in (
         'pending', 'pendingconfirmation', 'awaitingconfirmation', 'awaitingreview', 'disputed'
     )
+
+def tournament_manager_identity(session, managers):
+    if session.get('role') in ('Overall Owner', 'Squad Owner', 'Tournament Manager'):
+        return True
+    session_id = str(session.get('id'))
+    return any(
+        str(item) == session_id
+        or str((item or {}).get('id')) == session_id
+        or str((item or {}).get('accountId')) == session_id
+        for item in managers
+    )
+
+def workflow_code_matches(submitted, expected):
+    submitted_code = str(submitted or '').strip().upper()
+    expected_code = str(expected or '').strip().upper()
+    return bool(submitted_code and expected_code) and hmac.compare_digest(submitted_code, expected_code)
 
 def request_ip(h):
     return (request_header(h, 'X-Forwarded-For').split(',')[0].strip() or h.client_address[0])
@@ -893,11 +932,9 @@ class Handler(BaseHTTPRequestHandler):
         return json_response(self,{'member':public_member(row,True)})
 
     def tournament_manager_allowed(self, session):
-        if session.get('role') in ('Overall Owner','Squad Owner','Tournament Manager'): return True
         with LOCK, db() as c:
             managers=state_get(c,'tournamentManagers',[])
-        sid=str(session.get('id'))
-        return any(str(x)==sid or str((x or {}).get('id'))==sid or str((x or {}).get('accountId'))==sid for x in managers)
+        return tournament_manager_identity(session, managers)
 
     def community_register(self):
         d=read_json(self); email=str(d.get('email','')).strip().lower(); password=str(d.get('password',''))
@@ -1199,22 +1236,49 @@ class Handler(BaseHTTPRequestHandler):
     def api_squad_approval(self):
         s=self.dedicated_write('squadTournamentApprovals')
         if not s:return
-        if not self.tournament_manager_allowed(s): return json_response(self,{'error':'Tournament Manager permission is required.'},403)
         d=read_json(self); action=str(d.get('action','')); tid=str(d.get('tournamentId','')); aid=str(d.get('approvalId',''))
+        if action in ('submit_leader','join_member'):
+            if s.get('type')!='community':return json_response(self,{'error':'Community authentication required.'},403)
+        elif not self.tournament_manager_allowed(s):
+            return json_response(self,{'error':'Tournament Manager permission is required.'},403)
         with LOCK, db() as c:
             approvals=state_get(c,'squadTournamentApprovals',[]); tours=state_get(c,'tournaments',[])
             t=next((x for x in tours if str(x.get('id'))==tid),None)
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
             if action=='submit_leader':
                 if str(t.get('format'))!='Squad vs Squad':return json_response(self,{'error':'Invalid tournament type.'},400)
-                squad=d.get('squad') or {}; leader=str(d.get('leaderAccountId') or s.get('id'))
+                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False or t.get('squadRegistrationOpen') is False:return json_response(self,{'error':'Squad registration is closed.'},409)
+                if not workflow_code_matches(d.get('accessCode'),t.get('leaderAccessCode')):return json_response(self,{'error':'The tournament invitation code is invalid.'},403)
+                squad=d.get('squad') or {}; leader=str(s.get('id'))
                 if not squad.get('squadName') or not squad.get('squadId'):return json_response(self,{'error':'Squad name and ID are required.'},400)
-                if any(str(a.get('tournamentId'))==tid and a.get('status')=='Pending' and str(a.get('leaderAccountId'))==leader for a in approvals):return json_response(self,{'error':'Registration already pending.'},409)
+                account=c.execute('SELECT * FROM community_accounts WHERE id=?',(leader,)).fetchone()
+                if not account:return json_response(self,{'error':'Community account not found.'},404)
+                if any(str(a.get('tournamentId'))==tid and a.get('status') in ('Pending','Approved') and str(a.get('leaderAccountId'))==leader for a in approvals):return json_response(self,{'error':'Registration already submitted.'},409)
                 if any(str(a.get('tournamentId'))==tid and a.get('status')=='Approved' and str(a.get('squadId','')).lower()==str(squad['squadId']).lower() for a in approvals):return json_response(self,{'error':'Squad already registered.'},409)
                 approved=sum(1 for a in approvals if str(a.get('tournamentId'))==tid and a.get('status')=='Approved')
                 if int(t.get('squadSlots') or 0) and approved>=int(t.get('squadSlots')):return json_response(self,{'error':'Squad slots are full.'},409)
-                a={'id':'STA'+secrets.token_hex(7),'tournamentId':tid,'tournamentTitle':t.get('title'),'squadName':str(squad['squadName']).strip(),'squadId':str(squad['squadId']).strip(),'leaderAccountId':leader,'leaderIgn':str(squad.get('leaderIgn','')),'leaderGameId':str(squad.get('leaderGameId','')),'leaderServerId':str(squad.get('leaderServerId','')),'role':'Squad Leader','status':'Pending','createdAt':now_iso(),'maxSquads':int(t.get('squadSlots') or 0),'membersPerSquad':int(t.get('membersPerSquad') or 7)}
-                approvals.append(a); state_set(c,'squadTournamentApprovals',approvals); c.commit(); self.audit(s,'squad_tournament_submit','approval',a['id'],{'tournamentId':tid}); return json_response(self,{'approval':a,'approvals':approvals},201)
+                a={'id':'STA'+secrets.token_hex(7),'tournamentId':tid,'tournamentTitle':t.get('title'),'squadName':str(squad['squadName']).strip(),'squadId':str(squad['squadId']).strip(),'leaderAccountId':leader,'leaderIgn':str(account['ign'] or ''),'leaderGameId':str(account['game_id'] or ''),'leaderServerId':str(account['server_id'] or ''),'role':'Squad Leader','status':'Pending','createdAt':now_iso(),'maxSquads':int(t.get('squadSlots') or 0),'membersPerSquad':int(t.get('membersPerSquad') or 7)}
+                approvals.append(a); state_set(c,'squadTournamentApprovals',approvals); c.commit()
+                own_approvals=[item for item in approvals if str(item.get('leaderAccountId'))==leader]
+                self.audit(s,'squad_tournament_submit','approval',a['id'],{'tournamentId':tid})
+                return json_response(self,{'approval':a,'approvals':own_approvals},201)
+            if action=='join_member':
+                if str(t.get('format'))!='Squad vs Squad':return json_response(self,{'error':'Invalid tournament type.'},400)
+                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False:return json_response(self,{'error':'Squad registration is closed.'},409)
+                a=next((item for item in approvals if str(item.get('tournamentId'))==tid and item.get('status')=='Approved' and workflow_code_matches(d.get('accessCode'),item.get('memberAccessCode'))),None)
+                if not a:return json_response(self,{'error':'The squad member access code is invalid.'},403)
+                regs=state_get(c,'registrations',[]); account_id=str(s.get('id'))
+                if any(str(reg.get('tournamentId'))==tid and str(reg.get('accountId'))==account_id for reg in regs):return json_response(self,{'error':'You are already registered.'},409)
+                squad_count=sum(1 for reg in regs if str(reg.get('tournamentId'))==tid and str(reg.get('squadApprovalId'))==str(a.get('id')))
+                maximum=int(t.get('membersPerSquad') or a.get('membersPerSquad') or 7)
+                if squad_count>=maximum:return json_response(self,{'error':'This squad is full.'},409)
+                account=c.execute('SELECT * FROM community_accounts WHERE id=?',(account_id,)).fetchone()
+                if not account:return json_response(self,{'error':'Community account not found.'},404)
+                registration={'id':'R'+secrets.token_hex(6),'accountId':account_id,'tournamentId':tid,'ign':str(account['ign'] or ''),'gameId':str(account['game_id'] or ''),'serverId':str(account['server_id'] or ''),'status':'Registered','registeredAt':now_iso(),'squadApprovalId':a.get('id'),'squadName':a.get('squadName'),'squadId':a.get('squadId'),'squadRole':'Squad Leader' if account_id==str(a.get('leaderAccountId')) else 'Squad Member','isSubstitute':squad_count>=5}
+                regs.append(registration); state_set(c,'registrations',regs); c.commit()
+                own_regs=[reg for reg in regs if str(reg.get('accountId'))==account_id]
+                self.audit(s,'squad_tournament_join','registration',registration['id'],{'tournamentId':tid,'approvalId':a.get('id')})
+                return json_response(self,{'registration':registration,'registrations':own_regs},201)
             a=next((x for x in approvals if str(x.get('id'))==aid and str(x.get('tournamentId'))==tid),None)
             if not a:return json_response(self,{'error':'Approval request not found.'},404)
             if a.get('status')!='Pending':return json_response(self,{'error':'Request already decided.'},409)
@@ -1404,9 +1468,22 @@ class Handler(BaseHTTPRequestHandler):
                 # Community members may only synchronize their own registration/notification state.
                 account_id=str(s.get('id'))
                 if isinstance(community.get('registrations'),list):
-                    safe_regs=[r for r in community['registrations'] if str(r.get('accountId'))==account_id]
+                    tournaments=state_get(c,'tournaments',[])
+                    squad_tournament_ids={
+                        str(tournament.get('id')) for tournament in tournaments
+                        if isinstance(tournament,dict) and tournament.get('format')=='Squad vs Squad'
+                    }
+                    safe_regs=[
+                        r for r in community['registrations']
+                        if str(r.get('accountId'))==account_id
+                        and str(r.get('tournamentId')) not in squad_tournament_ids
+                    ]
                     existing=state_get(c,'registrations',[])
-                    existing=[r for r in existing if str(r.get('accountId'))!=account_id]
+                    existing=[
+                        r for r in existing
+                        if str(r.get('accountId'))!=account_id
+                        or str(r.get('tournamentId')) in squad_tournament_ids
+                    ]
                     state_set(c,'registrations',existing+safe_regs)
                 if isinstance(community.get('notifications'),list):
                     safe_notes=[n for n in community['notifications'] if not n.get('audienceId') or str(n.get('audienceId'))==account_id]

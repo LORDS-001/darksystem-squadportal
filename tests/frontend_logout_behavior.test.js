@@ -535,3 +535,74 @@ test("Squad concurrent logout failure preserves state and permits one retry afte
   assert.equal(vm.runInContext("current", harness.context), null);
   assert.equal(harness.document.getElementById("public").classList.contains("hidden"), false);
 });
+
+test("Squad leader registration sends the typed invitation code to the server", async () => {
+  const harness = await publicHarness();
+  const requests = [];
+  harness.setFetch(async (requestPath, options) => {
+    requests.push({ requestPath, payload: JSON.parse(options.body) });
+    return jsonResponse(true, {
+      approval: {
+        id: "approval-1", tournamentId: "squad-tournament",
+        leaderAccountId: "community-1", status: "Pending",
+      },
+      approvals: [],
+    });
+  });
+  vm.runInContext(`
+    communityCurrent = { id: "community-1", ign: "Leader", gameId: "123456", serverId: "4321" };
+    communityDb.tournaments = [{
+      id: "squad-tournament", title: "Squad Tournament", format: "Squad vs Squad",
+      status: "Open", registrationOpen: true, squadRegistrationOpen: true,
+      squadSlots: 4, membersPerSquad: 7
+    }];
+    communityDb.squadTournamentApprovals = [];
+  `, harness.context);
+
+  await vm.runInContext(
+    'submitSTLeaderRegistration("squad-tournament", "Boundary Squad", "BS-1", "TYPED-LEADER-CODE", communityCurrent, null)',
+    harness.context,
+  );
+
+  const submissions = requests.filter(({ requestPath }) => requestPath === "/api/tournaments/squad-approval");
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].payload.action, "submit_leader");
+  assert.equal(submissions[0].payload.accessCode, "TYPED-LEADER-CODE");
+  assert.equal("leaderAccountId" in submissions[0].payload, false);
+});
+
+test("Squad member registration submits its code without a downloaded approval list", async () => {
+  const harness = await publicHarness();
+  const requests = [];
+  harness.setFetch(async (requestPath, options) => {
+    requests.push({ requestPath, payload: JSON.parse(options.body) });
+    return jsonResponse(true, {
+      registration: {
+        id: "registration-1", tournamentId: "squad-tournament",
+        accountId: "community-1", squadApprovalId: "approval-1",
+        squadName: "Boundary Squad", isSubstitute: false,
+      },
+      registrations: [],
+    });
+  });
+  vm.runInContext(`
+    communityCurrent = { id: "community-1", ign: "Member", gameId: "123456", serverId: "4321" };
+    communityDb.tournaments = [{
+      id: "squad-tournament", title: "Squad Tournament", format: "Squad vs Squad",
+      status: "Open", registrationOpen: true, membersPerSquad: 7
+    }];
+    communityDb.squadTournamentApprovals = [];
+    communityDb.registrations = [];
+  `, harness.context);
+
+  await vm.runInContext(
+    'submitSTMemberRegistration("squad-tournament", "TYPED-MEMBER-CODE", communityCurrent)',
+    harness.context,
+  );
+
+  const submissions = requests.filter(({ requestPath }) => requestPath === "/api/tournaments/squad-approval");
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].payload.action, "join_member");
+  assert.equal(submissions[0].payload.accessCode, "TYPED-MEMBER-CODE");
+  assert.equal("accountId" in submissions[0].payload, false);
+});

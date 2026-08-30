@@ -1858,9 +1858,20 @@ const _v29SubmitSTLeader=submitSTLeaderRegistration;
 submitSTLeaderRegistration=async function(tid,squadName,squadId,code,account,member){
   const t=communityDb.tournaments.find(x=>String(x.id)===String(tid));
   if(!t||t.format!=='Squad vs Squad')return error('INVALID TOURNAMENT','This is not a Squad-vs-Squad tournament.');
-  if(String(code).trim().toUpperCase()!==String(t.leaderAccessCode||'').trim().toUpperCase())return error('INVALID ACCESS CODE','The tournament invitation code is incorrect.');
-  const r=await v29Json('/api/tournaments/squad-approval',{action:'submit_leader',tournamentId:tid,leaderAccountId:account.id,squad:{squadName,squadId,leaderIgn:account.ign,leaderGameId:account.gameId,leaderServerId:account.serverId}});
+  if(t.registrationOpen===false||t.squadRegistrationOpen===false)return error('INVITATION CODE EXPIRED','The initial Squad Leader access code is no longer valid because squad registration has closed.');
+  const r=await v29Json('/api/tournaments/squad-approval',{action:'submit_leader',tournamentId:tid,accessCode:code,squad:{squadName,squadId}});
   if(!r)return; communityDb.squadTournamentApprovals=r.approvals||communityDb.squadTournamentApprovals; close(); renderTournamentPage();
+};
+const _v29SubmitSTMember=submitSTMemberRegistration;
+submitSTMemberRegistration=async function(tid,code,account){
+  const t=communityDb.tournaments.find(x=>String(x.id)===String(tid));
+  if(!t||t.format!=='Squad vs Squad')return error('INVALID TOURNAMENT','This is not a Squad-vs-Squad tournament.');
+  if(t.registrationOpen===false)return error('SQUAD REGISTRATION CLOSED','Squad member registration is closed.');
+  const r=await v29Json('/api/tournaments/squad-approval',{action:'join_member',tournamentId:tid,accessCode:code});
+  if(!r)return;
+  communityDb.registrations=r.registrations||communityDb.registrations;
+  const registration=r.registration||{};
+  close();renderTournamentPage();show(`<div class="setup-lock"><div class="setup-icon">✓</div><span class="eyebrow">SQUAD REGISTRATION COMPLETE</span><h2>${esc(t.title)}</h2><p class="muted">${esc(account.ign)} is registered to <b>${esc(registration.squadName||'your squad')}</b> as a ${registration.isSubstitute?'substitute':'starter'}.</p><div class="actions"><button class="primary" onclick="close();renderTournamentPage()">Done</button></div></div>`);
 };
 const _v29ApproveST=approveSTRequest;
 approveSTRequest=async function(id){

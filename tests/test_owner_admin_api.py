@@ -172,36 +172,63 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertNotIn("community-bootstrap@example.test", serialized)
         self.assertNotIn("+234-555-0100", serialized)
 
-    def test_authenticated_tournament_bootstrap_preserves_approval_access_codes_for_legacy_hydration(self):
-        community = self.register_community("approval-leader@example.test")
-        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+    def test_authenticated_bootstrap_scopes_tournament_codes_to_distributors(self):
+        leader = self.register_community("approval-leader@example.test")
+        leader_cookie = leader.headers["Set-Cookie"].split(";", 1)[0]
+        member = self.register_community("approval-member@example.test")
+        member_cookie = member.headers["Set-Cookie"].split(";", 1)[0]
         self.setup_owner()
         squad_cookie = self.squad_cookie()
-        approvals = [{
-            "id": "approval-1", "tournamentId": "squad-tournament",
-            "leaderAccountId": community.json["account"]["id"],
-            "leaderAccessCode": "LEADER-WORKFLOW-CODE", "memberAccessCode": "MEMBER-WORKFLOW-CODE",
-        }]
+        approvals = [
+            {
+                "id": "approval-1", "tournamentId": "squad-tournament",
+                "leaderAccountId": leader.json["account"]["id"], "status": "Approved",
+                "memberAccessCode": "MEMBER-WORKFLOW-CODE",
+            },
+            {
+                "id": "approval-2", "tournamentId": "squad-tournament",
+                "leaderAccountId": "other-leader", "status": "Approved",
+                "memberAccessCode": "OTHER-MEMBER-CODE",
+            },
+            {
+                "id": "approval-3", "tournamentId": "other-tournament",
+                "leaderAccountId": leader.json["account"]["id"], "status": "Pending",
+                "memberAccessCode": "PREMATURE-MEMBER-CODE",
+            },
+        ]
         tournaments = [{
-            "id": "squad-tournament", "leaderAccessCode": "TOURNAMENT-LEADER-CODE",
-            "memberAccessCode": "TOURNAMENT-MEMBER-CODE",
+            "id": "squad-tournament", "title": "Squad Tournament",
+            "format": "Squad vs Squad", "leaderAccessCode": "TOURNAMENT-LEADER-CODE",
         }]
         with server.LOCK, server.db() as connection:
             server.state_set(connection, "squadTournamentApprovals", approvals)
             server.state_set(connection, "tournaments", tournaments)
             connection.commit()
 
-        community_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=community_cookie)
+        leader_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=leader_cookie)
+        member_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=member_cookie)
         squad_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=squad_cookie)
 
-        self.assertEqual(community_bootstrap.status, 200)
+        self.assertEqual(leader_bootstrap.status, 200)
         self.assertEqual(
-            community_bootstrap.json["community"]["squadTournamentApprovals"][0]["memberAccessCode"],
+            leader_bootstrap.json["community"]["squadTournamentApprovals"][0]["memberAccessCode"],
             "MEMBER-WORKFLOW-CODE",
         )
+        self.assertNotIn(
+            "TOURNAMENT-LEADER-CODE", json.dumps(leader_bootstrap.json)
+        )
+        self.assertNotIn("OTHER-MEMBER-CODE", json.dumps(leader_bootstrap.json))
+        self.assertNotIn("PREMATURE-MEMBER-CODE", json.dumps(leader_bootstrap.json))
+        self.assertNotIn("TOURNAMENT-LEADER-CODE", json.dumps(member_bootstrap.json))
+        self.assertNotIn("MEMBER-WORKFLOW-CODE", json.dumps(member_bootstrap.json))
+        self.assertNotIn("OTHER-MEMBER-CODE", json.dumps(member_bootstrap.json))
         self.assertEqual(
             squad_bootstrap.json["community"]["tournaments"][0]["leaderAccessCode"],
             "TOURNAMENT-LEADER-CODE",
+        )
+        self.assertEqual(
+            squad_bootstrap.json["community"]["squadTournamentApprovals"][1]["memberAccessCode"],
+            "OTHER-MEMBER-CODE",
         )
         synced = self.backend.request(
             "PUT", "/api/state",
@@ -212,6 +239,153 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         with server.LOCK, server.db() as connection:
             self.assertEqual(server.state_get(connection, "squadTournamentApprovals", [])[0]["memberAccessCode"], "MEMBER-WORKFLOW-CODE")
             self.assertEqual(server.state_get(connection, "tournaments", [])[0]["leaderAccessCode"], "TOURNAMENT-LEADER-CODE")
+
+    def test_community_leader_code_is_validated_server_side_and_identity_cannot_be_spoofed(self):
+        community = self.register_community("server-leader@example.test")
+        cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        account = community.json["account"]
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournaments",
+                [{
+                    "id": "squad-tournament", "title": "Squad Tournament",
+                    "format": "Squad vs Squad", "status": "Open",
+                    "registrationOpen": True, "squadRegistrationOpen": True,
+                    "squadSlots": 4, "membersPerSquad": 7,
+                    "leaderAccessCode": "LEADER-SERVER-CODE",
+                }],
+            )
+            connection.commit()
+
+        rejected = self.backend.request(
+            "POST", "/api/tournaments/squad-approval",
+            {
+                "action": "submit_leader", "tournamentId": "squad-tournament",
+                "accessCode": "WRONG-CODE", "leaderAccountId": "spoofed-account",
+                "squad": {"squadName": "Boundary Squad", "squadId": "BS-1"},
+            },
+            cookie=cookie,
+        )
+        self.assertEqual(rejected.status, 403)
+
+        accepted = self.backend.request(
+            "POST", "/api/tournaments/squad-approval",
+            {
+                "action": "submit_leader", "tournamentId": "squad-tournament",
+                "accessCode": "leader-server-code", "leaderAccountId": "spoofed-account",
+                "squad": {
+                    "squadName": "Boundary Squad", "squadId": "BS-1",
+                    "leaderIgn": "Spoofed IGN", "leaderGameId": "000000",
+                    "leaderServerId": "0000",
+                },
+            },
+            cookie=cookie,
+        )
+
+        self.assertEqual(accepted.status, 201)
+        approval = accepted.json["approval"]
+        self.assertEqual(approval["leaderAccountId"], account["id"])
+        self.assertEqual(approval["leaderIgn"], account["ign"])
+        self.assertEqual(approval["leaderGameId"], account["gameId"])
+        self.assertEqual(approval["leaderServerId"], account["serverId"])
+        self.assertNotIn("LEADER-SERVER-CODE", json.dumps(accepted.json))
+        with server.LOCK, server.db() as connection:
+            stored = server.state_get(connection, "squadTournamentApprovals", [])
+        self.assertEqual(len(stored), 1)
+        self.assertNotIn("accessCode", stored[0])
+
+    def test_community_member_joins_through_server_without_downloading_approval_codes(self):
+        community = self.register_community("server-member@example.test")
+        cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        account = community.json["account"]
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournaments",
+                [{
+                    "id": "squad-tournament", "title": "Squad Tournament",
+                    "format": "Squad vs Squad", "status": "Open",
+                    "registrationOpen": True, "membersPerSquad": 7,
+                }],
+            )
+            server.state_set(
+                connection,
+                "squadTournamentApprovals",
+                [{
+                    "id": "approval-1", "tournamentId": "squad-tournament",
+                    "status": "Approved", "squadName": "Boundary Squad",
+                    "squadId": "BS-1", "leaderAccountId": "leader-account",
+                    "membersPerSquad": 7, "memberAccessCode": "MEMBER-SERVER-CODE",
+                }],
+            )
+            connection.commit()
+
+        rejected = self.backend.request(
+            "POST", "/api/tournaments/squad-approval",
+            {
+                "action": "join_member", "tournamentId": "squad-tournament",
+                "accessCode": "WRONG-CODE", "accountId": "spoofed-account",
+            },
+            cookie=cookie,
+        )
+        self.assertEqual(rejected.status, 403)
+
+        accepted = self.backend.request(
+            "POST", "/api/tournaments/squad-approval",
+            {
+                "action": "join_member", "tournamentId": "squad-tournament",
+                "accessCode": "member-server-code", "accountId": "spoofed-account",
+            },
+            cookie=cookie,
+        )
+
+        self.assertEqual(accepted.status, 201)
+        registration = accepted.json["registration"]
+        self.assertEqual(registration["accountId"], account["id"])
+        self.assertEqual(registration["ign"], account["ign"])
+        self.assertEqual(registration["squadApprovalId"], "approval-1")
+        self.assertNotIn("MEMBER-SERVER-CODE", json.dumps(accepted.json))
+        duplicate = self.backend.request(
+            "POST", "/api/tournaments/squad-approval",
+            {
+                "action": "join_member", "tournamentId": "squad-tournament",
+                "accessCode": "MEMBER-SERVER-CODE",
+            },
+            cookie=cookie,
+        )
+        self.assertEqual(duplicate.status, 409)
+
+    def test_legacy_state_sync_cannot_bypass_squad_member_code_validation(self):
+        community = self.register_community("sync-bypass@example.test")
+        cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        account_id = community.json["account"]["id"]
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournaments",
+                [{"id": "squad-tournament", "format": "Squad vs Squad", "status": "Open"}],
+            )
+            connection.commit()
+
+        response = self.backend.request(
+            "PUT", "/api/state",
+            {
+                "squad": {},
+                "community": {
+                    "registrations": [{
+                        "id": "forged-registration", "tournamentId": "squad-tournament",
+                        "accountId": account_id, "squadApprovalId": "forged-approval",
+                    }],
+                },
+            },
+            cookie=cookie,
+        )
+
+        self.assertEqual(response.status, 200)
+        with server.LOCK, server.db() as connection:
+            registrations = server.state_get(connection, "registrations", [])
+        self.assertEqual(registrations, [])
 
     def test_authorized_squad_bootstrap_round_trip_preserves_member_contact_and_access_code_data(self):
         self.setup_owner()
