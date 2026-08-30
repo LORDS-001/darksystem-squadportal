@@ -13,6 +13,14 @@ class OwnerStaticContractTests(unittest.TestCase):
     def test_owner_shell_defers_the_owner_script(self):
         self.assertIn('<script src="/owner-admin.js" defer>', self.html)
 
+    def test_owner_shell_loads_modular_administration_clients(self):
+        for module in (
+            "owner-admin-api.js", "owner-admin-squad.js",
+            "owner-admin-tournaments.js", "owner-admin-seasons.js",
+            "owner-admin-audit.js",
+        ):
+            self.assertIn(f'<script src="/{module}" defer>', self.html)
+
     def test_owner_client_declares_the_required_api_contract(self):
         for endpoint in (
             "/api/owner/setup/status",
@@ -47,8 +55,17 @@ class OwnerStaticContractTests(unittest.TestCase):
         self.assertIn('autocomplete: "current-password"', self.js)
 
     def test_dashboard_includes_foundation_sections_and_logout(self):
-        for label in ("Overview", "Recent Activity", "Logout"):
+        for label in (
+            "Overview", "Squads", "Community", "Content", "Tournaments",
+            "Seasons & Rankings", "Events & History", "Audit", "Settings",
+            "Recent Activity", "Logout",
+        ):
             self.assertIn(label, self.js)
+
+    def test_dashboard_has_accessible_refresh_and_status_regions(self):
+        self.assertIn('aria-live', self.js)
+        self.assertIn('Refresh', self.js)
+        self.assertIn('.focus()', self.js)
 
     def test_owner_ui_does_not_persist_browser_state(self):
         for source in (self.html, self.js):

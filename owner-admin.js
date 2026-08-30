@@ -298,6 +298,313 @@ function renderOwnerDashboard(data) {
   setOwnerRoot(dashboard);
 }
 
+const OWNER_SECTIONS = [
+  ["overview", "Overview"], ["squads", "Squads"], ["community", "Community"],
+  ["content", "Content"], ["tournaments", "Tournaments"],
+  ["seasons", "Seasons & Rankings"], ["history", "Events & History"],
+  ["audit", "Audit"], ["settings", "Settings"],
+];
+let ownerActiveSection = "overview";
+let ownerOverviewData = null;
+
+function ownerButton(label, onClick, secondary = false) {
+  const button = ownerElement("button", `owner-admin__button${secondary ? " owner-admin__button--secondary" : ""}`, label);
+  button.type = "button";
+  if (onClick) button.addEventListener("click", onClick);
+  return button;
+}
+
+function ownerStatusRegion() {
+  const status = ownerElement("p", "owner-admin__notice");
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  status.hidden = true;
+  return status;
+}
+
+function ownerSectionShell(title, description) {
+  const section = ownerElement("section", "owner-admin__panel");
+  const header = ownerElement("header", "owner-admin__panel-header");
+  const copy = ownerElement("div");
+  copy.append(ownerElement("h1", "owner-admin__title owner-admin__title--section", title), ownerElement("p", "owner-admin__copy", description));
+  const refresh = ownerButton("Refresh", () => openOwnerSection(ownerActiveSection), true);
+  header.append(copy, refresh);
+  const status = ownerStatusRegion();
+  const error = ownerElement("p", "owner-admin__error-banner");
+  error.hidden = true;
+  error.setAttribute("role", "alert");
+  const content = ownerElement("div", "owner-admin__panel-content");
+  section.append(header, status, error, content);
+  return { section, content, status, error };
+}
+
+function ownerSetNotice(shell, message, isError = false) {
+  setOwnerError(shell.error, isError ? message : "");
+  shell.status.textContent = isError ? "" : message;
+  shell.status.hidden = isError || !message;
+}
+
+function ownerForm(title, fields, submitLabel, onSubmit) {
+  const card = ownerElement("section", "owner-admin__card");
+  card.append(ownerElement("h2", "owner-admin__section-title", title));
+  const form = ownerElement("form", "owner-admin__form owner-admin__form--grid");
+  form.noValidate = true;
+  for (const field of fields) {
+    const built = ownerField({ ...field, id: `owner-${title.toLowerCase().replace(/[^a-z]+/g, "-")}-${field.name}` });
+    if (field.value !== undefined) built.input.value = field.value;
+    if (field.secret) built.input.dataset.secret = "true";
+    form.append(built.field);
+  }
+  const submit = ownerElement("button", "owner-admin__button", submitLabel);
+  submit.type = "submit";
+  form.append(submit);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) { OwnerAdminApi.clearSecrets(form); return; }
+    setOwnerBusy(submit, true, submitLabel);
+    const values = Object.fromEntries(new FormData(form).entries());
+    try { await onSubmit(values, form); }
+    catch (requestError) {
+      const panel = form.closest(".owner-admin__panel");
+      const error = panel && panel.querySelector(".owner-admin__error-banner");
+      if (error) setOwnerError(error, requestError.message);
+    } finally { OwnerAdminApi.clearSecrets(form); setOwnerBusy(submit, false, submitLabel); }
+  });
+  card.append(form);
+  return card;
+}
+
+function ownerRows(items, columns, actions) {
+  if (!Array.isArray(items) || !items.length) return ownerElement("p", "owner-admin__empty", "No records match the current filters.");
+  const wrap = ownerElement("div", "owner-admin__table-wrap");
+  const table = ownerElement("table", "owner-admin__table");
+  const thead = ownerElement("thead");
+  const heading = ownerElement("tr");
+  for (const column of columns) heading.append(ownerElement("th", "", ownerLabel(column)));
+  if (actions) heading.append(ownerElement("th", "", "Actions"));
+  thead.append(heading);
+  const tbody = ownerElement("tbody");
+  for (const raw of items) {
+    const item = OwnerAdminApi.scrub(raw);
+    const row = ownerElement("tr");
+    for (const column of columns) row.append(ownerElement("td", "", ownerValue(item[column])));
+    if (actions) { const cell = ownerElement("td", "owner-admin__actions"); actions(item, cell); row.append(cell); }
+    tbody.append(row);
+  }
+  table.append(thead, tbody); wrap.append(table); return wrap;
+}
+
+async function ownerRequest(path, options) {
+  return OwnerAdminApi.request(path, options, { onUnauthorized: () => {
+    activeOwnerSession = null;
+    renderOwnerLogin("Your Owner session has expired. Sign in again.", true);
+  } });
+}
+
+function ownerQueryForm(onChange, options = {}) {
+  const form = ownerElement("form", "owner-admin__filters");
+  const label = ownerElement("label", "owner-admin__field-label", "Filter records");
+  label.htmlFor = `owner-filter-${ownerActiveSection}`;
+  const input = ownerElement("input", "owner-admin__input");
+  input.id = label.htmlFor; input.type = "search"; input.placeholder = options.placeholder || "Search";
+  const submit = ownerElement("button", "owner-admin__button owner-admin__button--secondary", "Apply filter"); submit.type = "submit";
+  form.append(label, input, submit);
+  form.addEventListener("submit", (event) => { event.preventDefault(); onChange(input.value.trim()); });
+  return form;
+}
+
+function renderOwnerOverviewSection(shell, data) {
+  const health = data && data.health || {};
+  const healthCard = ownerElement("section", "owner-admin__health-card");
+  const backend = ownerElement("p", "owner-admin__health-indicator", "Backend: "); backend.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.backend)));
+  const database = ownerElement("p", "owner-admin__health-indicator", "Database: "); database.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.database)));
+  healthCard.append(ownerElement("h2", "owner-admin__section-title", "System health"), backend, database);
+  shell.content.append(healthCard);
+  appendMetricGroup(shell.content, "System totals", data && data.counts);
+  appendMetricGroup(shell.content, "Pending work", data && data.pending);
+  shell.content.append(ownerElement("h2", "owner-admin__section-title", "Recent Activity"), ownerRows(data && data.recentAudit, ["action", "actor_role", "target_type", "created_at"]));
+}
+
+async function renderOwnerSquads(shell) {
+  let search = "";
+  const draw = async () => {
+    const query = new URLSearchParams({ limit: "100" }); if (search) query.set("search", search);
+    const data = await ownerRequest(`${OwnerAdminSquad.endpoints.squads}?${query}`);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerRows(data.members, ["name", "ign", "gameId", "serverId", "role", "status"], (member, cell) => {
+      cell.append(ownerButton(member.status === "Disabled" ? "Activate" : "Disable", async () => {
+        await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(member.id)}`, OwnerAdminApi.json("PATCH", { status: member.status === "Disabled" ? "Offline" : "Disabled" })); await draw();
+      }, true), ownerButton("Appoint Owner", async () => {
+        if (!confirm(`Appoint ${member.ign} as Squad Owner?`)) return;
+        await ownerRequest("/api/owner/squad-owner", OwnerAdminApi.json("POST", { memberId: member.id })); await draw();
+      }, true), ownerButton("Remove", async () => {
+        if (!confirm(`Remove ${member.ign}? This cannot be undone.`)) return;
+        await ownerRequest(`${OwnerAdminSquad.endpoints.squads}/${encodeURIComponent(member.id)}`, { method: "DELETE" }); await draw();
+      }, true));
+    })); shell.content.append(records);
+  };
+  shell.content.append(ownerQueryForm((value) => { search = value; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }), ownerForm("Create Squad member", [
+    { name: "name", label: "Name" }, { name: "ign", label: "IGN" }, { name: "gameId", label: "Game ID" }, { name: "serverId", label: "Server ID" },
+    { name: "email", label: "Email", type: "email", required: false }, { name: "role", label: "Role", value: "Squad Member" }, { name: "accessCode", label: "Access code", type: "password", secret: true },
+  ], "Create member", async (values, form) => { await ownerRequest(OwnerAdminSquad.endpoints.squads, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Squad member created."); await draw(); }));
+  await draw();
+}
+
+async function renderOwnerCommunity(shell) {
+  let search = "";
+  const draw = async () => {
+    const query = new URLSearchParams({ limit: "100" }); if (search) query.set("search", search);
+    const data = await ownerRequest(`${OwnerAdminSquad.endpoints.community}?${query}`);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerRows(data.accounts, ["ign", "gameId", "serverId", "email", "role", "status"], (account, cell) => cell.append(ownerButton(account.status === "Disabled" ? "Activate" : "Disable", async () => {
+      await ownerRequest(`${OwnerAdminSquad.endpoints.community}/${encodeURIComponent(account.id)}`, OwnerAdminApi.json("PATCH", { status: account.status === "Disabled" ? "Active" : "Disabled" })); await draw();
+    }, true)))); shell.content.append(records);
+  };
+  shell.content.append(ownerQueryForm((value) => { search = value; draw().catch((e) => ownerSetNotice(shell, e.message, true)); })); await draw();
+}
+
+async function renderOwnerContent(shell) {
+  const domain = ownerElement("select", "owner-admin__input"); domain.id = "owner-content-domain";
+  for (const name of OwnerAdminSquad.contentDomains()) { const option = ownerElement("option", "", ownerLabel(name)); option.value = name; domain.append(option); }
+  const label = ownerElement("label", "owner-admin__field-label", "Content type"); label.htmlFor = domain.id;
+  const draw = async () => {
+    const data = await ownerRequest(`${OwnerAdminSquad.endpoints.content}?domain=${encodeURIComponent(domain.value)}`);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerRows(data.items, ["title", "status", "audienceType", "createdAt"], (item, cell) => cell.append(ownerButton("Delete", async () => {
+      if (!confirm("Delete this content item?")) return;
+      await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}/${encodeURIComponent(item.id)}`, { method: "DELETE" }); await draw();
+    }, true)))); shell.content.append(records);
+  };
+  domain.addEventListener("change", () => draw().catch((e) => ownerSetNotice(shell, e.message, true)));
+  shell.content.append(label, domain, ownerForm("Create content", [{ name: "title", label: "Title" }, { name: "body", label: "Body" }, { name: "audienceType", label: "Audience type", value: "squad", required: false }, { name: "audienceId", label: "Audience ID", required: false }], "Publish content", async (values, form) => {
+    await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}`, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Content saved."); await draw();
+  })); await draw();
+}
+
+async function renderOwnerTournaments(shell) {
+  const draw = async () => {
+    const data = await ownerRequest(OwnerAdminTournaments.endpoint);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerRows(data.tournaments, ["title", "game", "format", "date", "status"], (item, cell) => {
+      for (const action of OwnerAdminTournaments.transitions) cell.append(ownerButton(ownerLabel(action), async () => {
+        if (OwnerAdminTournaments.needsConfirmation(action) && !confirm(`${ownerLabel(action)} ${item.title}?`)) return;
+        await ownerRequest(OwnerAdminTournaments.transitionPath(item.id, action), OwnerAdminApi.json("POST", {})); await draw();
+      }, true));
+    })); shell.content.append(records);
+  };
+  shell.content.append(ownerForm("Create tournament", [{ name: "title", label: "Title" }, { name: "game", label: "Game" }, { name: "format", label: "Format" }, { name: "date", label: "Date", type: "date" }, { name: "registrationDeadline", label: "Registration deadline", type: "date", required: false }], "Create tournament", async (values, form) => {
+    await ownerRequest(OwnerAdminTournaments.endpoint, OwnerAdminApi.json("POST", values)); form.reset(); ownerSetNotice(shell, "Tournament created."); await draw();
+  }), ownerForm("Edit tournament", [{ name: "tournamentId", label: "Tournament ID" }, { name: "title", label: "Title", required: false }, { name: "date", label: "Date", type: "date", required: false }, { name: "registrationDeadline", label: "Registration deadline", type: "date", required: false }], "Save tournament", async (values) => {
+    const id = values.tournamentId; delete values.tournamentId; Object.keys(values).forEach((key) => { if (!values[key]) delete values[key]; });
+    await ownerRequest(`${OwnerAdminTournaments.endpoint}/${encodeURIComponent(id)}`, OwnerAdminApi.json("PATCH", values)); await draw();
+  }), ownerForm("Registration or Squad approval", [{ name: "tournamentId", label: "Tournament ID" }, { name: "recordId", label: "Registration / approval ID" }, { name: "recordType", label: "Type (registration or approval)", value: "registration" }, { name: "decision", label: "Decision (approve or reject)", value: "approve" }, { name: "reason", label: "Reason", required: false }], "Save decision", async (values) => {
+    const path = values.recordType === "approval" ? OwnerAdminTournaments.approvalDecisionPath(values.tournamentId, values.recordId) : OwnerAdminTournaments.registrationDecisionPath(values.tournamentId, values.recordId);
+    await ownerRequest(path, OwnerAdminApi.json("POST", { action: values.decision, decision: values.decision, reason: values.reason })); await draw();
+  }), ownerForm("Create match", [{ name: "tournamentId", label: "Tournament ID" }, { name: "player1", label: "Player 1 account ID" }, { name: "player2", label: "Player 2 account ID" }, { name: "round", label: "Round", type: "number", value: "1" }, { name: "scheduledAt", label: "Scheduled time", required: false }], "Create match", async (values) => {
+    const tournamentId = values.tournamentId; delete values.tournamentId; values.round = Number(values.round);
+    await ownerRequest(OwnerAdminTournaments.matchPath(tournamentId), OwnerAdminApi.json("POST", values)); await draw();
+  }), ownerForm("Update or delete match", [{ name: "tournamentId", label: "Tournament ID" }, { name: "matchId", label: "Match ID" }, { name: "action", label: "Action (update or delete)", value: "update" }, { name: "scheduledAt", label: "Scheduled time", required: false }, { name: "status", label: "Status", required: false }], "Apply match change", async (values) => {
+    const { tournamentId, matchId, action } = values; const path = OwnerAdminTournaments.matchPath(tournamentId, matchId);
+    if (action === "delete") { if (!confirm("Delete this match?")) return; await ownerRequest(path, { method: "DELETE" }); }
+    else { const body = {}; if (values.scheduledAt) body.scheduledAt = values.scheduledAt; if (values.status) body.status = values.status; await ownerRequest(path, OwnerAdminApi.json("PATCH", body)); }
+    await draw();
+  }), ownerForm("Review match result", [{ name: "tournamentId", label: "Tournament ID" }, { name: "matchId", label: "Match ID" }, { name: "action", label: "Action (confirm, reject, dispute)", value: "confirm" }, { name: "winner", label: "Winner", required: false }, { name: "reason", label: "Reason", required: false }], "Review result", async (values) => {
+    const { tournamentId, matchId, ...body } = values; await ownerRequest(OwnerAdminTournaments.resultPath(tournamentId, matchId), OwnerAdminApi.json("POST", body)); await draw();
+  }), ownerForm("Tournament Manager permission", [{ name: "memberId", label: "Squad member ID" }, { name: "action", label: "Action (grant or revoke)", value: "grant" }], "Update permission", async (values) => {
+    await ownerRequest(`/api/owner/tournament-managers/${encodeURIComponent(values.memberId)}`, OwnerAdminApi.json("POST", { action: values.action })); ownerSetNotice(shell, "Tournament Manager permission updated.");
+  })); await draw();
+}
+
+async function renderOwnerSeasons(shell) {
+  const draw = async () => {
+    const data = await ownerRequest(OwnerAdminSeasons.endpoints.seasons);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    if (data.currentSeason) records.append(ownerElement("p", "owner-admin__notice", `Active season: ${ownerValue(data.currentSeason.name)}`), ownerButton("Complete season", async () => { if (!confirm("Complete the active season?")) return; await ownerRequest(`${OwnerAdminSeasons.endpoints.seasons}/${encodeURIComponent(data.currentSeason.id)}/complete`, OwnerAdminApi.json("POST", {})); await draw(); }, true));
+    records.append(ownerElement("h2", "owner-admin__section-title", "Rankings"), ownerRows(data.leaderboard, ["rank", "ign", "accountId", "points"])); shell.content.append(records);
+  };
+  shell.content.append(ownerForm("Start season", [{ name: "name", label: "Season name" }, { name: "requestId", label: "Request ID", required: false }], "Start season", async (values, form) => { await ownerRequest(OwnerAdminSeasons.endpoints.seasons, OwnerAdminApi.json("POST", values)); form.reset(); await draw(); }), ownerForm("Correct ranking points", [{ name: "accountId", label: "Community account ID" }, { name: "points", label: "Points", type: "number" }, { name: "reason", label: "Correction reason" }], "Save correction", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.points}/${encodeURIComponent(values.accountId)}`, OwnerAdminApi.json("PATCH", { points: Number(values.points), reason: values.reason })); await draw(); })); await draw();
+}
+
+async function renderOwnerHistory(shell) {
+  const draw = async () => {
+    const [events, history] = await Promise.all([ownerRequest(OwnerAdminSeasons.endpoints.events), ownerRequest(OwnerAdminSeasons.endpoints.history)]);
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerElement("h2", "owner-admin__section-title", "Events"), ownerRows(events.events, ["title", "date", "time", "status", "rewardPoints"], (item, cell) => {
+      for (const action of ["publish", "close", "archive"]) cell.append(ownerButton(ownerLabel(action), async () => { if (action === "archive" && !confirm("Archive this event?")) return; await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(item.id)}/${action}`, OwnerAdminApi.json("POST", {})); await draw(); }, true));
+    }), ownerElement("h2", "owner-admin__section-title", "Tournament history"), ownerRows(history.hallOfFame, ["title", "champion", "runnerUp", "date"]), ownerElement("h2", "owner-admin__section-title", "Season Hall of Fame"), ownerRows(history.seasonHallOfFame, ["seasonName", "ign", "points", "completedAt"])); shell.content.append(records);
+  };
+  shell.content.append(ownerForm("Create event", [{ name: "title", label: "Title" }, { name: "date", label: "Date", type: "date" }, { name: "time", label: "Time", type: "time" }, { name: "description", label: "Description" }, { name: "rules", label: "Rules" }, { name: "rewardPoints", label: "Reward points", type: "number" }], "Create event", async (values, form) => { values.rewardPoints = Number(values.rewardPoints); await ownerRequest(OwnerAdminSeasons.endpoints.events, OwnerAdminApi.json("POST", values)); form.reset(); await draw(); }), ownerForm("Record event participation", [{ name: "eventId", label: "Event ID" }, { name: "accountId", label: "Community account ID" }], "Award participation", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.events}/${encodeURIComponent(values.eventId)}/participation`, OwnerAdminApi.json("POST", { accountId: values.accountId })); await draw(); }), ownerForm("Correct Hall of Fame", [{ name: "domain", label: "Domain (hall-of-fame or season-hall-of-fame)", value: "hall-of-fame" }, { name: "entryId", label: "Entry ID" }, { name: "field", label: "Field to correct", value: "champion" }, { name: "value", label: "Corrected value" }, { name: "reason", label: "Correction reason" }], "Save history correction", async (values) => {
+    const body = { reason: values.reason, [values.field]: values.field === "points" ? Number(values.value) : values.value };
+    await ownerRequest(OwnerAdminSeasons.historyCorrectionPath(values.domain, values.entryId), OwnerAdminApi.json("PATCH", body)); await draw();
+  })); await draw();
+}
+
+async function renderOwnerAudit(shell) {
+  let page = 1, search = "", action = "";
+  const draw = async () => {
+    const data = await ownerRequest(OwnerAdminAudit.query({ search, action, page, pageSize: 25 }));
+    const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
+    const records = ownerElement("section", "owner-admin__records");
+    records.append(ownerRows(data.audit, ["actor_id", "actor_role", "action", "target_type", "target_id", "created_at", "details"]));
+    const pager = ownerElement("div", "owner-admin__pager"); pager.append(ownerButton("Previous", () => { page = Math.max(1, page - 1); draw(); }, true), ownerElement("span", "", `Page ${page}`), ownerButton("Next", () => { page += 1; draw(); }, true)); records.append(pager); shell.content.append(records);
+  };
+  const filters = ownerQueryForm((value) => { search = value; page = 1; draw().catch((e) => ownerSetNotice(shell, e.message, true)); }, { placeholder: "Actor, target, or detail" });
+  const actionLabel = ownerElement("label", "owner-admin__field-label", "Action filter"); const actionInput = ownerElement("input", "owner-admin__input"); actionInput.addEventListener("change", () => { action = actionInput.value.trim(); page = 1; draw(); });
+  filters.append(actionLabel, actionInput); shell.content.append(filters); await draw();
+}
+
+async function renderOwnerSettings(shell) {
+  const data = await ownerRequest("/api/owner/settings");
+  shell.content.append(ownerRows([data.owner || data.account || data], ["username", "createdAt", "sessionCount"]), ownerForm("Change Owner password", [{ name: "currentPassword", label: "Current password", type: "password", secret: true }, { name: "newPassword", label: "New password", type: "password", secret: true }, { name: "passwordConfirmation", label: "Confirm new password", type: "password", secret: true }], "Update password", async (values) => {
+    if (values.newPassword !== values.passwordConfirmation) throw new Error("New password confirmation must match.");
+    await ownerRequest("/api/owner/settings", OwnerAdminApi.json("PATCH", { currentPassword: values.currentPassword, newPassword: values.newPassword, revokeOtherSessions: true })); ownerSetNotice(shell, "Owner password updated and other sessions revoked.");
+  }));
+}
+
+async function openOwnerSection(sectionName) {
+  ownerActiveSection = sectionName;
+  document.querySelectorAll(".owner-admin__nav-button").forEach((button) => { button.setAttribute("aria-current", button.getAttribute("data-section") === sectionName ? "page" : "false"); });
+  const region = document.getElementById("ownerWorkspace"); if (!region) return;
+  const definition = OWNER_SECTIONS.find(([key]) => key === sectionName) || OWNER_SECTIONS[0];
+  const shell = ownerSectionShell(definition[1], `Manage ${definition[1].toLowerCase()} for Dark System.`);
+  region.replaceChildren(shell.section); region.setAttribute("aria-busy", "true");
+  try {
+    if (sectionName === "overview") { ownerOverviewData = await ownerRequest("/api/owner/overview"); renderOwnerOverviewSection(shell, ownerOverviewData); }
+    else if (sectionName === "squads") await renderOwnerSquads(shell);
+    else if (sectionName === "community") await renderOwnerCommunity(shell);
+    else if (sectionName === "content") await renderOwnerContent(shell);
+    else if (sectionName === "tournaments") await renderOwnerTournaments(shell);
+    else if (sectionName === "seasons") await renderOwnerSeasons(shell);
+    else if (sectionName === "history") await renderOwnerHistory(shell);
+    else if (sectionName === "audit") await renderOwnerAudit(shell);
+    else if (sectionName === "settings") await renderOwnerSettings(shell);
+  } catch (error) { ownerSetNotice(shell, error.message, true); }
+  finally { region.setAttribute("aria-busy", "false"); const heading = shell.section.querySelector("h1"); if (heading) { heading.tabIndex = -1; heading.focus(); } }
+}
+
+// This later declaration intentionally upgrades the original foundation renderer.
+function renderOwnerDashboard(data) {
+  ownerOverviewData = data;
+  const app = ownerElement("section", "owner-admin__application owner-admin__dashboard");
+  const top = ownerElement("header", "owner-admin__dashboard-header");
+  const title = ownerElement("div"); title.append(ownerElement("p", "owner-admin__eyebrow", "OVERALL OWNER"), ownerElement("h1", "owner-admin__title", "Administration"));
+  top.append(title, ownerButton("Logout", ownerLogout, true));
+  const logoutError = ownerElement("p", "owner-admin__error-banner owner-admin__logout-error"); logoutError.hidden = true; logoutError.setAttribute("role", "alert");
+  const layout = ownerElement("div", "owner-admin__layout"); const nav = ownerElement("nav", "owner-admin__nav"); nav.setAttribute("aria-label", "Owner administration");
+  for (const [key, label] of OWNER_SECTIONS) { const button = ownerButton(label, () => openOwnerSection(key), true); button.classList.add("owner-admin__nav-button"); button.setAttribute("data-section", key); nav.append(button); }
+  const workspace = ownerElement("main", "owner-admin__workspace"); workspace.id = "ownerWorkspace"; workspace.setAttribute("aria-live", "polite");
+  layout.append(nav, workspace); app.append(top, logoutError, layout); setOwnerRoot(app);
+  const firstButton = nav.querySelector(".owner-admin__nav-button"); if (firstButton) firstButton.setAttribute("aria-current", "page");
+  const shell = ownerSectionShell("Overview", "Current operational state for Dark System.");
+  workspace.replaceChildren(shell.section); renderOwnerOverviewSection(shell, data); workspace.setAttribute("aria-busy", "false");
+}
+
 function ownerLogout() {
   if (activeOwnerLogoutRequest) return activeOwnerLogoutRequest;
   const request = (async () => {

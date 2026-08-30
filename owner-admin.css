@@ -303,6 +303,29 @@
   max-width: 640px;
 }
 
+.owner-admin .owner-admin__application { display: grid; gap: 20px; }
+.owner-admin .owner-admin__layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 24px; align-items: start; }
+.owner-admin .owner-admin__nav { position: sticky; top: 94px; display: grid; gap: 7px; padding: 12px; border: 1px solid var(--line); background: rgba(5, 9, 18, .82); }
+.owner-admin .owner-admin__nav-button { width: 100%; justify-content: flex-start; text-align: left; }
+.owner-admin .owner-admin__nav-button[aria-current="page"] { background: var(--a); color: #03101a; }
+.owner-admin .owner-admin__workspace, .owner-admin .owner-admin__panel, .owner-admin .owner-admin__panel-content, .owner-admin .owner-admin__records { display: grid; gap: 18px; min-width: 0; }
+.owner-admin .owner-admin__panel-header { display: flex; align-items: end; justify-content: space-between; gap: 18px; }
+.owner-admin .owner-admin__title--section { font-size: clamp(26px, 4vw, 38px); }
+.owner-admin .owner-admin__card { display: grid; gap: 16px; padding: 18px; border: 1px solid rgba(105, 139, 177, .28); background: linear-gradient(145deg, rgba(15, 27, 44, .94), rgba(8, 16, 28, .98)); }
+.owner-admin .owner-admin__form--grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.owner-admin .owner-admin__form--grid .owner-admin__button { align-self: end; }
+.owner-admin .owner-admin__filters { display: grid; grid-template-columns: auto minmax(180px, 1fr) auto; gap: 10px; align-items: center; }
+.owner-admin .owner-admin__table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid rgba(105, 139, 177, .28); }
+.owner-admin .owner-admin__table { width: 100%; border-collapse: collapse; color: var(--txt); }
+.owner-admin .owner-admin__table th, .owner-admin .owner-admin__table td { padding: 12px; border-bottom: 1px solid rgba(105, 139, 177, .2); text-align: left; vertical-align: top; }
+.owner-admin .owner-admin__table th { color: var(--a2); font: 700 11px Orbitron, sans-serif; white-space: nowrap; }
+.owner-admin .owner-admin__actions { display: flex; flex-wrap: wrap; gap: 7px; min-width: 150px; }
+.owner-admin .owner-admin__actions .owner-admin__button { min-height: 34px; padding: 7px 9px; font-size: 9px; }
+.owner-admin .owner-admin__pager { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+
+/* Owner controls retain the established sharp Dark System geometry. */
+.owner-admin .owner-admin__button { border-radius: 0 !important; }
+
 @media (max-width: 850px) {
   .owner-admin .owner-admin__auth-shell {
     grid-template-columns: 1fr;
@@ -311,6 +334,9 @@
   .owner-admin .owner-admin__metrics-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .owner-admin .owner-admin__layout { grid-template-columns: 1fr; }
+  .owner-admin .owner-admin__nav { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 560px) {
@@ -327,4 +353,7 @@
   .owner-admin .owner-admin__metrics-grid {
     grid-template-columns: 1fr;
   }
+
+  .owner-admin .owner-admin__panel-header { align-items: flex-start; flex-direction: column; }
+  .owner-admin .owner-admin__form--grid, .owner-admin .owner-admin__filters, .owner-admin .owner-admin__nav { grid-template-columns: 1fr; }
 }
