@@ -141,7 +141,12 @@ class Element {
     this.parentNode = null;
   }
 
-  closest() {
+  closest(selector) {
+    let candidate = this;
+    while (candidate) {
+      if (matches(candidate, selector)) return candidate;
+      candidate = candidate.parentNode;
+    }
     return null;
   }
 
@@ -224,8 +229,8 @@ function querySelectorFrom(nodes, selector) {
   return querySelectorAllFrom(nodes, selector)[0] || null;
 }
 
-function jsonResponse(ok, payload) {
-  return { ok, json: async () => payload };
+function jsonResponse(ok, payload, status = ok ? 200 : 500) {
+  return { ok, status, json: async () => payload };
 }
 
 function deferred() {
@@ -625,6 +630,31 @@ test("Owner settings renders the backend settings envelope", async () => {
   vm.runInContext(`activeOwnerSession={role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
   await vm.runInContext(`openOwnerSection("settings")`, harness.context);
   assert.match(descendants([harness.ownerRoot]).map((node) => node.textContent).join(" "), /root-owner/);
+});
+
+test("Owner incorrect current password stays in Settings and shows the safe API error", async () => {
+  const harness = ownerHarness(); await new Promise((resolve) => setImmediate(resolve));
+  harness.setFetch(async (path, options = {}) => {
+    if (path === "/api/owner/settings" && options.method === "PATCH") {
+      return jsonResponse(false, { error: "The current password is incorrect." }, 403);
+    }
+    if (path === "/api/owner/settings") return jsonResponse(true, { settings: { username: "root-owner" } });
+    return jsonResponse(true, {});
+  });
+  vm.runInContext(`activeOwnerSession={id:"owner-1",role:"Overall Owner"}; renderOwnerDashboard({health:{},counts:{},pending:{},recentAudit:[]})`, harness.context);
+  await vm.runInContext(`openOwnerSection("settings")`, harness.context);
+  const dashboard = harness.ownerRoot.children[0];
+  const settingsForm = formByHeading(harness.ownerRoot, "Change Owner password");
+  fillForm(settingsForm, { currentPassword: "wrong-password", newPassword: "new-secret-123", passwordConfirmation: "new-secret-123" });
+
+  await submitAsBrowser(settingsForm);
+
+  assert.equal(harness.ownerRoot.children[0], dashboard);
+  assert.equal(vm.runInContext("activeOwnerSession.role", harness.context), "Overall Owner");
+  assert.equal(harness.ownerRoot.querySelector(".owner-admin__auth-shell"), null);
+  const alert = harness.ownerRoot.querySelector(".owner-admin__workspace").querySelector('[role="alert"]');
+  assert.equal(alert.hidden, false);
+  assert.equal(alert.textContent, "The current password is incorrect.");
 });
 
 test("Owner guarded row action surfaces a safe panel error and restores its button", async () => {

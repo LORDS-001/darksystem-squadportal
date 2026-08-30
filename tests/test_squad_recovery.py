@@ -51,6 +51,13 @@ class SquadRecoveryTests(unittest.TestCase):
         self.assertGreater(int(recovery["expires_at"]), int(time.time()))
         self.assertIsNone(recovery["used_at"])
 
+    def test_internal_recovery_eligibility_is_not_exposed_in_member_payloads(self):
+        payload = server.public_member({
+            "id": "pending", "ign": "Pending", "role": "Squad Member",
+            "profile_complete": 0, "account_activated": 0, "recovery_pending": 1,
+        })
+        self.assertNotIn("recovery_pending", payload)
+
     def test_failed_smtp_invalidates_new_squad_recovery_code(self):
         with patch.object(server, "smtp_send", return_value=False):
             response = self.backend.request("POST", "/api/squad/forgot", self.identity())
@@ -99,6 +106,11 @@ class SquadRecoveryTests(unittest.TestCase):
         }, cookie=owner_cookie)
         self.assertEqual(created.status, 201)
         self.assertFalse(created.json["member"]["accountActivated"])
+        with server.LOCK, server.db() as connection:
+            pending = connection.execute(
+                "SELECT recovery_pending FROM squad_members WHERE id=?", (created.json["member"]["id"],)
+            ).fetchone()
+        self.assertEqual(pending["recovery_pending"], 1)
         self.assertEqual(self.backend.request("POST", "/api/squad/login", {
             **identity, "accessCode": "GUESSED-CODE",
         }).status, 401)
@@ -113,8 +125,50 @@ class SquadRecoveryTests(unittest.TestCase):
             **identity, "accessCode": "SELF-CHOSEN-CODE",
         }).status, 200)
         with server.LOCK, server.db() as connection:
-            row = connection.execute("SELECT account_activated FROM squad_members WHERE id=?", (created.json["member"]["id"],)).fetchone()
+            row = connection.execute("SELECT account_activated,recovery_pending FROM squad_members WHERE id=?", (created.json["member"]["id"],)).fetchone()
         self.assertEqual(row["account_activated"], 1)
+        self.assertEqual(row["recovery_pending"], 0)
+
+    def test_administratively_deactivated_member_cannot_recover_or_self_reactivate(self):
+        deliveries = []
+        with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
+            before_deactivation = self.backend.request("POST", "/api/squad/forgot", self.identity())
+        self.assertEqual(before_deactivation.status, 200)
+        code = deliveries[0][2].split(" is ", 1)[1].split(".", 1)[0]
+
+        self.assertEqual(self.backend.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET, "username": "deactivation-owner",
+            "password": "owner-password-123", "squadOwner": {
+                "ign": "DeactivationOwner", "gameId": "710001", "serverId": "7101", "accessCode": "OWNER-INITIAL",
+            },
+        }).status, 200)
+        owner_login = self.backend.request("POST", "/api/owner/login", {
+            "username": "deactivation-owner", "password": "owner-password-123",
+        })
+        owner_cookie = owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        deactivation = self.backend.request(
+            "PATCH", "/api/owner/squad-members/recover-1", {"accountActivated": False}, cookie=owner_cookie,
+        )
+        self.assertEqual(deactivation.status, 200)
+
+        deliveries.clear()
+        with patch.object(server, "smtp_send", side_effect=lambda *args: deliveries.append(args) or True):
+            deactivated = self.backend.request("POST", "/api/squad/forgot", self.identity())
+            missing = self.backend.request("POST", "/api/squad/forgot", self.identity(email="missing@example.test"))
+        self.assertEqual(deactivated.status, 200)
+        self.assertEqual(deactivated.json, missing.json)
+        self.assertEqual(deliveries, [])
+
+        reset = self.backend.request("POST", "/api/squad/reset", {
+            **self.identity(), "code": code, "accessCode": "SHOULD-NOT-ACTIVATE",
+        })
+        self.assertEqual(reset.status, 400)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute(
+                "SELECT account_activated,recovery_pending FROM squad_members WHERE id='recover-1'"
+            ).fetchone()
+        self.assertEqual(row["account_activated"], 0)
+        self.assertEqual(row["recovery_pending"], 0)
 
     def test_reset_rotates_access_code_revokes_sessions_and_is_single_use(self):
         login = self.backend.request("POST", "/api/squad/login", {

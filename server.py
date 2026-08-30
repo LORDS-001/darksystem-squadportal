@@ -230,7 +230,8 @@ def init_db():
           id TEXT PRIMARY KEY, name TEXT, ign TEXT NOT NULL, game_id TEXT, server_id TEXT,
           role TEXT NOT NULL, lane TEXT, email TEXT, phone TEXT, birthday TEXT,
           access_code TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Offline', last_login TEXT,
-          profile_complete INTEGER NOT NULL DEFAULT 1, account_activated INTEGER NOT NULL DEFAULT 1
+          profile_complete INTEGER NOT NULL DEFAULT 1, account_activated INTEGER NOT NULL DEFAULT 1,
+          recovery_pending INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS community_accounts (
           id TEXT PRIMARY KEY, squad_member_id TEXT, ign TEXT NOT NULL, game_id TEXT, server_id TEXT,
@@ -275,6 +276,8 @@ def init_db():
             squad_columns = {row['name'] for row in c.execute('PRAGMA table_info(squad_members)').fetchall()}
         if 'access_code_hash' not in squad_columns:
             c.execute("ALTER TABLE squad_members ADD COLUMN access_code_hash TEXT")
+        if 'recovery_pending' not in squad_columns:
+            c.execute("ALTER TABLE squad_members ADD COLUMN recovery_pending INTEGER NOT NULL DEFAULT 0")
         duplicate_ign = c.execute(
             "SELECT lower(ign) FROM squad_members GROUP BY lower(ign) HAVING COUNT(*)>1 LIMIT 1"
         ).fetchone()
@@ -630,6 +633,7 @@ def generate_owner_bracket(tournament, registrations):
 def public_member(r, include_secret=False):
     d = dict(r)
     d.pop('access_code_hash', None)
+    d.pop('recovery_pending', None)
     d['profileComplete'] = bool(d.pop('profile_complete', 1))
     d['accountActivated'] = bool(d.pop('account_activated', 1))
     d['gameId'] = d.pop('game_id', '')
@@ -1721,14 +1725,14 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c, 'squad_members', ign, game_id, server_id):
                     return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
                 c.execute(
-                    '''INSERT INTO squad_members(id,name,ign,game_id,server_id,role,lane,email,phone,birthday,access_code,status,last_login,profile_complete,account_activated)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    '''INSERT INTO squad_members(id,name,ign,game_id,server_id,role,lane,email,phone,birthday,access_code,status,last_login,profile_complete,account_activated,recovery_pending)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (member_id, name, ign, game_id, server_id, role,
                      str(data.get('lane', '')).strip(), str(data.get('email', '')).strip(),
                      str(data.get('phone', '')).strip(), str(data.get('birthday', '')).strip(),
                      '', status, None,
                      1 if profile_complete else 0,
-                     0),
+                     0, 1),
                 )
                 c.execute('UPDATE squad_members SET access_code_hash=? WHERE id=?',(hash_password(secrets.token_urlsafe(48)),member_id))
                 row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
@@ -1793,11 +1797,14 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c, 'squad_members', values['ign'], values['game_id'], values['server_id'], member_id):
                     return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
                 new_access_hash=row['access_code_hash']
+                recovery_pending = int(row['recovery_pending'] or 0)
+                if values['status'] == 'Disabled' or ('accountActivated' in data and not account_activated):
+                    recovery_pending = 0
                 c.execute(
-                    '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?''',
+                    '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=?,recovery_pending=? WHERE id=?''',
                     (values['name'], values['ign'], values['game_id'], values['server_id'], values['role'],
                      values['lane'], values['email'], values['phone'], values['birthday'], values['access_code'],
-                     new_access_hash,values['status'], values['profile_complete'], values['account_activated'], member_id),
+                     new_access_hash,values['status'], values['profile_complete'], values['account_activated'], recovery_pending, member_id),
                 )
                 authority_changed = values['role'] != row['role']
                 credentials_changed = False
@@ -2887,7 +2894,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK,db() as c:
             row=c.execute(
                 '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
-                   AND status!=?''',
+                   AND status!=? AND (account_activated=1 OR recovery_pending=1)''',
                 (email,ign,game_id,server_id,'Disabled'),
             ).fetchone()
         if row:
@@ -2920,7 +2927,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK,db() as c:
                 row=c.execute(
                     '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
-                       AND status!=?''',(email,ign,game_id,server_id,'Disabled'),
+                       AND status!=? AND (account_activated=1 OR recovery_pending=1)''',(email,ign,game_id,server_id,'Disabled'),
                 ).fetchone()
                 recovery=c.execute(
                     '''SELECT * FROM recovery_codes WHERE account_type='squad' AND account_id=? AND used_at IS NULL
@@ -2931,7 +2938,7 @@ class Handler(BaseHTTPRequestHandler):
                 claimed=c.execute('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL',(now,recovery['id']))
                 if claimed.rowcount!=1:
                     return json_response(self,{'error':'The recovery code is invalid or expired.'},400)
-                c.execute('UPDATE squad_members SET access_code=?,access_code_hash=?,status=?,account_activated=1 WHERE id=?',('',hash_password(new_code),'Offline',row['id']))
+                c.execute('UPDATE squad_members SET access_code=?,access_code_hash=?,status=?,account_activated=1,recovery_pending=0 WHERE id=?',('',hash_password(new_code),'Offline',row['id']))
                 revoke_user_sessions(c,'squad',row['id'])
                 insert_audit(c,{'type':'squad','id':row['id'],'role':row['role']},'squad_access_code_reset','squad_member',row['id'])
                 c.commit()

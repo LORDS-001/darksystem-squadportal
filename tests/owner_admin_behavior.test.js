@@ -22,6 +22,16 @@ test("API reports unauthorized responses through the session callback", async ()
   assert.equal(expired, true);
 });
 
+test("API preserves the active session for forbidden responses", async () => {
+  let expired = false;
+  const fetcher = async () => ({ ok: false, status: 403, json: async () => ({ error: "The current password is incorrect." }) });
+  await assert.rejects(
+    api.request("/api/owner/settings", {}, { fetcher, onUnauthorized: () => { expired = true; } }),
+    /current password is incorrect/i,
+  );
+  assert.equal(expired, false);
+});
+
 test("API rejects non-JSON responses with a safe message", async () => {
   const fetcher = async () => ({ ok: false, status: 500, json: async () => { throw new Error("html"); } });
   await assert.rejects(api.request("/broken", {}, { fetcher }), /could not be completed/);

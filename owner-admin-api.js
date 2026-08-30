@@ -20,7 +20,7 @@
     try { payload = await response.json(); }
     catch { throw new Error(SAFE_ERROR); }
     if (!response.ok) {
-      if ((response.status === 401 || response.status === 403) && dependencies.onUnauthorized) dependencies.onUnauthorized();
+      if (response.status === 401 && dependencies.onUnauthorized) dependencies.onUnauthorized();
       throw new Error(typeof payload.error === "string" ? payload.error : SAFE_ERROR);
     }
     return payload;
