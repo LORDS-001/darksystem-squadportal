@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 import server
 from tests.http_harness import BackendHarness
@@ -931,6 +932,18 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
     def test_every_owner_account_route_rejects_anonymous_and_community_sessions(self):
         community = self.register_community("route-guard@example.test")
         community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        squad_login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER",
+            },
+        )
+        self.assertEqual(squad_login.status, 200)
+        squad_cookie = squad_login.headers["Set-Cookie"].split(";", 1)[0]
+        manager = self.register_community("route-manager@example.test")
+        manager_cookie = manager.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE community_accounts SET role='Tournament Manager' WHERE id=?", (manager.json["account"]["id"],))
+            connection.commit()
         routes = (
             ("GET", "/api/owner/squad-members", None),
             ("POST", "/api/owner/squad-members", {}),
@@ -946,6 +959,16 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
             with self.subTest(path=path, actor="community"):
                 self.assertEqual(
                     self.backend.request(method, path, payload, cookie=community_cookie).status,
+                    403,
+                )
+            with self.subTest(path=path, actor="squad"):
+                self.assertEqual(
+                    self.backend.request(method, path, payload, cookie=squad_cookie).status,
+                    403,
+                )
+            with self.subTest(path=path, actor="tournament-manager"):
+                self.assertEqual(
+                    self.backend.request(method, path, payload, cookie=manager_cookie).status,
                     403,
                 )
 
@@ -1039,6 +1062,71 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
                      "Squad Member", "DUPLICATE-CODE", "Offline"),
                 )
         self.assertIsNotNone(member["id"])
+
+    def test_state_sync_cannot_disable_or_deactivate_the_active_squad_owner_and_revokes_disabled_member(self):
+        member = self.create_member("SyncTarget", "200001", "2001")
+        member_login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "SyncTarget", "gameId": "200001", "serverId": "2001", "accessCode": "NEW-MEMBER-CODE",
+            },
+        )
+        self.assertEqual(member_login.status, 200)
+        member_cookie = member_login.headers["Set-Cookie"].split(";", 1)[0]
+        owner_login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER",
+            },
+        )
+        owner_cookie = owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        disabled = self.backend.request(
+            "PUT", "/api/state", {"squad": {"members": [{
+                "id": member["id"], "name": member["name"], "ign": member["ign"],
+                "gameId": member["gameId"], "serverId": member["serverId"], "status": "Disabled",
+                "profileComplete": False, "accountActivated": True,
+            }]}, "community": {}}, cookie=owner_cookie,
+        )
+        self.assertEqual(disabled.status, 200)
+        self.assertEqual(self.backend.request("GET", "/api/auth/me", cookie=member_cookie).json,
+                         {"authenticated": False, "session": None})
+        blocked = self.backend.request(
+            "PUT", "/api/state", {"squad": {"members": [{
+                "id": "1", "name": "Dark System Owner", "ign": "DarkOwner", "gameId": "123456",
+                "serverId": "1234", "status": "Disabled", "profileComplete": True, "accountActivated": True,
+            }]}, "community": {}}, cookie=owner_cookie,
+        )
+        self.assertEqual(blocked.status, 409)
+
+    def test_deactivated_squad_session_is_rejected_and_removed_by_authentication(self):
+        member = self.create_member("DeactivateAuth", "210001", "2101")
+        login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "DeactivateAuth", "gameId": "210001", "serverId": "2101", "accessCode": "NEW-MEMBER-CODE",
+        })
+        self.assertEqual(login.status, 200)
+        cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+        token_hash = server.session_token_hash(cookie.split("=", 1)[1])
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE squad_members SET account_activated=0 WHERE id=?", (member["id"],))
+            connection.commit()
+        self.assertEqual(self.backend.request("GET", "/api/auth/me", cookie=cookie).json,
+                         {"authenticated": False, "session": None})
+        with server.LOCK, server.db() as connection:
+            self.assertIsNone(connection.execute("SELECT token FROM sessions WHERE token=?", (token_hash,)).fetchone())
+
+    def test_owner_routes_reject_non_boolean_fields_and_map_identity_races_to_conflict(self):
+        member = self.create_member("BooleanTarget", "220001", "2201")
+        self.assertEqual(self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{member['id']}", {"profileComplete": "false"}
+        ).status, 400)
+        community = self.register_community("boolean-community@example.test")
+        self.assertEqual(self.owner_request(
+            "PATCH", f"/api/owner/community-accounts/{community.json['account']['id']}", {"emailNotifications": "false"}
+        ).status, 400)
+        with patch.object(server, "identity_conflict", return_value=False):
+            race = self.owner_request("POST", "/api/owner/squad-members", {
+                "name": "Race", "ign": "BooleanTarget", "gameId": "990001", "serverId": "9901",
+                "accessCode": "RACE-CODE",
+            })
+        self.assertEqual(race.status, 409)
 
 
 if __name__ == "__main__":
