@@ -157,6 +157,12 @@ def create_session(user_type, user_id, role='Community Member'):
         c.commit()
     return token
 
+def sanitize_audit_details(connection, details):
+    secret_values=bootstrap_secret_values(connection)
+    session_token_hashes={str(row['token']) for row in connection.execute('SELECT token FROM sessions').fetchall() if row['token']}
+    cleaned=sanitize_overview_value(details or {}, secret_values, session_token_hashes)
+    return {} if cleaned is _OVERVIEW_OMIT else cleaned
+
 def insert_audit(connection, session, action, target_type='', target_id='', details=None):
     connection.execute(
         'INSERT INTO audit_log(id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -169,7 +175,7 @@ def insert_audit(connection, session, action, target_type='', target_id='', deta
             target_type,
             str(target_id or ''),
             now_iso(),
-            json.dumps(details or {}, separators=(',', ':')),
+            json.dumps(sanitize_audit_details(connection, details), separators=(',', ':')),
         ),
     )
 
@@ -288,6 +294,26 @@ def safe_owner_community_account(r):
         if key in account
     }
 
+def public_bootstrap_account(r):
+    account = public_account(r)
+    return {
+        key: account[key]
+        for key in ('id', 'squadMemberId', 'ign', 'gameId', 'serverId', 'role', 'lane', 'createdAt', 'linkedSquad')
+        if key in account
+    }
+
+def bootstrap_secret_values(c):
+    values=set()
+    for query, column in (
+        ('SELECT access_code FROM squad_members', 'access_code'),
+        ('SELECT password_hash FROM community_accounts', 'password_hash'),
+        ('SELECT reset_code FROM community_accounts WHERE reset_code IS NOT NULL', 'reset_code'),
+        ('SELECT password_hash FROM owner_accounts', 'password_hash'),
+    ):
+        for row in c.execute(query).fetchall():
+            if row[column]: values.add(str(row[column]))
+    return values
+
 def bootstrap(session):
     with LOCK, db() as c:
         members = [public_bootstrap_member(r) for r in c.execute('SELECT * FROM squad_members').fetchall()]
@@ -301,6 +327,52 @@ def bootstrap(session):
             'announcements': state_get(c, 'announcements', []),
             'events': state_get(c, 'events', []),
         }
+        if not session:
+            return {'squad':squad,'community':community}
+
+        secret_values=bootstrap_secret_values(c)
+        session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
+        sanitize=lambda value: sanitize_overview_value(value, secret_values, session_token_hashes)
+        safe_state=lambda key, default: sanitize(state_get(c, key, default))
+        accounts=[public_bootstrap_account(row) for row in c.execute('SELECT * FROM community_accounts').fetchall()]
+        session_type=session.get('type')
+        session_id=str(session.get('id'))
+        registrations=safe_state('registrations', [])
+        approvals=safe_state('squadTournamentApprovals', [])
+        notifications=safe_state('community_notifications', [])
+        event_participation=safe_state('eventParticipation', [])
+        community_privileged=session_type == 'squad' or session.get('role') == 'Tournament Manager'
+        if session_type == 'community' and not community_privileged:
+            registrations=[item for item in registrations if isinstance(item, dict) and str(item.get('accountId')) == session_id]
+            approvals=[item for item in approvals if isinstance(item, dict) and str(item.get('leaderAccountId')) == session_id]
+            event_participation=[item for item in event_participation if isinstance(item, dict) and str(item.get('accountId')) == session_id]
+        notifications=[
+            item for item in notifications
+            if isinstance(item, dict) and (not item.get('audienceId') or str(item.get('audienceId')) == session_id)
+        ]
+        community={
+            'accounts':accounts,
+            'tournaments':safe_state('tournaments', []),
+            'registrations':registrations,
+            'tournamentManagers':safe_state('tournamentManagers', []),
+            'notifications':notifications,
+            'seasonPoints':safe_state('seasonPoints', {}),
+            'seasonHistory':safe_state('seasonHistory', []),
+            'seasonHallOfFame':safe_state('seasonHallOfFame', []),
+            'eventParticipation':event_participation,
+            'currentSeason':safe_state('currentSeason', None),
+            'hallOfFame':safe_state('hallOfFame', []),
+            'squadTournamentApprovals':approvals,
+        }
+        if session_type == 'squad':
+            privileged=session.get('role') in ('Squad Owner', 'Squad Leader', 'Assistant Squad Leader')
+            reports=safe_state('reports', [])
+            squad.update({
+                'reports':reports if privileged else [item for item in reports if isinstance(item, dict) and str(item.get('memberId')) == session_id],
+                'complaints':safe_state('complaints', []) if privileged else [],
+                'reportConfig':safe_state('reportConfig', {}),
+                'notifications':[],
+            })
         return {'squad':squad,'community':community}
 
 def request_header(handler, name, default=''):
