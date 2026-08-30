@@ -307,6 +307,8 @@ def init_db():
             c.executemany('''INSERT INTO squad_members
               (id,name,ign,game_id,server_id,role,lane,email,phone,birthday,access_code,status,last_login,profile_complete,account_activated)
               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', seed)
+            for member in seed:
+                c.execute('UPDATE squad_members SET access_code_hash=?,access_code=? WHERE id=?',(hash_password(member[10]),'',member[0]))
         c.execute("INSERT INTO app_state(key,value) VALUES('owner_setup_complete','false') ON CONFLICT(key) DO NOTHING")
         for key, value in [
           ('announcements', json.dumps([{'id':1,'title':'Welcome to Dark System V4','body':'The squad portal is ready for testing.','author':'Dark System Owner','time':now_iso()}])),
@@ -627,6 +629,7 @@ def generate_owner_bracket(tournament, registrations):
 
 def public_member(r, include_secret=False):
     d = dict(r)
+    d.pop('access_code_hash', None)
     d['profileComplete'] = bool(d.pop('profile_complete', 1))
     d['accountActivated'] = bool(d.pop('account_activated', 1))
     d['gameId'] = d.pop('game_id', '')
@@ -1072,11 +1075,11 @@ def rate_limited(h, bucket):
         hits.append(now); RATE_LIMITS[key]=hits
         return len(hits) > RATE_LIMIT_MAX
 
-def durable_rate_limited(h, bucket):
+def durable_rate_limited(h, bucket, identity=''):
     now = int(time.time())
     cutoff = now - RATE_LIMIT_WINDOW
     durable_key = hashlib.sha256(
-        f'{request_ip(h)}\0{bucket}'.encode('utf-8')
+        f'{request_ip(h)}\0{bucket}\0{str(identity).strip().lower()}'.encode('utf-8')
     ).hexdigest()
     with LOCK, db() as connection:
         connection.execute(
@@ -1142,11 +1145,18 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(parsed, dict):
                 return json_response(self, {'error': 'Request JSON must be an object.'}, 400)
             self._parsed_json = parsed
-        if path=='/api/owner/login' and method=='POST' and durable_rate_limited(self, path):
+        throttle_identity=''
+        if path.startswith('/api/community/'):
+            throttle_identity=str(self._parsed_json.get('email','')).strip().lower()
+        elif path.startswith('/api/squad/'):
+            throttle_identity='\0'.join(str(self._parsed_json.get(key,'')).strip().lower() for key in ('email','ign','gameId','serverId'))
+        elif path=='/api/owner/login':
+            throttle_identity=str(self._parsed_json.get('username','')).strip().lower()
+        if path=='/api/owner/login' and method=='POST' and durable_rate_limited(self, path, throttle_identity):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
-        if path in ('/api/community/login','/api/squad/login') and method=='POST' and rate_limited(self, path):
+        if path in ('/api/community/login','/api/squad/login') and method=='POST' and durable_rate_limited(self, path, throttle_identity):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
-        if path in ('/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and method=='POST' and rate_limited(self, path):
+        if path in ('/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and method=='POST' and durable_rate_limited(self, path, throttle_identity):
             return json_response(self, {'error':'Too many password reset requests. Please wait a few minutes and try again.'}, 429)
         if path=='/api/health': return json_response(self, {'ok':True,'service':'Dark System backend','time':now_iso()})
         if path=='/api/bootstrap' and method=='GET': return json_response(self, bootstrap(auth_from_cookie(self)))
@@ -1319,6 +1329,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute("UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,access_code=?,role='Squad Owner',account_activated=1,profile_complete=1 WHERE id='1'",('Dark System Owner',str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),str(squad['accessCode']).strip().upper()))
                 else:
                     c.execute("INSERT INTO squad_members(id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated) VALUES('1','Dark System Owner',?,?,?,?,?,'Offline',1,1)",(str(squad['ign']).strip(),str(squad['gameId']).strip(),str(squad['serverId']).strip(),'Squad Owner',str(squad['accessCode']).strip().upper()))
+                c.execute('UPDATE squad_members SET access_code_hash=?,access_code=? WHERE id=?',(hash_password(str(squad['accessCode']).strip().upper()),'','1'))
                 insert_audit(c,owner_session,'owner_setup','system',owner_id,{'username':username})
                 c.commit()
         except Exception:
@@ -1685,6 +1696,9 @@ class Handler(BaseHTTPRequestHandler):
         required = ('name', 'ign', 'gameId', 'serverId', 'accessCode')
         if any(not str(data.get(key, '')).strip() for key in required):
             return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code are required.'}, 400)
+        submitted_access_code=str(data['accessCode']).strip().upper()
+        if len(submitted_access_code)<8:
+            return json_response(self,{'error':'Access code must be at least 8 characters.'},400)
         role = str(data.get('role', 'Squad Member')).strip() or 'Squad Member'
         if role not in SQUAD_ROLES or role == 'Squad Owner':
             return json_response(self, {'error': 'Use the Squad Owner appointment endpoint to appoint a Squad Owner.'}, 409)
@@ -1710,10 +1724,11 @@ class Handler(BaseHTTPRequestHandler):
                     (member_id, name, ign, game_id, server_id, role,
                      str(data.get('lane', '')).strip(), str(data.get('email', '')).strip(),
                      str(data.get('phone', '')).strip(), str(data.get('birthday', '')).strip(),
-                     str(data['accessCode']).strip().upper(), status, None,
+                     '', status, None,
                      1 if profile_complete else 0,
                      1 if account_activated else 0),
                 )
+                c.execute('UPDATE squad_members SET access_code_hash=? WHERE id=?',(hash_password(submitted_access_code),member_id))
                 row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
                 create_owner_notification(
                     c, session, 'owner_squad_member_create', 'squad_member', member_id,
@@ -1733,6 +1748,8 @@ class Handler(BaseHTTPRequestHandler):
         if not session:
             return
         data = read_json(self)
+        if 'accessCode' in data:
+            return json_response(self, {'error':'Squad members rotate credentials through self-service recovery.'},400)
         try:
             with LOCK, db() as c:
                 row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
@@ -1759,8 +1776,8 @@ class Handler(BaseHTTPRequestHandler):
                     'profile_complete': 1 if profile_complete else 0,
                     'account_activated': 1 if account_activated else 0,
                 }
-                if not all(values[key] for key in ('name', 'ign', 'game_id', 'server_id')) or not (values['access_code'] or row['access_code_hash']):
-                    return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code cannot be empty.'}, 400)
+                if not all(values[key] for key in ('name', 'ign', 'game_id', 'server_id')):
+                    return json_response(self, {'error': 'Name, IGN, Game ID and Server ID cannot be empty.'}, 400)
                 if values['role'] not in SQUAD_ROLES:
                     return json_response(self, {'error': 'The requested Squad role is invalid.'}, 400)
                 if values['status'] not in SQUAD_MEMBER_STATUSES:
@@ -1774,8 +1791,6 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c, 'squad_members', values['ign'], values['game_id'], values['server_id'], member_id):
                     return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
                 new_access_hash=row['access_code_hash']
-                if 'accessCode' in data:
-                    new_access_hash=hash_password(values['access_code']);values['access_code']=''
                 c.execute(
                     '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?''',
                     (values['name'], values['ign'], values['game_id'], values['server_id'], values['role'],
@@ -1783,7 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
                      new_access_hash,values['status'], values['profile_complete'], values['account_activated'], member_id),
                 )
                 authority_changed = values['role'] != row['role']
-                credentials_changed = 'accessCode' in data
+                credentials_changed = False
                 unavailable = values['status'] == 'Disabled' or not values['account_activated']
                 if authority_changed or credentials_changed or unavailable:
                     revoke_user_sessions(c, 'squad', member_id)
@@ -2146,6 +2161,8 @@ class Handler(BaseHTTPRequestHandler):
                 item[key]=data[key].strip()
         if 'date' in data:
             if not isinstance(data['date'],str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',data['date']):return None,'date must use YYYY-MM-DD.'
+            try:datetime.strptime(data['date'],'%Y-%m-%d')
+            except ValueError:return None,'date must be a real calendar date.'
             item['date']=data['date']
         if 'time' in data:
             if not isinstance(data['time'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',data['time']):return None,'time must use HH:MM.'
@@ -2703,10 +2720,15 @@ class Handler(BaseHTTPRequestHandler):
         # Always return the same response to reduce account enumeration.
         if row and str(row['status'] or '').strip().lower()!='disabled':
             code=f'{secrets.randbelow(900000)+100000}'; exp=int(time.time())+600
+            encoded=hash_recovery_code(code)
             with LOCK, db() as c:
-                c.execute('UPDATE community_accounts SET reset_code=?,reset_expires=? WHERE id=?',(hash_recovery_code(code),exp,row['id'])); c.commit()
-            try:smtp_send(email,'Your Dark System password reset code',f'Your Dark System password reset code is {code}. It expires in 10 minutes.')
+                c.execute('UPDATE community_accounts SET reset_code=?,reset_expires=? WHERE id=?',(encoded,exp,row['id'])); c.commit()
+            delivered=False
+            try:delivered=bool(smtp_send(email,'Your Dark System password reset code',f'Your Dark System password reset code is {code}. It expires in 10 minutes.'))
             except Exception:logging.exception('Community recovery email delivery failed.')
+            if not delivered:
+                with LOCK,db() as c:
+                    c.execute('UPDATE community_accounts SET reset_code=NULL,reset_expires=NULL WHERE id=? AND reset_code=?',(row['id'],encoded));c.commit()
         return json_response(self, {'ok':True,'message':'If that account exists, a reset code has been sent.'})
     def community_reset(self):
         d=read_json(self); email=str(d.get('email','')).strip().lower(); code=str(d.get('code','')).strip(); password=str(d.get('password',''))
@@ -2868,16 +2890,22 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
         if row:
             code=f'{secrets.randbelow(900000)+100000}';expires=int(time.time())+RECOVERY_TTL
+            recovery_id='RC'+secrets.token_hex(8)
             try:
                 with LOCK,db() as c:
                     c.execute("UPDATE recovery_codes SET used_at=? WHERE account_type='squad' AND account_id=? AND used_at IS NULL",(int(time.time()),row['id']))
                     c.execute('INSERT INTO recovery_codes(id,account_type,account_id,code_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(
-                        'RC'+secrets.token_hex(8),'squad',row['id'],hash_recovery_code(code),expires,None,now_iso(),
+                        recovery_id,'squad',row['id'],hash_recovery_code(code),expires,None,now_iso(),
                     ))
                     c.commit()
-                smtp_send(email,'Your Dark System Squad recovery code',f'Your Dark System Squad recovery code is {code}. It expires in 10 minutes.')
+                delivered=bool(smtp_send(email,'Your Dark System Squad recovery code',f'Your Dark System Squad recovery code is {code}. It expires in 10 minutes.'))
+                if not delivered:
+                    with LOCK,db() as c:
+                        c.execute('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL',(int(time.time()),recovery_id));c.commit()
             except Exception:
                 logging.exception('Squad recovery email delivery failed.')
+                with LOCK,db() as c:
+                    c.execute('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL',(int(time.time()),recovery_id));c.commit()
         return json_response(self,{'ok':True,'message':'If those account details match, a recovery code has been sent.'})
 
     def squad_reset(self):
@@ -2949,6 +2977,9 @@ class Handler(BaseHTTPRequestHandler):
         required=['name','ign','gameId','serverId','accessCode']
         if any(not str(d.get(k,'')).strip() for k in required):
             return json_response(self, {'error':'Name, IGN, Game ID, Server ID and access code are required.'},400)
+        submitted_access_code=str(d['accessCode']).strip().upper()
+        if len(submitted_access_code)<8:
+            return json_response(self,{'error':'Access code must be at least 8 characters.'},400)
         role=str(d.get('role','Squad Member')).strip() or 'Squad Member'
         status=str(d.get('status','Offline')).strip() or 'Offline'
         activated, error=json_bool(d,'accountActivated',False)
@@ -2963,7 +2994,8 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c,'squad_members',d['ign'],d['gameId'],d['serverId']):
                     return json_response(self, {'error':'A Squad member already uses that IGN, Game ID, or Server ID.'},409)
                 c.execute("""INSERT INTO squad_members(id,name,ign,game_id,server_id,role,lane,email,phone,birthday,access_code,status,last_login,profile_complete,account_activated)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(mid,str(d['name']).strip(),str(d['ign']).strip(),str(d['gameId']).strip(),str(d['serverId']).strip(),role,str(d.get('lane','')),str(d.get('email','')),str(d.get('phone','')),str(d.get('birthday','')),str(d['accessCode']).strip().upper(),status,None,0,1 if activated else 0))
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(mid,str(d['name']).strip(),str(d['ign']).strip(),str(d['gameId']).strip(),str(d['serverId']).strip(),role,str(d.get('lane','')),str(d.get('email','')),str(d.get('phone','')),str(d.get('birthday','')),'',status,None,0,1 if activated else 0))
+                c.execute('UPDATE squad_members SET access_code_hash=? WHERE id=?',(hash_password(submitted_access_code),mid))
                 row=c.execute('SELECT * FROM squad_members WHERE id=?',(mid,)).fetchone()
                 insert_audit(c,s,'member_create','squad_member',mid,{'ign':row['ign'],'role':role})
                 c.commit()
@@ -2973,6 +3005,7 @@ class Handler(BaseHTTPRequestHandler):
             logging.exception('Legacy Squad member creation failed.')
             return json_response(self, {'error':'The Squad member could not be created.'},503)
         member=safe_owner_squad_member(row) if s.get('role')=='Overall Owner' else public_member(row,True)
+        if s.get('role')!='Overall Owner':member['accessCode']=submitted_access_code
         return json_response(self, {'member':member},201)
 
     def api_member_update(self):
@@ -2980,6 +3013,8 @@ class Handler(BaseHTTPRequestHandler):
         if not s:return
         d=read_json(self); mid=str(d.get('id',''))
         if not mid:return json_response(self,{'error':'Member id is required.'},400)
+        if 'accessCode' in d:
+            return json_response(self,{'error':'Squad members rotate credentials through self-service recovery.'},400)
         if self.role_allowed(s,'Squad Owner','Overall Owner'):
             owner=True
         elif self.role_allowed(s,'Squad Leader','Assistant Squad Leader'):
@@ -3018,10 +3053,8 @@ class Handler(BaseHTTPRequestHandler):
                 if identity_conflict(c,'squad_members',vals['ign'],vals['gameId'],vals['serverId'],mid):
                     return json_response(self,{'error':'A Squad member already uses that IGN, Game ID, or Server ID.'},409)
                 new_access_hash=row['access_code_hash']
-                if owner and 'accessCode' in d:
-                    new_access_hash=hash_password(vals['accessCode']);vals['accessCode']=''
                 c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],new_access_hash,vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
-                if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated'] or (owner and 'accessCode' in d):
+                if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated']:
                     revoke_user_sessions(c,'squad',mid)
                 if vals['role'] not in ('Squad Leader','Assistant Squad Leader') or vals['status']=='Disabled' or not vals['accountActivated']:
                     remove_tournament_manager_permission(c,mid)

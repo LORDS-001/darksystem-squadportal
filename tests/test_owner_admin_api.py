@@ -71,6 +71,23 @@ class OwnerAuditAndSettingsTests(unittest.TestCase):
             "username": "audit-owner", "password": "new-owner-password-456",
         }).status, 200)
 
+    def test_access_code_hash_never_serializes_and_owner_cannot_set_member_credentials(self):
+        with server.LOCK, server.db() as connection:
+            row = connection.execute("SELECT * FROM squad_members WHERE id='1'").fetchone()
+            connection.execute("UPDATE squad_members SET access_code_hash=? WHERE id='1'", (server.hash_password("OWNER-CODE"),))
+            connection.commit()
+            row = connection.execute("SELECT * FROM squad_members WHERE id='1'").fetchone()
+        self.assertNotIn("access_code_hash", server.public_member(row, True))
+        self.assertNotIn("access_code_hash", server.public_member(row, False))
+        listed = self.backend.request("GET", "/api/owner/squad-members", cookie=self.cookie)
+        self.assertNotIn("access_code_hash", str(listed.json))
+        rejected = self.backend.request("PATCH", "/api/owner/squad-members/1", {"accessCode": "OWNER-ROTATE"}, cookie=self.cookie)
+        self.assertEqual(rejected.status, 400)
+
+    def test_owner_events_reject_impossible_calendar_dates(self):
+        created = self.backend.request("POST", "/api/owner/events", {"title": "Impossible", "date": "2026-02-30"}, cookie=self.cookie)
+        self.assertEqual(created.status, 400)
+
 
 class OwnerAdministrationSecurityTests(unittest.TestCase):
     def setUp(self):
@@ -775,7 +792,7 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         owner_token = owner_cookie.split("=", 1)[1]
         community = self.register_community("audit-reset@example.test")
         with server.LOCK, server.db() as connection:
-            member = connection.execute("SELECT access_code FROM squad_members LIMIT 1").fetchone()
+            member = connection.execute("SELECT access_code_hash FROM squad_members LIMIT 1").fetchone()
             connection.execute(
                 "UPDATE community_accounts SET reset_code=?,reset_expires=? WHERE id=?",
                 ("owner-audit-reset-code", 2_000_000_000, community.json["account"]["id"]),
@@ -802,7 +819,7 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
                     json.dumps(
                         {
                             "passwordHash": "owner-audit-password-hash",
-                            "accessCode": member["access_code"],
+                            "accessCode": member["access_code_hash"],
                             "resetCode": "owner-audit-reset-code",
                             "sessionToken": owner_token,
                         }
@@ -824,7 +841,7 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         serialized = json.dumps(response.json).lower()
         for secret in (
             "owner-audit-password-hash",
-            member["access_code"].lower(),
+            member["access_code_hash"].lower(),
             "owner-audit-reset-code",
             owner_token.lower(),
         ):
@@ -920,7 +937,7 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
 
         changed = self.owner_request(
             "PATCH", f"/api/owner/squad-members/{member['id']}",
-            {"role": "Squad Leader", "status": "Disabled", "accessCode": "ROTATED-CODE"},
+            {"role": "Squad Leader", "status": "Disabled"},
         )
 
         self.assertEqual(changed.status, 200)
@@ -1376,7 +1393,7 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         member_id = created.json["member"]["id"]
         changed = self.owner_request(
             "PATCH", f"/api/owner/squad-members/{member_id}",
-            {"role": "Squad Leader", "accessCode": "NOTICE-ROTATED-CODE"},
+            {"role": "Squad Leader"},
         )
         self.assertEqual(changed.status, 200)
         appointed = self.owner_request("POST", "/api/owner/squad-owner", {"memberId": member_id})

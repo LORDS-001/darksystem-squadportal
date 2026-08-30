@@ -51,6 +51,21 @@ class SquadRecoveryTests(unittest.TestCase):
         self.assertGreater(int(recovery["expires_at"]), int(time.time()))
         self.assertIsNone(recovery["used_at"])
 
+    def test_failed_smtp_invalidates_new_squad_recovery_code(self):
+        with patch.object(server, "smtp_send", return_value=False):
+            response = self.backend.request("POST", "/api/squad/forgot", self.identity())
+        self.assertEqual(response.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute("SELECT used_at FROM recovery_codes WHERE account_type='squad'").fetchone()
+        self.assertIsNotNone(row["used_at"])
+
+    def test_login_and_recovery_throttles_are_database_backed(self):
+        payload = {**self.identity(), "accessCode": "wrong"}
+        for _ in range(server.RATE_LIMIT_MAX):
+            self.assertEqual(self.backend.request("POST", "/api/squad/login", payload).status, 401)
+        server.RATE_LIMITS.clear()
+        self.assertEqual(self.backend.request("POST", "/api/squad/login", payload).status, 429)
+
     def test_reset_rotates_access_code_revokes_sessions_and_is_single_use(self):
         login = self.backend.request("POST", "/api/squad/login", {
             **self.identity(), "accessCode": "OLD-CODE",
@@ -134,6 +149,15 @@ class CommunityRecoveryHardeningTests(unittest.TestCase):
         self.assertEqual(self.backend.request("POST", "/api/community/reset", {
             "email": "community-recover@example.test", "code": code, "password": "other-password-123",
         }).status, 400)
+
+    def test_failed_smtp_invalidates_community_code(self):
+        with patch.object(server, "smtp_send", return_value=False):
+            found = self.backend.request("POST", "/api/community/forgot", {"email": "community-recover@example.test"})
+        self.assertEqual(found.status, 200)
+        with server.LOCK, server.db() as connection:
+            row = connection.execute("SELECT reset_code,reset_expires FROM community_accounts WHERE email='community-recover@example.test'").fetchone()
+        self.assertIsNone(row["reset_code"])
+        self.assertIsNone(row["reset_expires"])
 
 
 if __name__ == "__main__":

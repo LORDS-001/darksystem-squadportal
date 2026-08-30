@@ -368,7 +368,7 @@ class OwnerSecurityTests(unittest.TestCase):
                 ).fetchone()
             )
 
-    def test_squad_credential_change_revokes_existing_sessions(self):
+    def test_owner_cannot_change_squad_credentials_outside_self_service_recovery(self):
         self.complete_setup()
         squad_cookie = self.squad_cookie()
         owner_cookie = self.owner_cookie()
@@ -381,8 +381,8 @@ class OwnerSecurityTests(unittest.TestCase):
         )
         copied = self.backend.request("GET", "/api/auth/me", cookie=squad_cookie)
 
-        self.assertEqual(changed.status, 200)
-        self.assertEqual(copied.json, {"authenticated": False, "session": None})
+        self.assertEqual(changed.status, 400)
+        self.assertTrue(copied.json["authenticated"])
 
     def test_community_password_reset_revokes_existing_sessions(self):
         registration = self.backend.request(
