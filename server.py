@@ -218,6 +218,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS login_throttle (key TEXT PRIMARY KEY, window_started INTEGER NOT NULL, attempts INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS login_throttle_window_started_idx ON login_throttle(window_started);
         CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, domain TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS notification_reads (notification_id TEXT NOT NULL, recipient_type TEXT NOT NULL, recipient_id TEXT NOT NULL, read_at TEXT NOT NULL, PRIMARY KEY(notification_id,recipient_type,recipient_id));
         ''')
         if isinstance(c, PostgresCompat):
             columns = {
@@ -286,7 +287,28 @@ def state_set(c, key, value):
 def safe_owner_content_item(domain, item):
     if domain not in OWNER_CONTENT_DOMAINS or not isinstance(item, dict):
         return None
-    return {key: item[key] for key in OWNER_CONTENT_FIELDS[domain] if key in item}
+    return {key: sanitize_content_metadata(item[key]) for key in OWNER_CONTENT_FIELDS[domain] if key in item and sanitize_content_metadata(item[key]) is not _CONTENT_OMIT}
+
+_CONTENT_OMIT = object()
+_CONTENT_SECRET_KEY = re.compile(r'(?:password|access.?code|token|reset|secret|credential)', re.I)
+def sanitize_content_metadata(value, depth=0):
+    if depth > 5: return _CONTENT_OMIT
+    if isinstance(value, str):
+        return _CONTENT_OMIT if len(value) > 4000 or re.search(r'(?:access\s*code|password|reset\s*code|session\s*token)\s*[:=]', value, re.I) else value
+    if value is None or isinstance(value, (bool, int, float)): return value
+    if isinstance(value, list):
+        if len(value) > 30: return _CONTENT_OMIT
+        return [clean for item in value if (clean := sanitize_content_metadata(item, depth + 1)) is not _CONTENT_OMIT]
+    if isinstance(value, dict):
+        if len(value) > 50: return _CONTENT_OMIT
+        return {str(key): clean for key, item in value.items() if len(str(key)) <= 80 and not _CONTENT_SECRET_KEY.search(str(key)) and (clean := sanitize_content_metadata(item, depth + 1)) is not _CONTENT_OMIT}
+    return _CONTENT_OMIT
+
+def validate_content_metadata(value, expected):
+    if not isinstance(value, expected): return None
+    clean=sanitize_content_metadata(value)
+    if clean is _CONTENT_OMIT or clean != value: return None
+    return clean
 
 def owner_content_items(connection, domain, notification_domain=None):
     if domain == 'notifications':
@@ -355,6 +377,8 @@ def normalize_owner_content(domain, data, item_id, existing=None):
         item['body'] = body
         for key in ('memberId', 'values', 'files', 'time'):
             value = data.get(key, existing.get(key))
+            if key == 'values' and value is not None and (value := validate_content_metadata(value, dict)) is None: return None, 'values must be a safe object.'
+            if key == 'files' and value is not None and (value := validate_content_metadata(value, list)) is None: return None, 'files must be a safe list.'
             if value is not None: item[key] = str(value) if key in ('memberId', 'time') else value
     elif domain == 'complaints':
         subject, error = owner_content_text(data, existing, 'subject', False, 180)
@@ -365,6 +389,7 @@ def normalize_owner_content(domain, data, item_id, existing=None):
         item['body'] = body
         for key in ('memberId', 'files', 'time', 'response', 'respondedBy'):
             value = data.get(key, existing.get(key))
+            if key == 'files' and value is not None and (value := validate_content_metadata(value, list)) is None: return None, 'files must be a safe list.'
             if value is not None: item[key] = str(value) if key in ('memberId', 'time', 'response', 'respondedBy') else value
     elif domain == 'events':
         title, error = owner_content_text(data, existing, 'title', True, 180)
@@ -419,6 +444,17 @@ def notification_portal_item(item):
     result['time'] = str(item.get('time') or item.get('createdAt') or now_iso())
     result['type'] = str(item.get('type') or item.get('action') or 'notice')
     return result
+
+def notification_for_recipient(connection, item, recipient_type, recipient_id):
+    result=notification_portal_item(item)
+    result['read']=notification_is_read(connection,str(item.get('id','')),recipient_type,recipient_id)
+    return result
+
+def notification_is_read(connection, notification_id, recipient_type, recipient_id):
+    return bool(connection.execute('SELECT 1 FROM notification_reads WHERE notification_id=? AND recipient_type=? AND recipient_id=?',(notification_id,recipient_type,str(recipient_id))).fetchone())
+
+def mark_notification_read(connection, notification_id, recipient_type, recipient_id):
+    connection.execute('INSERT INTO notification_reads(notification_id,recipient_type,recipient_id,read_at) VALUES(?,?,?,?) ON CONFLICT(notification_id,recipient_type,recipient_id) DO UPDATE SET read_at=excluded.read_at',(notification_id,recipient_type,str(recipient_id),now_iso()))
 
 def create_owner_notification(connection, session, action, target_type, target_id, title, message, notification_domain='squad', audience_id=None):
     item = {
@@ -567,7 +603,7 @@ def bootstrap(session):
             if isinstance(item, dict) and (not item.get('audienceId') or str(item.get('audienceId')) == session_id)
         ]
         notifications += [
-            notification_portal_item(item)
+            notification_for_recipient(c, item, 'community', session_id)
             for item in owner_content_items(c, 'notifications', 'community')
             if not item.get('audienceId') or str(item.get('audienceId')) == session_id
         ]
@@ -600,7 +636,7 @@ def bootstrap(session):
                 'complaints':safe_state('complaints', []) if privileged else [],
                 'reportConfig':safe_state('reportConfig', {}),
                 'notifications':[
-                    notification_portal_item(item)
+                    notification_for_recipient(c, item, 'squad', session_id)
                     for item in owner_content_items(c, 'notifications', 'squad')
                     if not item.get('audienceId') or str(item.get('audienceId')) == session_id
                 ],
@@ -1756,9 +1792,8 @@ class Handler(BaseHTTPRequestHandler):
                 try: payload=json.loads(row['payload'])
                 except Exception: continue
                 if not isinstance(payload,dict) or (payload.get('audienceId') and str(payload['audienceId'])!=str(s['id'])): continue
-                if not payload.get('read'): changed+=1
-                payload['read']=True
-                c.execute('UPDATE notifications SET payload=? WHERE id=?',(json.dumps(payload,separators=(',',':')),row['id']))
+                if not notification_is_read(c,row['id'],'community',s['id']): changed+=1
+                mark_notification_read(c,row['id'],'community',s['id'])
             state_set(c,'community_notifications',notes); c.commit()
         self.audit(s,'community_notifications_read_all','community_account',s['id'],{'changed':changed})
         return json_response(self,{'ok':True,'changed':changed})
@@ -1777,7 +1812,7 @@ class Handler(BaseHTTPRequestHandler):
                 try: payload=json.loads(row['payload'])
                 except Exception: payload=None
                 if isinstance(payload,dict) and (not payload.get('audienceId') or str(payload['audienceId'])==str(s['id'])):
-                    payload['read']=True; c.execute('UPDATE notifications SET payload=? WHERE id=?',(json.dumps(payload,separators=(',',':')),nid)); changed=True
+                    changed=not notification_is_read(c,nid,'community',s['id']); mark_notification_read(c,nid,'community',s['id'])
             if changed: state_set(c,'community_notifications',notes); c.commit()
         return json_response(self,{'ok':True,'changed':changed})
 
@@ -1792,8 +1827,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception: payload=None
             if not isinstance(payload,dict) or (payload.get('audienceId') and str(payload['audienceId'])!=str(s['id'])):
                 return json_response(self,{'ok':True,'changed':False})
-            changed=not bool(payload.get('read')); payload['read']=True
-            c.execute('UPDATE notifications SET payload=? WHERE id=?',(json.dumps(payload,separators=(',',':')),nid)); c.commit()
+            changed=not notification_is_read(c,nid,'squad',s['id']); mark_notification_read(c,nid,'squad',s['id']); c.commit()
         return json_response(self,{'ok':True,'changed':changed})
 
     def squad_notifications_read_all(self):
@@ -1805,8 +1839,8 @@ class Handler(BaseHTTPRequestHandler):
                 try: payload=json.loads(row['payload'])
                 except Exception: continue
                 if not isinstance(payload,dict) or (payload.get('audienceId') and str(payload['audienceId'])!=str(s['id'])): continue
-                if not payload.get('read'): changed+=1
-                payload['read']=True; c.execute('UPDATE notifications SET payload=? WHERE id=?',(json.dumps(payload,separators=(',',':')),row['id']))
+                if not notification_is_read(c,row['id'],'squad',s['id']): changed+=1
+                mark_notification_read(c,row['id'],'squad',s['id'])
             c.commit()
         return json_response(self,{'ok':True,'changed':changed})
 

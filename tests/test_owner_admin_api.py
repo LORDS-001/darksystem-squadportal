@@ -1453,6 +1453,68 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         with server.LOCK, server.db() as connection:
             self.assertFalse(any(item.get("id") == "rollback-test" for item in server.state_get(connection, "announcements", [])))
 
+    def test_broadcast_notification_read_state_is_per_recipient(self):
+        """Mutating a broadcast payload must not mark it read for every Squad recipient."""
+        member = self.owner_request("POST", "/api/owner/squad-members", {
+            "name": "Second Recipient", "ign": "SecondRecipient", "gameId": "919191", "serverId": "9191",
+            "accessCode": "SECOND-RECIPIENT-CODE",
+        })
+        self.assertEqual(member.status, 201)
+        owner_squad = self.backend.request("POST", "/api/squad/login", {
+            "ign": "ContentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-CONTENT-OWNER",
+        })
+        second_squad = self.backend.request("POST", "/api/squad/login", {
+            "ign": "SecondRecipient", "gameId": "919191", "serverId": "9191", "accessCode": "SECOND-RECIPIENT-CODE",
+        })
+        self.assertEqual(owner_squad.status, 200)
+        self.assertEqual(second_squad.status, 200)
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/notifications/broadcast-notice",
+            {"title": "Broadcast", "message": "Everyone should see this.", "audienceType": "squad"},
+        ).status, 201)
+        owner_cookie = owner_squad.headers["Set-Cookie"].split(";", 1)[0]
+        second_cookie = second_squad.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertFalse(next(item for item in self.backend.request("GET", "/api/bootstrap", cookie=owner_cookie).json["squad"]["notifications"] if item["id"] == "broadcast-notice")["read"])
+        self.assertFalse(next(item for item in self.backend.request("GET", "/api/bootstrap", cookie=second_cookie).json["squad"]["notifications"] if item["id"] == "broadcast-notice")["read"])
+        self.assertEqual(self.backend.request("POST", "/api/squad/notifications/read", {"id": "broadcast-notice"}, cookie=owner_cookie).status, 200)
+        self.assertTrue(next(item for item in self.backend.request("GET", "/api/bootstrap", cookie=owner_cookie).json["squad"]["notifications"] if item["id"] == "broadcast-notice")["read"])
+        self.assertFalse(next(item for item in self.backend.request("GET", "/api/bootstrap", cookie=second_cookie).json["squad"]["notifications"] if item["id"] == "broadcast-notice")["read"])
+
+    def test_content_metadata_is_bounded_sanitized_and_owner_member_failure_rolls_back(self):
+        """Metadata must not persist secrets, and a member audit failure must roll back every write."""
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/reports/unsafe-values",
+            {"body": "Body", "values": {"accessCode": "LEAK"}},
+        ).status, 400)
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/reports/unsafe-files",
+            {"body": "Body", "files": "not-a-list"},
+        ).status, 400)
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "reports", [{
+                "id": "legacy-safe", "body": "Safe", "values": {"visible": "yes", "password": "hidden"},
+                "files": [{"name": "safe.png", "token": "hidden"}],
+            }])
+            connection.commit()
+        listed = self.owner_request("GET", "/api/owner/squad-content?domain=reports")
+        legacy = next(item for item in listed.json["items"] if item["id"] == "legacy-safe")
+        self.assertEqual(legacy["values"], {"visible": "yes"})
+        self.assertEqual(legacy["files"], [{"name": "safe.png"}])
+        with server.LOCK, server.db() as connection:
+            members_before = connection.execute("SELECT COUNT(*) AS n FROM squad_members").fetchone()["n"]
+            notifications_before = connection.execute("SELECT COUNT(*) AS n FROM notifications").fetchone()["n"]
+            audit_before = connection.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+        with patch.object(server, "insert_audit", side_effect=RuntimeError("audit unavailable")):
+            failed = self.owner_request("POST", "/api/owner/squad-members", {
+                "name": "Rollback Member", "ign": "RollbackMember", "gameId": "929292", "serverId": "9292",
+                "accessCode": "ROLLBACK-MEMBER-CODE",
+            })
+        self.assertEqual(failed.status, 503)
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM squad_members").fetchone()["n"], members_before)
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM notifications").fetchone()["n"], notifications_before)
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"], audit_before)
+
 
 if __name__ == "__main__":
     unittest.main()
