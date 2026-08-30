@@ -664,7 +664,7 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         )
 
         self.assertEqual(set(member), {"id", "name", "ign", "gameId", "serverId", "role", "lane", "email", "phone", "birthday", "status", "lastLogin", "profileComplete", "accountActivated"})
-        self.assertEqual(set(account), {"id", "squadMemberId", "ign", "gameId", "serverId", "email", "phone", "role", "lane", "createdAt", "emailNotifications", "linkedSquad"})
+        self.assertEqual(set(account), {"id", "squadMemberId", "ign", "gameId", "serverId", "email", "phone", "role", "lane", "createdAt", "emailNotifications", "linkedSquad", "status"})
         self.assertNotIn("MEMBER-ACCESS", json.dumps(member))
         self.assertNotIn("COMMUNITY-HASH", json.dumps(account))
         self.assertNotIn("COMMUNITY-RESET", json.dumps(account))
@@ -768,6 +768,164 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
             if item["id"] == "owner-audit-secret-test"
         )
         self.assertEqual(row["details"], {})
+
+
+class OwnerAccountAdministrationTests(unittest.TestCase):
+    def setUp(self):
+        self.backend = BackendHarness()
+        setup = self.backend.request(
+            "POST", "/api/owner/setup", {
+                "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+                "username": "overall-owner", "password": "owner-password-123",
+                "squadOwner": {
+                    "ign": "DarkOwner", "gameId": "123456", "serverId": "1234",
+                    "accessCode": "DS-OWNER",
+                },
+            },
+        )
+        self.assertEqual(setup.status, 200)
+        login = self.backend.request(
+            "POST", "/api/owner/login",
+            {"username": "overall-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(login.status, 200)
+        self.owner_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+    def tearDown(self):
+        self.backend.close()
+
+    def owner_request(self, method, path, payload=None):
+        return self.backend.request(method, path, payload, cookie=self.owner_cookie)
+
+    def create_member(self, ign="NewMember", game_id="789012", server_id="7890", **extra):
+        payload = {
+            "name": "New Member", "ign": ign, "gameId": game_id,
+            "serverId": server_id, "accessCode": "NEW-MEMBER-CODE",
+        }
+        payload.update(extra)
+        response = self.owner_request("POST", "/api/owner/squad-members", payload)
+        self.assertEqual(response.status, 201)
+        self.assertNotIn("NEW-MEMBER-CODE", json.dumps(response.json))
+        return response.json["member"]
+
+    def register_community(self, email="community@example.test"):
+        response = self.backend.request(
+            "POST", "/api/community/register", {
+                "email": email, "password": "member-password-123",
+                "ign": "CommunityPlayer", "gameId": "555555", "serverId": "5555",
+            },
+        )
+        self.assertEqual(response.status, 200)
+        return response
+
+    def test_owner_squad_list_filters_pages_and_excludes_access_codes(self):
+        first = self.create_member("AlphaMember", "100001", "1001")
+        second = self.create_member("BravoMember", "100002", "1002", role="Squad Leader")
+
+        page = self.owner_request(
+            "GET", "/api/owner/squad-members?search=member&limit=1"
+        )
+        self.assertEqual(page.status, 200)
+        self.assertEqual(len(page.json["members"]), 1)
+        self.assertIn("nextCursor", page.json)
+        self.assertNotIn("accessCode", page.json["members"][0])
+        following = self.owner_request(
+            "GET", f"/api/owner/squad-members?limit=10&cursor={page.json['nextCursor']}"
+        )
+        self.assertEqual(following.status, 200)
+        self.assertTrue({first["id"], second["id"]}.intersection(
+            {item["id"] for item in page.json["members"] + following.json["members"]}
+        ))
+        leaders = self.owner_request("GET", "/api/owner/squad-members?role=Squad%20Leader")
+        self.assertEqual(leaders.status, 200)
+        self.assertEqual([item["id"] for item in leaders.json["members"]], [second["id"]])
+
+    def test_owner_member_update_disables_and_revokes_session_without_disclosing_code(self):
+        member = self.create_member()
+        login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "NewMember", "gameId": "789012", "serverId": "7890",
+                "accessCode": "NEW-MEMBER-CODE",
+            },
+        )
+        self.assertEqual(login.status, 200)
+        copied_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+        changed = self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{member['id']}",
+            {"role": "Squad Leader", "status": "Disabled", "accessCode": "ROTATED-CODE"},
+        )
+
+        self.assertEqual(changed.status, 200)
+        self.assertEqual(changed.json["member"]["status"], "Disabled")
+        self.assertEqual(changed.json["member"]["role"], "Squad Leader")
+        self.assertNotIn("ROTATED-CODE", json.dumps(changed.json))
+        self.assertEqual(
+            self.backend.request("GET", "/api/auth/me", cookie=copied_cookie).json,
+            {"authenticated": False, "session": None},
+        )
+
+    def test_owner_member_rejects_duplicate_identity_and_cannot_remove_active_squad_owner(self):
+        self.create_member("UniqueMember", "900001", "9001")
+        duplicate = self.owner_request(
+            "POST", "/api/owner/squad-members", {
+                "name": "Duplicate", "ign": "AnotherName", "gameId": "900001",
+                "serverId": "9002", "accessCode": "DUPLICATE-CODE",
+            },
+        )
+        self.assertEqual(duplicate.status, 409)
+        protected = self.owner_request("DELETE", "/api/owner/squad-members/1")
+        self.assertEqual(protected.status, 409)
+
+    def test_owner_appointment_replaces_squad_owner_atomically_and_revokes_demoted_owner(self):
+        member = self.create_member("Replacement", "800001", "8001")
+        old_login = self.backend.request(
+            "POST", "/api/squad/login", {
+                "ign": "DarkOwner", "gameId": "123456", "serverId": "1234",
+                "accessCode": "DS-OWNER",
+            },
+        )
+        old_cookie = old_login.headers["Set-Cookie"].split(";", 1)[0]
+
+        response = self.owner_request("POST", "/api/owner/squad-owner", {"memberId": member["id"]})
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json["member"]["role"], "Squad Owner")
+        with server.LOCK, server.db() as connection:
+            owners = connection.execute(
+                "SELECT id FROM squad_members WHERE role='Squad Owner'"
+            ).fetchall()
+        self.assertEqual([row["id"] for row in owners], [member["id"]])
+        self.assertEqual(
+            self.backend.request("GET", "/api/auth/me", cookie=old_cookie).json,
+            {"authenticated": False, "session": None},
+        )
+
+    def test_owner_community_list_and_status_update_revoke_session_and_are_audited(self):
+        created = self.register_community()
+        account = created.json["account"]
+        cookie = created.headers["Set-Cookie"].split(";", 1)[0]
+
+        listed = self.owner_request("GET", "/api/owner/community-accounts?search=community")
+        self.assertEqual(listed.status, 200)
+        self.assertEqual([item["id"] for item in listed.json["accounts"]], [account["id"]])
+        self.assertNotIn("password", json.dumps(listed.json).lower())
+        updated = self.owner_request(
+            "PATCH", f"/api/owner/community-accounts/{account['id']}",
+            {"ign": "AdminEdited", "status": "Disabled", "emailNotifications": False},
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertEqual(updated.json["account"]["status"], "Disabled")
+        self.assertEqual(updated.json["account"]["ign"], "AdminEdited")
+        self.assertEqual(
+            self.backend.request("GET", "/api/auth/me", cookie=cookie).json,
+            {"authenticated": False, "session": None},
+        )
+        audit = self.owner_request("GET", "/api/owner/audit")
+        self.assertTrue(any(
+            row["action"] == "owner_community_account_update" and row["actor_role"] == "Overall Owner"
+            for row in audit.json["audit"]
+        ))
 
 
 if __name__ == "__main__":

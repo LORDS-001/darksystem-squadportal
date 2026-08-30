@@ -33,6 +33,9 @@ SESSION_TTL = 60 * 60 * 24 * 7
 RATE_LIMIT_WINDOW = 300
 RATE_LIMIT_MAX = 12
 RATE_LIMITS = {}
+SQUAD_ROLES = ('Squad Owner', 'Squad Leader', 'Assistant Squad Leader', 'Squad Member')
+SQUAD_MEMBER_STATUSES = ('Online', 'Offline', 'Disabled')
+COMMUNITY_ACCOUNT_STATUSES = ('Active', 'Disabled')
 
 PUBLIC_STATIC_FILES = {
     '/': 'index.html',
@@ -193,7 +196,8 @@ def init_db():
           id TEXT PRIMARY KEY, squad_member_id TEXT, ign TEXT NOT NULL, game_id TEXT, server_id TEXT,
           email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL, role TEXT,
           lane TEXT, created_at TEXT, email_notifications INTEGER NOT NULL DEFAULT 1,
-          reset_code TEXT, reset_expires INTEGER, linked_squad INTEGER NOT NULL DEFAULT 0
+          reset_code TEXT, reset_expires INTEGER, linked_squad INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'Active'
         );
         CREATE TABLE IF NOT EXISTS app_state (
           key TEXT PRIMARY KEY, value TEXT NOT NULL
@@ -205,6 +209,16 @@ def init_db():
         CREATE INDEX IF NOT EXISTS login_throttle_window_started_idx ON login_throttle(window_started);
         CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, domain TEXT NOT NULL, payload TEXT NOT NULL);
         ''')
+        if isinstance(c, PostgresCompat):
+            columns = {
+                row['column_name'] for row in c.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='community_accounts'"
+                ).fetchall()
+            }
+        else:
+            columns = {row['name'] for row in c.execute('PRAGMA table_info(community_accounts)').fetchall()}
+        if 'status' not in columns:
+            c.execute("ALTER TABLE community_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
         count = c.execute('SELECT COUNT(*) AS n FROM squad_members').fetchone()['n']
         if count == 0 and DEMO_DATA:
             seed = [
@@ -252,7 +266,7 @@ def public_member(r, include_secret=False):
 
 def public_account(r):
     d = dict(r)
-    for k in ['password_hash','reset_code','reset_expires']:
+    for k in ['password_hash','reset_code','reset_expires','status']:
         d.pop(k, None)
     d['squadMemberId'] = d.pop('squad_member_id', None)
     d['gameId'] = d.pop('game_id','')
@@ -289,9 +303,10 @@ def safe_owner_squad_member(r):
 
 def safe_owner_community_account(r):
     account = public_account(r)
+    account['status'] = dict(r).get('status', 'Active')
     return {
         key: account[key]
-        for key in ('id', 'squadMemberId', 'ign', 'gameId', 'serverId', 'email', 'phone', 'role', 'lane', 'createdAt', 'emailNotifications', 'linkedSquad')
+        for key in ('id', 'squadMemberId', 'ign', 'gameId', 'serverId', 'email', 'phone', 'role', 'lane', 'createdAt', 'emailNotifications', 'linkedSquad', 'status')
         if key in account
     }
 
@@ -440,9 +455,10 @@ def auth_from_cookie(handler):
             current_role = (account['role'] or 'Squad Member') if account and not disabled else None
         elif user_type == 'community':
             account = connection.execute(
-                'SELECT role FROM community_accounts WHERE id=?', (user_id,)
+                'SELECT role,status FROM community_accounts WHERE id=?', (user_id,)
             ).fetchone()
-            current_role = (account['role'] or 'Community Member') if account else None
+            disabled = account and str(account['status'] or '').strip().lower() == 'disabled'
+            current_role = (account['role'] or 'Community Member') if account and not disabled else None
         else:
             current_role = None
         if current_role is None:
@@ -492,6 +508,43 @@ def require_overall_owner(h):
         json_response(h, {'error':'Overall Owner permission required.'}, 403)
         return None
     return session
+
+def revoke_user_sessions(connection, user_type, user_id):
+    connection.execute(
+        'DELETE FROM sessions WHERE type=? AND user_id=?', (user_type, str(user_id))
+    )
+
+def owner_list_options(handler, roles, statuses):
+    query = parse_qs(urlparse(handler.path).query, keep_blank_values=True)
+    search = str(query.get('search', [''])[0]).strip()
+    role = str(query.get('role', [''])[0]).strip()
+    status = str(query.get('status', [''])[0]).strip()
+    cursor = str(query.get('cursor', [''])[0]).strip()
+    raw_limit = str(query.get('limit', ['25'])[0]).strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return None, 'limit must be a whole number.'
+    if not 1 <= limit <= 100:
+        return None, 'limit must be between 1 and 100.'
+    if role and role not in roles:
+        return None, 'The requested role filter is invalid.'
+    if status and status not in statuses:
+        return None, 'The requested status filter is invalid.'
+    return {
+        'search': search, 'role': role, 'status': status,
+        'cursor': cursor, 'limit': limit,
+    }, None
+
+def identity_conflict(connection, table, ign, game_id, server_id, excluded_id=None):
+    clauses = ['(lower(ign)=? OR game_id=? OR server_id=?)']
+    params = [str(ign).strip().lower(), str(game_id).strip(), str(server_id).strip()]
+    if excluded_id is not None:
+        clauses.append('id!=?')
+        params.append(str(excluded_id))
+    return connection.execute(
+        f"SELECT id FROM {table} WHERE {' AND '.join(clauses)} LIMIT 1", tuple(params)
+    ).fetchone() is not None
 
 def request_is_https(h):
     forwarded_proto = request_header(h, 'X-Forwarded-Proto')
@@ -669,12 +722,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self): self.route('GET')
     def do_POST(self): self.route('POST')
     def do_PUT(self): self.route('PUT')
+    def do_PATCH(self): self.route('PATCH')
     def do_DELETE(self): self.route('DELETE')
     def do_OPTIONS(self):
         self.send_response(204); self.send_header('Access-Control-Allow-Headers','Content-Type'); self.send_header('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS'); self.send_header('Vary','Origin'); self.end_headers()
     def route(self, method):
         path=urlparse(self.path).path
-        if method in ('POST','PUT','DELETE') and not valid_origin(self):
+        if method in ('POST','PUT','PATCH','DELETE') and not valid_origin(self):
             return json_response(self, {'error':'Cross-origin request blocked.'}, 403)
         if path=='/api/owner/login' and method=='POST' and durable_rate_limited(self, path):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
@@ -690,6 +744,17 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/owner/login' and method=='POST': return self.owner_login()
         if path=='/api/owner/overview' and method=='GET': return self.owner_overview()
         if path=='/api/owner/audit' and method=='GET': return self.owner_audit()
+        if path=='/api/owner/squad-members' and method=='GET': return self.owner_squad_members()
+        if path=='/api/owner/squad-members' and method=='POST': return self.owner_squad_member_create()
+        if path.startswith('/api/owner/squad-members/'):
+            member_id=path.rsplit('/', 1)[-1]
+            if member_id and method=='PATCH': return self.owner_squad_member_update(member_id)
+            if member_id and method=='DELETE': return self.owner_squad_member_delete(member_id)
+        if path=='/api/owner/squad-owner' and method=='POST': return self.owner_squad_owner_appoint()
+        if path=='/api/owner/community-accounts' and method=='GET': return self.owner_community_accounts()
+        if path.startswith('/api/owner/community-accounts/') and method=='PATCH':
+            account_id=path.rsplit('/', 1)[-1]
+            if account_id: return self.owner_community_account_update(account_id)
         if path=='/api/roles' and method=='GET': return self.roles_info()
         if path=='/api/squad/role' and method=='POST': return self.squad_role_change()
         if path=='/api/logout' and method=='POST':
@@ -909,6 +974,266 @@ class Handler(BaseHTTPRequestHandler):
                 item['details']=overview_details(item.get('details'), secret_values, session_token_hashes)
                 rows.append(item)
         return json_response(self,{'audit':rows})
+
+    def owner_squad_members(self):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        options, error = owner_list_options(self, SQUAD_ROLES, SQUAD_MEMBER_STATUSES)
+        if error:
+            return json_response(self, {'error': error}, 400)
+        where, params = [], []
+        if options['search']:
+            escaped = options['search'].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_').lower()
+            where.append("(lower(name) LIKE ? ESCAPE '\\' OR lower(ign) LIKE ? ESCAPE '\\' OR lower(id) LIKE ? ESCAPE '\\')")
+            params.extend([f'%{escaped}%'] * 3)
+        if options['role']:
+            where.append('role=?'); params.append(options['role'])
+        if options['status']:
+            where.append('status=?'); params.append(options['status'])
+        if options['cursor']:
+            where.append('id>?'); params.append(options['cursor'])
+        clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+        with LOCK, db() as c:
+            rows = c.execute(
+                f'SELECT * FROM squad_members{clause} ORDER BY id ASC LIMIT ?',
+                tuple(params + [options['limit'] + 1]),
+            ).fetchall()
+        has_more = len(rows) > options['limit']
+        members = [safe_owner_squad_member(row) for row in rows[:options['limit']]]
+        return json_response(self, {
+            'members': members,
+            'nextCursor': members[-1]['id'] if has_more and members else None,
+        })
+
+    def owner_squad_member_create(self):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        data = read_json(self)
+        required = ('name', 'ign', 'gameId', 'serverId', 'accessCode')
+        if any(not str(data.get(key, '')).strip() for key in required):
+            return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code are required.'}, 400)
+        role = str(data.get('role', 'Squad Member')).strip() or 'Squad Member'
+        if role not in SQUAD_ROLES or role == 'Squad Owner':
+            return json_response(self, {'error': 'Use the Squad Owner appointment endpoint to appoint a Squad Owner.'}, 409)
+        status = str(data.get('status', 'Offline')).strip() or 'Offline'
+        if status not in SQUAD_MEMBER_STATUSES or status == 'Disabled':
+            return json_response(self, {'error': 'New Squad members must start in an active online or offline state.'}, 400)
+        member_id = 'SM-' + secrets.token_hex(8)
+        name, ign = str(data['name']).strip(), str(data['ign']).strip()
+        game_id, server_id = str(data['gameId']).strip(), str(data['serverId']).strip()
+        try:
+            with LOCK, db() as c:
+                if identity_conflict(c, 'squad_members', ign, game_id, server_id):
+                    return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
+                c.execute(
+                    '''INSERT INTO squad_members(id,name,ign,game_id,server_id,role,lane,email,phone,birthday,access_code,status,last_login,profile_complete,account_activated)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (member_id, name, ign, game_id, server_id, role,
+                     str(data.get('lane', '')).strip(), str(data.get('email', '')).strip(),
+                     str(data.get('phone', '')).strip(), str(data.get('birthday', '')).strip(),
+                     str(data['accessCode']).strip().upper(), status, None,
+                     1 if data.get('profileComplete', False) else 0,
+                     1 if data.get('accountActivated', True) else 0),
+                )
+                row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                insert_audit(c, session, 'owner_squad_member_create', 'squad_member', member_id, {'ign': ign, 'role': role})
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad member creation failed.')
+            return json_response(self, {'error': 'The Squad member could not be created.'}, 503)
+        return json_response(self, {'member': safe_owner_squad_member(row)}, 201)
+
+    def owner_squad_member_update(self, member_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        data = read_json(self)
+        try:
+            with LOCK, db() as c:
+                row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                if not row:
+                    return json_response(self, {'error': 'Squad member not found.'}, 404)
+                values = {
+                    'name': str(data.get('name', row['name'])).strip(),
+                    'ign': str(data.get('ign', row['ign'])).strip(),
+                    'game_id': str(data.get('gameId', row['game_id'])).strip(),
+                    'server_id': str(data.get('serverId', row['server_id'])).strip(),
+                    'role': str(data.get('role', row['role'])).strip(),
+                    'lane': str(data.get('lane', row['lane'] or '')).strip(),
+                    'email': str(data.get('email', row['email'] or '')).strip(),
+                    'phone': str(data.get('phone', row['phone'] or '')).strip(),
+                    'birthday': str(data.get('birthday', row['birthday'] or '')).strip(),
+                    'access_code': str(data.get('accessCode', row['access_code'])).strip().upper(),
+                    'status': str(data.get('status', row['status'])).strip(),
+                    'profile_complete': 1 if data.get('profileComplete', bool(row['profile_complete'])) else 0,
+                    'account_activated': 1 if data.get('accountActivated', bool(row['account_activated'])) else 0,
+                }
+                if not all(values[key] for key in ('name', 'ign', 'game_id', 'server_id', 'access_code')):
+                    return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code cannot be empty.'}, 400)
+                if values['role'] not in SQUAD_ROLES:
+                    return json_response(self, {'error': 'The requested Squad role is invalid.'}, 400)
+                if values['status'] not in SQUAD_MEMBER_STATUSES:
+                    return json_response(self, {'error': 'The requested Squad status is invalid.'}, 400)
+                if row['role'] == 'Squad Owner' and (
+                    values['role'] != 'Squad Owner' or values['status'] == 'Disabled' or not values['account_activated']
+                ):
+                    return json_response(self, {'error': 'Appoint a replacement before changing the active Squad Owner.'}, 409)
+                if values['role'] == 'Squad Owner' and row['role'] != 'Squad Owner':
+                    return json_response(self, {'error': 'Use the Squad Owner appointment endpoint to appoint a Squad Owner.'}, 409)
+                if identity_conflict(c, 'squad_members', values['ign'], values['game_id'], values['server_id'], member_id):
+                    return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
+                c.execute(
+                    '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,status=?,profile_complete=?,account_activated=? WHERE id=?''',
+                    (values['name'], values['ign'], values['game_id'], values['server_id'], values['role'],
+                     values['lane'], values['email'], values['phone'], values['birthday'], values['access_code'],
+                     values['status'], values['profile_complete'], values['account_activated'], member_id),
+                )
+                authority_changed = values['role'] != row['role']
+                credentials_changed = values['access_code'] != str(row['access_code']).upper()
+                unavailable = values['status'] == 'Disabled' or not values['account_activated']
+                if authority_changed or credentials_changed or unavailable:
+                    revoke_user_sessions(c, 'squad', member_id)
+                updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                insert_audit(c, session, 'owner_squad_member_update', 'squad_member', member_id, {
+                    'role': values['role'], 'status': values['status'], 'identityChanged': any(
+                        values[key] != row[source] for key, source in (('ign', 'ign'), ('game_id', 'game_id'), ('server_id', 'server_id'))
+                    ),
+                })
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad member update failed.')
+            return json_response(self, {'error': 'The Squad member could not be updated.'}, 503)
+        return json_response(self, {'member': safe_owner_squad_member(updated)})
+
+    def owner_squad_member_delete(self, member_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        try:
+            with LOCK, db() as c:
+                row = c.execute('SELECT role FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                if not row:
+                    return json_response(self, {'error': 'Squad member not found.'}, 404)
+                if row['role'] == 'Squad Owner':
+                    return json_response(self, {'error': 'Appoint a replacement before removing the active Squad Owner.'}, 409)
+                revoke_user_sessions(c, 'squad', member_id)
+                c.execute('DELETE FROM squad_members WHERE id=?', (member_id,))
+                insert_audit(c, session, 'owner_squad_member_delete', 'squad_member', member_id)
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad member deletion failed.')
+            return json_response(self, {'error': 'The Squad member could not be removed.'}, 503)
+        return json_response(self, {'ok': True})
+
+    def owner_squad_owner_appoint(self):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        member_id = str(read_json(self).get('memberId', '')).strip()
+        if not member_id:
+            return json_response(self, {'error': 'A Squad member id is required.'}, 400)
+        try:
+            with LOCK, db() as c:
+                candidate = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                if not candidate:
+                    return json_response(self, {'error': 'Squad member not found.'}, 404)
+                if candidate['status'] == 'Disabled' or not candidate['account_activated']:
+                    return json_response(self, {'error': 'Only an active Squad member can be appointed Squad Owner.'}, 409)
+                former_rows = c.execute(
+                    "SELECT id FROM squad_members WHERE role='Squad Owner' AND id!=?", (member_id,)
+                ).fetchall()
+                c.execute("UPDATE squad_members SET role='Squad Member' WHERE role='Squad Owner' AND id!=?", (member_id,))
+                c.execute("UPDATE squad_members SET role='Squad Owner',status='Offline',account_activated=1 WHERE id=?", (member_id,))
+                for former in former_rows:
+                    revoke_user_sessions(c, 'squad', former['id'])
+                updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                insert_audit(c, session, 'owner_squad_owner_appoint', 'squad_member', member_id, {
+                    'replacedMemberIds': [row['id'] for row in former_rows],
+                })
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad Owner appointment failed.')
+            return json_response(self, {'error': 'The Squad Owner appointment could not be completed.'}, 503)
+        return json_response(self, {'member': safe_owner_squad_member(updated)})
+
+    def owner_community_accounts(self):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        options, error = owner_list_options(self, ('Community Member', 'Tournament Manager'), COMMUNITY_ACCOUNT_STATUSES)
+        if error:
+            return json_response(self, {'error': error}, 400)
+        where, params = [], []
+        if options['search']:
+            escaped = options['search'].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_').lower()
+            where.append("(lower(ign) LIKE ? ESCAPE '\\' OR lower(email) LIKE ? ESCAPE '\\' OR lower(id) LIKE ? ESCAPE '\\')")
+            params.extend([f'%{escaped}%'] * 3)
+        if options['role']:
+            where.append('role=?'); params.append(options['role'])
+        if options['status']:
+            where.append('status=?'); params.append(options['status'])
+        if options['cursor']:
+            where.append('id>?'); params.append(options['cursor'])
+        clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+        with LOCK, db() as c:
+            rows = c.execute(
+                f'SELECT * FROM community_accounts{clause} ORDER BY id ASC LIMIT ?',
+                tuple(params + [options['limit'] + 1]),
+            ).fetchall()
+        has_more = len(rows) > options['limit']
+        accounts = [safe_owner_community_account(row) for row in rows[:options['limit']]]
+        return json_response(self, {
+            'accounts': accounts,
+            'nextCursor': accounts[-1]['id'] if has_more and accounts else None,
+        })
+
+    def owner_community_account_update(self, account_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        data = read_json(self)
+        try:
+            with LOCK, db() as c:
+                row = c.execute('SELECT * FROM community_accounts WHERE id=?', (account_id,)).fetchone()
+                if not row:
+                    return json_response(self, {'error': 'Community account not found.'}, 404)
+                values = {
+                    'ign': str(data.get('ign', row['ign'])).strip(),
+                    'game_id': str(data.get('gameId', row['game_id'])).strip(),
+                    'server_id': str(data.get('serverId', row['server_id'])).strip(),
+                    'email': str(data.get('email', row['email'])).strip().lower(),
+                    'phone': str(data.get('phone', row['phone'] or '')).strip(),
+                    'lane': str(data.get('lane', row['lane'] or '')).strip(),
+                    'email_notifications': 1 if data.get('emailNotifications', bool(row['email_notifications'])) else 0,
+                    'status': str(data.get('status', row['status'])).strip(),
+                }
+                if not all(values[key] for key in ('ign', 'game_id', 'server_id', 'email')):
+                    return json_response(self, {'error': 'IGN, Game ID, Server ID and email cannot be empty.'}, 400)
+                if values['status'] not in COMMUNITY_ACCOUNT_STATUSES:
+                    return json_response(self, {'error': 'The requested Community account status is invalid.'}, 400)
+                if c.execute('SELECT 1 FROM community_accounts WHERE lower(email)=? AND id!=?', (values['email'], account_id)).fetchone():
+                    return json_response(self, {'error': 'That email is already in use.'}, 409)
+                if identity_conflict(c, 'community_accounts', values['ign'], values['game_id'], values['server_id'], account_id):
+                    return json_response(self, {'error': 'A Community account already uses that IGN, Game ID, or Server ID.'}, 409)
+                c.execute(
+                    'UPDATE community_accounts SET ign=?,game_id=?,server_id=?,email=?,phone=?,lane=?,email_notifications=?,status=? WHERE id=?',
+                    (values['ign'], values['game_id'], values['server_id'], values['email'], values['phone'], values['lane'], values['email_notifications'], values['status'], account_id),
+                )
+                if values['status'] == 'Disabled':
+                    revoke_user_sessions(c, 'community', account_id)
+                updated = c.execute('SELECT * FROM community_accounts WHERE id=?', (account_id,)).fetchone()
+                insert_audit(c, session, 'owner_community_account_update', 'community_account', account_id, {
+                    'status': values['status'], 'identityChanged': any(
+                        values[key] != row[source] for key, source in (('ign', 'ign'), ('game_id', 'game_id'), ('server_id', 'server_id'), ('email', 'email'))
+                    ),
+                })
+                c.commit()
+        except Exception:
+            logging.exception('Owner Community account update failed.')
+            return json_response(self, {'error': 'The Community account could not be updated.'}, 503)
+        return json_response(self, {'account': safe_owner_community_account(updated)})
 
     def roles_info(self):
         return json_response(self, {'roles': {
