@@ -1599,6 +1599,26 @@ class OwnerTournamentAdministrationTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         return response.json["account"], response.headers["Set-Cookie"].split(";", 1)[0]
 
+    def create_two_player_bracket(self, first_number=5, second_number=6, title="Review Cup"):
+        tournament = self.owner_request("POST", "/api/owner/tournaments", {
+            "title": title, "game": "MLBB", "format": "1v1", "date": "2099-12-20", "slots": 4,
+        }).json["tournament"]
+        players = []
+        for number in (first_number, second_number):
+            account, cookie = self.register_player(number)
+            registered = self.backend.request(
+                "POST", "/api/tournaments/register", {"tournamentId": tournament["id"]}, cookie=cookie,
+            )
+            registration = next(item for item in registered.json["registrations"] if item["accountId"] == account["id"])
+            self.assertEqual(self.owner_request(
+                "POST", f"/api/owner/tournaments/{tournament['id']}/registrations/{registration['id']}/decision",
+                {"action": "approve"},
+            ).status, 200)
+            players.append((account, cookie))
+        bracket = self.owner_request("POST", f"/api/owner/tournaments/{tournament['id']}/bracket", {})
+        self.assertEqual(bracket.status, 200)
+        return tournament["id"], bracket.json["tournament"]["matches"][0], players
+
     def test_owner_can_run_a_secret_safe_tournament_from_creation_through_archive(self):
         """Removing any dedicated lifecycle transition, safe projection, audit, or notification breaks this flow."""
         created = self.owner_request("POST", "/api/owner/tournaments", {
@@ -1782,6 +1802,317 @@ class OwnerTournamentAdministrationTests(unittest.TestCase):
         self.assertEqual(failed.status, 503)
         listed = self.owner_request("GET", "/api/owner/tournaments")
         self.assertNotIn("Rollback Cup", [item.get("title") for item in listed.json["tournaments"]])
+
+    def test_manager_authority_is_removed_by_owner_and_legacy_member_demotion_or_deletion(self):
+        """A stale Tournament Manager id must not survive any supported role-loss or member-removal path."""
+        def create_manager(suffix):
+            response = self.owner_request("POST", "/api/owner/squad-members", {
+                "name": f"Manager {suffix}", "ign": f"Manager{suffix}",
+                "gameId": f"77{suffix:04d}", "serverId": f"7{suffix:03d}",
+                "accessCode": f"MANAGER-{suffix}-CODE", "role": "Squad Leader",
+            })
+            self.assertEqual(response.status, 201)
+            member = response.json["member"]
+            self.assertEqual(self.owner_request(
+                "POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "grant"},
+            ).status, 200)
+            return member
+
+        owner_demoted = create_manager(1)
+        login = self.backend.request("POST", "/api/squad/login", {
+            "ign": owner_demoted["ign"], "gameId": owner_demoted["gameId"],
+            "serverId": owner_demoted["serverId"], "accessCode": "MANAGER-1-CODE",
+        })
+        stale_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{owner_demoted['id']}", {"role": "Squad Member"},
+        ).status, 200)
+        relogin = self.backend.request("POST", "/api/squad/login", {
+            "ign": owner_demoted["ign"], "gameId": owner_demoted["gameId"],
+            "serverId": owner_demoted["serverId"], "accessCode": "MANAGER-1-CODE",
+        })
+        self.assertEqual(relogin.status, 200)
+        relogin_cookie = relogin.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.backend.request("POST", "/api/tournaments", {
+            "title": "Unauthorized", "game": "MLBB", "format": "1v1", "date": "2099-01-01",
+        }, cookie=relogin_cookie).status, 403)
+        self.assertFalse(self.backend.request("GET", "/api/auth/me", cookie=stale_cookie).json["authenticated"])
+
+        role_demoted = create_manager(2)
+        self.assertEqual(self.owner_request("POST", "/api/squad/role", {
+            "memberId": role_demoted["id"], "role": "Squad Member",
+        }).status, 200)
+        legacy_updated = create_manager(3)
+        self.assertEqual(self.owner_request("PUT", "/api/squad/members", {
+            "id": legacy_updated["id"], "role": "Squad Member",
+        }).status, 200)
+        owner_deleted = create_manager(4)
+        self.assertEqual(self.owner_request(
+            "DELETE", f"/api/owner/squad-members/{owner_deleted['id']}", {},
+        ).status, 200)
+        legacy_deleted = create_manager(5)
+        self.assertEqual(self.owner_request("DELETE", "/api/squad/members", {
+            "id": legacy_deleted["id"],
+        }).status, 200)
+        with server.LOCK, server.db() as connection:
+            managers = server.state_get(connection, "tournamentManagers", [])
+        manager_ids = {
+            str(item.get("id") or item.get("accountId")) if isinstance(item, dict) else str(item)
+            for item in managers
+        }
+        self.assertTrue({
+            owner_demoted["id"], role_demoted["id"], legacy_updated["id"],
+            owner_deleted["id"], legacy_deleted["id"],
+        }.isdisjoint(manager_ids))
+
+    def test_disputed_result_requires_reasoned_resolution_and_rejection_allows_resubmission(self):
+        """Owner confirmation must not bypass a dispute, and a rejected submission must not block a clean retry."""
+        tournament_id, match, players = self.create_two_player_bracket(title="Dispute Cup")
+        cookies = {account["id"]: cookie for account, cookie in players}
+        submitter = match["player1"]
+        opponent = match["player2"]
+        self.assertEqual(self.backend.request("POST", "/api/tournaments/result", {
+            "tournamentId": tournament_id, "matchId": match["id"], "result": {"winner": submitter},
+        }, cookie=cookies[submitter]).status, 200)
+        self.assertEqual(self.backend.request("POST", "/api/tournaments/result-dispute", {
+            "tournamentId": tournament_id, "matchId": match["id"],
+        }, cookie=cookies[opponent]).status, 200)
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result", {"action": "confirm"},
+        ).status, 409)
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result",
+            {"action": "resolve", "winner": submitter},
+        ).status, 400)
+        rejected = self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result", {"action": "reject"},
+        )
+        self.assertEqual(rejected.status, 200)
+        self.assertIsNone(rejected.json["match"]["submission"])
+        self.assertEqual(self.backend.request("POST", "/api/tournaments/result", {
+            "tournamentId": tournament_id, "matchId": match["id"], "result": {"winner": opponent},
+        }, cookie=cookies[opponent]).status, 200)
+
+    def test_reinstate_preserves_capacity_closed_squad_registration(self):
+        """A general registration flag must never reopen an independently capacity-closed Squad queue."""
+        tournament = self.owner_request("POST", "/api/owner/tournaments", {
+            "title": "Full Squad Cup", "game": "MLBB", "format": "Squad vs Squad", "date": "2099-12-22",
+            "squadSlots": 1, "membersPerSquad": 7, "registrationOpen": True, "squadRegistrationOpen": False,
+        }).json["tournament"]
+        self.assertEqual(self.owner_request("POST", f"/api/owner/tournaments/{tournament['id']}/cancel", {}).status, 200)
+        reinstated = self.owner_request("POST", f"/api/owner/tournaments/{tournament['id']}/reinstate", {})
+        self.assertEqual(reinstated.status, 200)
+        self.assertTrue(reinstated.json["tournament"]["registrationOpen"])
+        self.assertFalse(reinstated.json["tournament"]["squadRegistrationOpen"])
+
+    def test_upstream_correction_rejects_downstream_activity_and_final_correction_survives_auto_completion(self):
+        """Corrections must preserve downstream history while still allowing an Owner to correct an auto-completed final."""
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "tournaments", [{
+                "id": "correction-tree", "title": "Correction Tree", "status": "In Progress", "bracketReady": True,
+                "matches": [
+                    {"id": "semi", "round": 1, "player1": "p1", "player2": "p2", "winner": "p1",
+                     "submission": {"winner": "p1", "status": "Owner Confirmed"}, "pointsAwarded": True,
+                     "nextMatchId": "final", "nextSlot": "player1"},
+                    {"id": "final", "round": 2, "player1": "p1", "player2": "p3", "winner": None,
+                     "submission": {"winner": "p1", "status": "Awaiting Confirmation"}},
+                ],
+            }])
+            server.state_set(connection, "seasonPoints", {"p1": 100, "p2": 50})
+            connection.commit()
+        blocked = self.owner_request(
+            "POST", "/api/owner/tournaments/correction-tree/matches/semi/result",
+            {"action": "correct", "winner": "p2", "reason": "Verified replay"},
+        )
+        self.assertEqual(blocked.status, 409)
+        with server.LOCK, server.db() as connection:
+            tree = server.state_get(connection, "tournaments", [])[0]
+            points = server.state_get(connection, "seasonPoints", {})
+        self.assertEqual(tree["matches"][0]["winner"], "p1")
+        self.assertEqual(points, {"p1": 100, "p2": 50})
+
+        tournament_id, match, players = self.create_two_player_bracket(7, 8, "Auto Complete Cup")
+        cookies = {account["id"]: cookie for account, cookie in players}
+        self.assertEqual(self.backend.request("POST", "/api/tournaments/result", {
+            "tournamentId": tournament_id, "matchId": match["id"], "result": {"winner": match["player1"]},
+        }, cookie=cookies[match["player1"]]).status, 200)
+        self.assertEqual(self.backend.request("POST", "/api/tournaments/result-confirm", {
+            "tournamentId": tournament_id, "matchId": match["id"],
+        }, cookie=cookies[match["player2"]]).status, 200)
+        corrected = self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result",
+            {"action": "correct", "winner": match["player2"], "reason": "Official replay review"},
+        )
+        self.assertEqual(corrected.status, 200)
+        completed = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/complete", {})
+        self.assertEqual(completed.status, 200)
+        self.assertEqual(completed.json["tournament"]["champion"], match["player2"])
+        self.assertEqual(
+            self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/complete", {}).status,
+            409,
+        )
+
+    def test_owner_can_create_manual_match_with_strict_fields_and_registered_participants(self):
+        """Manual match creation must reject protected fields and outsiders instead of accepting arbitrary state."""
+        tournament_id, generated, players = self.create_two_player_bracket(9, 0, "Manual Match Cup")
+        participants = [account["id"] for account, _cookie in players]
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches",
+            {"player1": participants[0], "player2": participants[1], "round": 2, "winner": participants[0]},
+        ).status, 400)
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches",
+            {"player1": participants[0], "player2": "outsider", "round": 2},
+        ).status, 400)
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches",
+            {"player1": participants[0], "player2": participants[1], "round": 2, "status": "Arbitrary"},
+        ).status, 400)
+        self.assertEqual(self.owner_request(
+            "PATCH", f"/api/owner/tournaments/{tournament_id}/matches/{generated['id']}",
+            {"status": "Arbitrary"},
+        ).status, 400)
+        created = self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches",
+            {"player1": participants[0], "player2": participants[1], "round": 2, "scheduledAt": "2099-12-20T20:00:00Z"},
+        )
+        self.assertEqual(created.status, 201)
+        self.assertEqual(created.json["match"]["round"], 2)
+
+
+class OwnerSeasonEventHistoryAdministrationTests(unittest.TestCase):
+    """Server-authoritative season, ranking, event, and history administration."""
+
+    def setUp(self):
+        self.backend = BackendHarness()
+        setup = self.backend.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+            "username": "season-owner", "password": "owner-password-123",
+            "squadOwner": {"ign": "SeasonOwner", "gameId": "551100", "serverId": "5511", "accessCode": "DS-SEASON-OWNER"},
+        })
+        self.assertEqual(setup.status, 200)
+        login = self.backend.request("POST", "/api/owner/login", {
+            "username": "season-owner", "password": "owner-password-123",
+        })
+        self.assertEqual(login.status, 200)
+        self.owner_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+        self.accounts = []
+        for number, ign in enumerate(("Alpha", "Bravo", "Charlie"), 1):
+            registered = self.backend.request("POST", "/api/community/register", {
+                "email": f"season-{number}@example.test", "password": "member-password-123",
+                "ign": ign, "gameId": f"77110{number}", "serverId": f"771{number}",
+            })
+            self.assertEqual(registered.status, 200)
+            self.accounts.append((registered.json["account"], registered.headers["Set-Cookie"].split(";", 1)[0]))
+
+    def tearDown(self):
+        self.backend.close()
+
+    def owner_request(self, method, path, payload=None, cookie=None):
+        return self.backend.request(method, path, payload, cookie=cookie or self.owner_cookie)
+
+    def test_season_creation_points_ranking_and_completion_are_authoritative_and_idempotent(self):
+        created = self.owner_request("POST", "/api/owner/seasons", {"name": "Season 9", "requestId": "season-nine"})
+        self.assertEqual(created.status, 201)
+        season = created.json["season"]
+        retry = self.owner_request("POST", "/api/owner/seasons", {"name": "Season 9", "requestId": "season-nine"})
+        self.assertEqual(retry.status, 200)
+        self.assertEqual(retry.json["season"]["id"], season["id"])
+        self.assertEqual(self.owner_request("POST", "/api/owner/seasons", {"name": "Another"}).status, 409)
+
+        first_id, second_id = self.accounts[0][0]["id"], self.accounts[1][0]["id"]
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{first_id}", {"points": 120}).status, 400)
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{first_id}", {"points": 120, "reason": "Match correction"}).status, 200)
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{second_id}", {"points": 80, "reason": "Verified score"}).status, 200)
+        listed = self.owner_request("GET", "/api/owner/seasons")
+        self.assertEqual([row["accountId"] for row in listed.json["leaderboard"][:2]], [first_id, second_id])
+        self.assertEqual([row["rank"] for row in listed.json["leaderboard"][:2]], [1, 2])
+
+        completed = self.owner_request("POST", f"/api/owner/seasons/{season['id']}/complete", {})
+        self.assertEqual(completed.status, 200)
+        snapshot = completed.json["history"]
+        repeated = self.owner_request("POST", f"/api/owner/seasons/{season['id']}/complete", {})
+        self.assertEqual(repeated.status, 200)
+        self.assertEqual(repeated.json["history"]["id"], snapshot["id"])
+        history = self.owner_request("GET", "/api/owner/history")
+        self.assertEqual(len(history.json["seasonHistory"]), 1)
+        self.assertEqual(len(history.json["seasonHallOfFame"]), 1)
+        self.assertEqual(history.json["seasonHistory"][0]["leaderboard"][0]["points"], 120)
+        delayed_retry = self.owner_request("POST", "/api/owner/seasons", {"name": "Season 9", "requestId": "season-nine"})
+        self.assertEqual(delayed_retry.status, 200)
+        self.assertEqual(delayed_retry.json["season"]["id"], season["id"])
+        self.assertTrue(delayed_retry.json["alreadyCompleted"])
+
+        with server.LOCK, server.db() as connection:
+            points = server.state_get(connection, "seasonPoints", {})
+            points[first_id] = 999
+            server.state_set(connection, "seasonPoints", points)
+            connection.commit()
+        unchanged = self.owner_request("GET", "/api/owner/history")
+        self.assertEqual(unchanged.json["seasonHistory"][0]["leaderboard"][0]["points"], 120)
+
+    def test_hall_of_fame_corrections_require_reason_and_are_audited(self):
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "hallOfFame", [{"id": "H-test", "title": "Cup", "champion": "Wrong"}])
+            connection.commit()
+        self.assertEqual(self.owner_request("PATCH", "/api/owner/history/hall-of-fame/H-test", {"champion": "Alpha"}).status, 400)
+        corrected = self.owner_request("PATCH", "/api/owner/history/hall-of-fame/H-test", {"champion": "Alpha", "reason": "Verified final"})
+        self.assertEqual(corrected.status, 200)
+        self.assertEqual(corrected.json["entry"]["champion"], "Alpha")
+        audit = self.owner_request("GET", "/api/owner/audit")
+        self.assertIn("owner_hall_of_fame_correct", {item["action"] for item in audit.json["audit"]})
+
+    def test_event_lifecycle_and_participation_rewards_are_idempotent(self):
+        created = self.owner_request("POST", "/api/owner/events", {
+            "title": "Community Night", "date": "2099-12-10", "time": "18:00", "rewardPoints": 50,
+            "requestId": "community-night",
+        })
+        self.assertEqual(created.status, 201)
+        event = created.json["event"]
+        create_retry = self.owner_request("POST", "/api/owner/events", {
+            "title": "Community Night", "date": "2099-12-10", "time": "18:00", "rewardPoints": 50,
+            "requestId": "community-night",
+        })
+        self.assertEqual(create_retry.status, 200)
+        self.assertEqual(create_retry.json["event"]["id"], event["id"])
+        self.assertEqual(event["status"], "Draft")
+        updated = self.owner_request("PATCH", f"/api/owner/events/{event['id']}", {"title": "Community Finals"})
+        self.assertEqual(updated.status, 200)
+        published = self.owner_request("POST", f"/api/owner/events/{event['id']}/publish", {})
+        self.assertEqual(published.json["event"]["status"], "Published")
+        account = self.accounts[0][0]
+        awarded = self.owner_request("POST", f"/api/owner/events/{event['id']}/participation", {"accountId": account["id"]})
+        self.assertEqual(awarded.status, 201)
+        self.assertEqual(awarded.json["pointsAwarded"], 50)
+        repeated = self.owner_request("POST", f"/api/owner/events/{event['id']}/participation", {"accountId": account["id"]})
+        self.assertEqual(repeated.status, 200)
+        self.assertFalse(repeated.json["created"])
+        correction = {"points": 75, "reason": "Verified event total", "requestId": "points-after-event"}
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{account['id']}", correction).status, 200)
+        self.assertTrue(self.owner_request("PATCH", f"/api/owner/season-points/{account['id']}", correction).json["alreadyApplied"])
+        seasons = self.owner_request("GET", "/api/owner/seasons")
+        self.assertEqual(next(row for row in seasons.json["leaderboard"] if row["accountId"] == account["id"])["points"], 75)
+        closed = self.owner_request("POST", f"/api/owner/events/{event['id']}/close", {})
+        self.assertEqual(closed.json["event"]["status"], "Closed")
+        self.assertEqual(self.owner_request("POST", f"/api/owner/events/{event['id']}/participation", {"accountId": self.accounts[1][0]["id"]}).status, 409)
+        archived = self.owner_request("POST", f"/api/owner/events/{event['id']}/archive", {})
+        self.assertEqual(archived.json["event"]["status"], "Archived")
+        self.assertEqual(len(self.owner_request("GET", "/api/owner/events").json["events"]), 1)
+
+    def test_new_routes_require_overall_owner_and_transactions_rollback_with_audit(self):
+        community_cookie = self.accounts[0][1]
+        for method, path, payload in (
+            ("GET", "/api/owner/seasons", None),
+            ("GET", "/api/owner/history", None),
+            ("GET", "/api/owner/events", None),
+            ("POST", "/api/owner/seasons", {"name": "Forbidden"}),
+        ):
+            self.assertEqual(self.backend.request(method, path, payload).status, 401)
+            self.assertEqual(self.backend.request(method, path, payload, cookie=community_cookie).status, 403)
+        with patch.object(server, "insert_audit", side_effect=RuntimeError("audit unavailable")):
+            failed = self.owner_request("POST", "/api/owner/seasons", {"name": "Rollback Season"})
+        self.assertEqual(failed.status, 503)
+        self.assertIsNone(self.owner_request("GET", "/api/owner/seasons").json["currentSeason"])
 
 
 if __name__ == "__main__":

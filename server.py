@@ -55,6 +55,7 @@ OWNER_TOURNAMENT_TEXT_LIMITS = {
     'title': 200, 'game': 120, 'format': 80, 'date': 10, 'time': 20,
     'reward': 1000, 'rules': 8000, 'registrationDeadline': 40,
 }
+OWNER_MATCH_STATUSES = ('Pending', 'Scheduled', 'Ready', 'In Progress', 'Postponed', 'Cancelled')
 
 PUBLIC_STATIC_FILES = {
     '/': 'index.html',
@@ -292,6 +293,17 @@ def state_get(c, key, default):
 
 def state_set(c, key, value):
     c.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value, separators=(',', ':'))))
+
+def remove_tournament_manager_permission(connection, member_id):
+    member_id=str(member_id)
+    managers=state_get(connection,'tournamentManagers',[])
+    if not isinstance(managers,list):managers=[]
+    def identity(item):
+        if isinstance(item,dict):return str(item.get('id') or item.get('accountId') or '')
+        return str(item)
+    updated=[item for item in managers if identity(item)!=member_id]
+    if len(updated)!=len(managers):state_set(connection,'tournamentManagers',updated)
+    return len(updated)!=len(managers)
 
 def safe_owner_content_item(domain, item):
     if domain not in OWNER_CONTENT_DOMAINS or not isinstance(item, dict):
@@ -1130,6 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method=='GET':return self.owner_tournament_detail(parts[0])
                 if method=='PATCH':return self.owner_tournament_update(parts[0])
             if len(parts)==2 and method=='POST':
+                if parts[1]=='matches':return self.owner_tournament_match_create(parts[0])
                 if parts[1] in ('cancel','reinstate','bracket','complete','archive'):
                     return self.owner_tournament_transition(parts[0],parts[1])
             if len(parts)==4 and parts[1]=='registrations' and parts[3]=='decision' and method=='POST':
@@ -1143,6 +1156,28 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/api/owner/tournament-managers/') and method=='POST':
             parts=[part for part in path[len('/api/owner/tournament-managers/'):].split('/') if part]
             if parts:return self.owner_tournament_manager_change(parts[0],parts[1] if len(parts)>1 else '')
+        if path=='/api/owner/seasons':
+            if method=='GET':return self.owner_seasons()
+            if method=='POST':return self.owner_season_create()
+        if path.startswith('/api/owner/seasons/') and method=='POST':
+            parts=[part for part in path[len('/api/owner/seasons/'):].split('/') if part]
+            if len(parts)==2 and parts[1]=='complete':return self.owner_season_complete(parts[0])
+        if path.startswith('/api/owner/season-points/') and method=='PATCH':
+            account_id=path[len('/api/owner/season-points/'):].strip('/')
+            if account_id:return self.owner_season_points_correct(account_id)
+        if path=='/api/owner/history' and method=='GET':return self.owner_history()
+        if path.startswith('/api/owner/history/') and method=='PATCH':
+            parts=[part for part in path[len('/api/owner/history/'):].split('/') if part]
+            if len(parts)==2:return self.owner_history_correct(parts[0],parts[1])
+        if path=='/api/owner/events':
+            if method=='GET':return self.owner_events()
+            if method=='POST':return self.owner_event_create()
+        if path.startswith('/api/owner/events/'):
+            parts=[part for part in path[len('/api/owner/events/'):].split('/') if part]
+            if len(parts)==1 and method=='PATCH':return self.owner_event_update(parts[0])
+            if len(parts)==2 and method=='POST':
+                if parts[1] in ('publish','close','archive'):return self.owner_event_transition(parts[0],parts[1])
+                if parts[1]=='participation':return self.owner_event_participation(parts[0])
         if path=='/api/roles' and method=='GET': return self.roles_info()
         if path=='/api/squad/role' and method=='POST': return self.squad_role_change()
         if path=='/api/logout' and method=='POST':
@@ -1631,6 +1666,8 @@ class Handler(BaseHTTPRequestHandler):
                 unavailable = values['status'] == 'Disabled' or not values['account_activated']
                 if authority_changed or credentials_changed or unavailable:
                     revoke_user_sessions(c, 'squad', member_id)
+                if values['role'] not in ('Squad Leader', 'Assistant Squad Leader') or unavailable:
+                    remove_tournament_manager_permission(c, member_id)
                 updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
                 create_owner_notification(
                     c, session, 'owner_squad_member_update', 'squad_member', member_id,
@@ -1661,6 +1698,7 @@ class Handler(BaseHTTPRequestHandler):
                 if row['role'] == 'Squad Owner':
                     return json_response(self, {'error': 'Appoint a replacement before removing the active Squad Owner.'}, 409)
                 revoke_user_sessions(c, 'squad', member_id)
+                remove_tournament_manager_permission(c, member_id)
                 c.execute('DELETE FROM squad_members WHERE id=?', (member_id,))
                 create_owner_notification(
                     c, session, 'owner_squad_member_delete', 'squad_member', member_id,
@@ -1692,6 +1730,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchall()
                 c.execute("UPDATE squad_members SET role='Squad Member' WHERE role='Squad Owner' AND id!=?", (member_id,))
                 c.execute("UPDATE squad_members SET role='Squad Owner',status='Offline',account_activated=1 WHERE id=?", (member_id,))
+                remove_tournament_manager_permission(c, member_id)
                 for former in former_rows:
                     revoke_user_sessions(c, 'squad', former['id'])
                 updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
@@ -1794,6 +1833,265 @@ class Handler(BaseHTTPRequestHandler):
             logging.exception('Owner Community account update failed.')
             return json_response(self, {'error': 'The Community account could not be updated.'}, 503)
         return json_response(self, {'account': safe_owner_community_account(updated)})
+
+    def _owner_leaderboard(self, connection, points=None):
+        points = points if isinstance(points, dict) else state_get(connection, 'seasonPoints', {})
+        if not isinstance(points, dict): points = {}
+        accounts = {
+            str(row['id']): row for row in connection.execute(
+                'SELECT id,ign,game_id,server_id,status FROM community_accounts'
+            ).fetchall()
+        }
+        rows=[]
+        for account_id, value in points.items():
+            try: score=int(value)
+            except (TypeError,ValueError): score=0
+            account=accounts.get(str(account_id))
+            rows.append({
+                'accountId':str(account_id), 'ign':str(account['ign'] if account else ''),
+                'gameId':str(account['game_id'] if account else ''),
+                'serverId':str(account['server_id'] if account else ''), 'points':score,
+            })
+        rows.sort(key=lambda item:(-item['points'],item['ign'].lower(),item['accountId']))
+        for rank,item in enumerate(rows,1):item['rank']=rank
+        return rows
+
+    def owner_seasons(self):
+        session=require_overall_owner(self)
+        if not session:return
+        with LOCK,db() as c:
+            current=state_get(c,'currentSeason',None)
+            history=state_get(c,'seasonHistory',[]) or []
+            leaderboard=self._owner_leaderboard(c)
+            safe_current=safe_owner_tournament_value(c,current) if current else None
+            safe_history=safe_owner_tournament_value(c,history)
+        return json_response(self,{'currentSeason':safe_current,'leaderboard':leaderboard,'seasons':safe_history})
+
+    def owner_season_create(self):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self);name=data.get('name');request_id=data.get('requestId')
+        if not isinstance(name,str) or not name.strip() or len(name.strip())>120:return json_response(self,{'error':'A valid season name is required.'},400)
+        if request_id is not None and (not isinstance(request_id,str) or not request_id.strip() or len(request_id)>120):return json_response(self,{'error':'requestId must be a valid identifier.'},400)
+        try:
+            with LOCK,db() as c:
+                current=state_get(c,'currentSeason',None)
+                if isinstance(current,dict):
+                    if request_id and current.get('requestId')==request_id.strip():
+                        return json_response(self,{'season':safe_owner_tournament_value(c,current)},200)
+                    return json_response(self,{'error':'Complete the active season before starting another.'},409)
+                history=state_get(c,'seasonHistory',[]) or []
+                completed=next((item for item in history if isinstance(item,dict) and request_id and item.get('requestId')==request_id.strip()),None)
+                if completed:
+                    return json_response(self,{'season':{'id':completed.get('seasonId'),'name':completed.get('name'),'status':'Completed','completedAt':completed.get('completedAt')},'alreadyCompleted':True},200)
+                season={'id':'S'+secrets.token_hex(7),'name':name.strip(),'status':'Active','startedAt':now_iso(),'startedBy':str(session.get('id'))}
+                if request_id:season['requestId']=request_id.strip()
+                state_set(c,'currentSeason',season);state_set(c,'seasonPoints',{})
+                create_owner_notification(c,session,'owner_season_create','season',season['id'],'Season started','An Overall Owner started a new season.','community')
+                insert_audit(c,session,'owner_season_create','season',season['id'],{'name':season['name']})
+                c.commit();safe=safe_owner_tournament_value(c,season)
+        except Exception:
+            logging.exception('Owner season creation failed.')
+            return json_response(self,{'error':'The season could not be started.'},503)
+        return json_response(self,{'season':safe},201)
+
+    def owner_season_points_correct(self,account_id):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self);points=data.get('points');reason=data.get('reason');request_id=data.get('requestId')
+        if isinstance(points,bool) or not isinstance(points,int) or points<0 or points>100000000:return json_response(self,{'error':'points must be a non-negative integer.'},400)
+        if not isinstance(reason,str) or not reason.strip() or len(reason.strip())>500:return json_response(self,{'error':'A correction reason is required.'},400)
+        if request_id is not None and (not isinstance(request_id,str) or not request_id.strip() or len(request_id)>120):return json_response(self,{'error':'requestId must be a valid identifier.'},400)
+        try:
+            with LOCK,db() as c:
+                account=c.execute('SELECT id FROM community_accounts WHERE id=?',(account_id,)).fetchone()
+                if not account:return json_response(self,{'error':'Community account not found.'},404)
+                operations=state_get(c,'ownerIdempotency',{}) or {};operation_key='season-points:'+request_id.strip() if request_id else ''
+                if operation_key and operation_key in operations:
+                    stored=operations[operation_key]
+                    return json_response(self,{'accountId':str(stored.get('accountId')),'points':stored.get('points'),'leaderboard':self._owner_leaderboard(c),'alreadyApplied':True})
+                values=state_get(c,'seasonPoints',{}) or {};previous=int(values.get(str(account_id),0) or 0);values[str(account_id)]=points
+                state_set(c,'seasonPoints',values)
+                create_owner_notification(c,session,'owner_season_points_correct','community_account',account_id,'Season points corrected','An Overall Owner corrected your season points.','community',account_id)
+                insert_audit(c,session,'owner_season_points_correct','community_account',account_id,{'previousPoints':previous,'points':points,'reason':reason.strip()})
+                if operation_key:
+                    operations[operation_key]={'accountId':str(account_id),'points':points};state_set(c,'ownerIdempotency',operations)
+                c.commit();leaderboard=self._owner_leaderboard(c,values)
+        except Exception:
+            logging.exception('Owner season points correction failed.')
+            return json_response(self,{'error':'The season points could not be corrected.'},503)
+        return json_response(self,{'accountId':str(account_id),'points':points,'leaderboard':leaderboard,'alreadyApplied':False})
+
+    def owner_season_complete(self,season_id):
+        session=require_overall_owner(self)
+        if not session:return
+        try:
+            with LOCK,db() as c:
+                history=state_get(c,'seasonHistory',[]) or []
+                existing=next((item for item in history if isinstance(item,dict) and str(item.get('seasonId'))==season_id),None)
+                if existing:return json_response(self,{'history':safe_owner_tournament_value(c,existing),'alreadyCompleted':True})
+                current=state_get(c,'currentSeason',None)
+                if not isinstance(current,dict) or str(current.get('id'))!=season_id:return json_response(self,{'error':'Active season not found.'},404)
+                leaderboard=self._owner_leaderboard(c)
+                completed_at=now_iso();snapshot={
+                    'id':'SH'+secrets.token_hex(7),'seasonId':season_id,'name':str(current.get('name','')),
+                    'startedAt':current.get('startedAt'),'completedAt':completed_at,
+                    'leaderboard':[dict(item) for item in leaderboard],
+                }
+                if current.get('requestId'):snapshot['requestId']=current['requestId']
+                history.append(snapshot)
+                hall=state_get(c,'seasonHallOfFame',[]) or []
+                if leaderboard:
+                    winner=leaderboard[0]
+                    hall.append({'id':'SF'+secrets.token_hex(7),'seasonId':season_id,'seasonName':snapshot['name'],'accountId':winner['accountId'],'ign':winner['ign'],'points':winner['points'],'completedAt':completed_at})
+                state_set(c,'seasonHistory',history);state_set(c,'seasonHallOfFame',hall);state_set(c,'currentSeason',None)
+                create_owner_notification(c,session,'owner_season_complete','season',season_id,'Season completed','An Overall Owner completed the current season.','community')
+                insert_audit(c,session,'owner_season_complete','season',season_id,{'leaderboardSize':len(leaderboard)})
+                c.commit();safe=safe_owner_tournament_value(c,snapshot)
+        except Exception:
+            logging.exception('Owner season completion failed.')
+            return json_response(self,{'error':'The season could not be completed.'},503)
+        return json_response(self,{'history':safe,'alreadyCompleted':False})
+
+    def owner_history(self):
+        session=require_overall_owner(self)
+        if not session:return
+        with LOCK,db() as c:
+            result={key:safe_owner_tournament_value(c,state_get(c,key,[]) or []) for key in ('seasonHistory','seasonHallOfFame','hallOfFame')}
+        return json_response(self,result)
+
+    def owner_history_correct(self,domain,entry_id):
+        session=require_overall_owner(self)
+        if not session:return
+        domains={'hall-of-fame':('hallOfFame',{'title','champion','runnerUp','date'}),'season-hall-of-fame':('seasonHallOfFame',{'seasonName','accountId','ign','points'})}
+        if domain not in domains:return json_response(self,{'error':'Unsupported history domain.'},400)
+        data=read_json(self);reason=data.get('reason')
+        if not isinstance(reason,str) or not reason.strip() or len(reason.strip())>500:return json_response(self,{'error':'A correction reason is required.'},400)
+        state_key,allowed=domains[domain];changes={key:value for key,value in data.items() if key!='reason'}
+        if not changes or set(changes)-allowed:return json_response(self,{'error':'Unsupported history correction field.'},400)
+        if any(isinstance(value,(dict,list)) or value is None for value in changes.values()):return json_response(self,{'error':'History correction values must be scalar.'},400)
+        if 'points' in changes and (isinstance(changes['points'],bool) or not isinstance(changes['points'],int) or changes['points']<0):return json_response(self,{'error':'points must be a non-negative integer.'},400)
+        try:
+            with LOCK,db() as c:
+                items=state_get(c,state_key,[]) or [];entry=next((item for item in items if isinstance(item,dict) and str(item.get('id'))==entry_id),None)
+                if not entry:return json_response(self,{'error':'History entry not found.'},404)
+                before={key:entry.get(key) for key in changes};entry.update(changes);entry['correctedAt']=now_iso();entry['correctedBy']=str(session.get('id'))
+                state_set(c,state_key,items)
+                insert_audit(c,session,'owner_hall_of_fame_correct','history',entry_id,{'domain':domain,'before':before,'changes':changes,'reason':reason.strip()})
+                c.commit();safe=safe_owner_tournament_value(c,entry)
+        except Exception:
+            logging.exception('Owner history correction failed.')
+            return json_response(self,{'error':'The history correction could not be saved.'},503)
+        return json_response(self,{'entry':safe})
+
+    def owner_events(self):
+        session=require_overall_owner(self)
+        if not session:return
+        with LOCK,db() as c:
+            events=state_get(c,'events',[]) or [];participation=state_get(c,'eventParticipation',[]) or []
+            safe_events=safe_owner_tournament_value(c,events);safe_participation=safe_owner_tournament_value(c,participation)
+        return json_response(self,{'events':safe_events,'participation':safe_participation})
+
+    def _owner_event_values(self,data,existing=None):
+        existing=existing if isinstance(existing,dict) else {};allowed={'title','date','time','description','rules','rewardPoints'}
+        if set(data)-allowed:return None,'Unsupported event field.'
+        item=dict(existing)
+        for key,limit in (('title',180),('description',8000),('rules',8000)):
+            if key in data:
+                if not isinstance(data[key],str) or not data[key].strip() or len(data[key].strip())>limit:return None,f'{key} must be valid text.'
+                item[key]=data[key].strip()
+        if 'date' in data:
+            if not isinstance(data['date'],str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',data['date']):return None,'date must use YYYY-MM-DD.'
+            item['date']=data['date']
+        if 'time' in data:
+            if not isinstance(data['time'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',data['time']):return None,'time must use HH:MM.'
+            item['time']=data['time']
+        if 'rewardPoints' in data:
+            value=data['rewardPoints']
+            if isinstance(value,bool) or not isinstance(value,int) or value<0 or value>1000000:return None,'rewardPoints must be a non-negative integer.'
+            item['rewardPoints']=value
+        if not existing and (not item.get('title') or not item.get('date')):return None,'title and date are required.'
+        item.setdefault('rewardPoints',0)
+        return item,None
+
+    def owner_event_create(self):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self);request_id=data.pop('requestId',None)
+        if request_id is not None and (not isinstance(request_id,str) or not request_id.strip() or len(request_id)>120):return json_response(self,{'error':'requestId must be a valid identifier.'},400)
+        values,error=self._owner_event_values(data)
+        if error:return json_response(self,{'error':error},400)
+        event={**values,'id':'E'+secrets.token_hex(7),'status':'Draft','createdAt':now_iso(),'createdBy':str(session.get('id'))}
+        if request_id:event['requestId']=request_id.strip()
+        try:
+            with LOCK,db() as c:
+                events=state_get(c,'events',[]) or []
+                existing=next((item for item in events if isinstance(item,dict) and request_id and item.get('requestId')==request_id.strip()),None)
+                if existing:return json_response(self,{'event':safe_owner_tournament_value(c,existing)},200)
+                events.append(event);state_set(c,'events',events)
+                insert_audit(c,session,'owner_event_create','event',event['id'],{'title':event['title']});c.commit();safe=safe_owner_tournament_value(c,event)
+        except Exception:
+            logging.exception('Owner event creation failed.');return json_response(self,{'error':'The event could not be created.'},503)
+        return json_response(self,{'event':safe},201)
+
+    def owner_event_update(self,event_id):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self)
+        try:
+            with LOCK,db() as c:
+                events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
+                if not event:return json_response(self,{'error':'Event not found.'},404)
+                if event.get('status') in ('Closed','Archived'):return json_response(self,{'error':'Event cannot be edited in its current state.'},409)
+                values,error=self._owner_event_values(data,event)
+                if error:return json_response(self,{'error':error},400)
+                event.update(values,updatedAt=now_iso(),updatedBy=str(session.get('id')));state_set(c,'events',events)
+                insert_audit(c,session,'owner_event_update','event',event_id,{'fields':sorted(data)});c.commit();safe=safe_owner_tournament_value(c,event)
+        except Exception:
+            logging.exception('Owner event update failed.');return json_response(self,{'error':'The event could not be updated.'},503)
+        return json_response(self,{'event':safe})
+
+    def owner_event_transition(self,event_id,action):
+        session=require_overall_owner(self)
+        if not session:return
+        transitions={'publish':('Draft','Published'),'close':('Published','Closed'),'archive':('Closed','Archived')}
+        before,after=transitions[action]
+        try:
+            with LOCK,db() as c:
+                events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
+                if not event:return json_response(self,{'error':'Event not found.'},404)
+                if event.get('status')!=before:return json_response(self,{'error':'Event cannot make that transition.'},409)
+                event['status']=after;event[action+'edAt' if action!='close' else 'closedAt']=now_iso();state_set(c,'events',events)
+                create_owner_notification(c,session,'owner_event_'+action,'event',event_id,f'Event {after.lower()}',f'An Overall Owner {action}ed an event.','community')
+                insert_audit(c,session,'owner_event_'+action,'event',event_id,{'status':after});c.commit();safe=safe_owner_tournament_value(c,event)
+        except Exception:
+            logging.exception('Owner event transition failed.');return json_response(self,{'error':'The event transition could not be saved.'},503)
+        return json_response(self,{'event':safe})
+
+    def owner_event_participation(self,event_id):
+        session=require_overall_owner(self)
+        if not session:return
+        account_id=str(read_json(self).get('accountId','')).strip()
+        if not account_id:return json_response(self,{'error':'A Community account id is required.'},400)
+        try:
+            with LOCK,db() as c:
+                events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
+                if not event:return json_response(self,{'error':'Event not found.'},404)
+                if event.get('status')!='Published':return json_response(self,{'error':'Participation is only available for published events.'},409)
+                account=c.execute("SELECT id FROM community_accounts WHERE id=? AND status='Active'",(account_id,)).fetchone()
+                if not account:return json_response(self,{'error':'Active Community account not found.'},404)
+                current=state_get(c,'currentSeason',None);season_id=str(current.get('id')) if isinstance(current,dict) else ''
+                items=state_get(c,'eventParticipation',[]) or []
+                existing=next((item for item in items if isinstance(item,dict) and str(item.get('eventId'))==event_id and str(item.get('accountId'))==account_id and str(item.get('seasonId',''))==season_id),None)
+                if existing:return json_response(self,{'participation':safe_owner_tournament_value(c,existing),'pointsAwarded':0,'created':False})
+                reward=int(event.get('rewardPoints',0) or 0);record={'id':'EP'+secrets.token_hex(7),'eventId':event_id,'accountId':account_id,'seasonId':season_id,'pointsAwarded':reward,'createdAt':now_iso(),'createdBy':str(session.get('id'))}
+                items.append(record);points=state_get(c,'seasonPoints',{}) or {};points[account_id]=int(points.get(account_id,0) or 0)+reward
+                state_set(c,'eventParticipation',items);state_set(c,'seasonPoints',points)
+                create_owner_notification(c,session,'owner_event_participation','event',event_id,'Event participation recorded','An Overall Owner recorded your event participation.','community',account_id)
+                insert_audit(c,session,'owner_event_participation','event',event_id,{'accountId':account_id,'pointsAwarded':reward,'seasonId':season_id});c.commit();safe=safe_owner_tournament_value(c,record)
+        except Exception:
+            logging.exception('Owner event participation failed.');return json_response(self,{'error':'Event participation could not be recorded.'},503)
+        return json_response(self,{'participation':safe,'pointsAwarded':reward,'created':True},201)
 
     def owner_tournaments_list(self):
         session=require_overall_owner(self)
@@ -1966,7 +2264,8 @@ class Handler(BaseHTTPRequestHandler):
                     tournament.update(matches=matches,bracketReady=True,registrationOpen=False,squadRegistrationOpen=False,status='In Progress',bracketGeneratedAt=now_iso(),bracketGeneratedBy=str(session.get('id')))
                     audit_action='owner_tournament_bracket_generate';title='Tournament bracket generated'
                 elif action=='complete':
-                    if status!='inprogress' or not tournament.get('bracketReady'):return json_response(self,{'error':'Tournament cannot be completed in its current state.'},409)
+                    if status not in ('inprogress','completed') or not tournament.get('bracketReady'):return json_response(self,{'error':'Tournament cannot be completed in its current state.'},409)
+                    if status=='completed' and tournament.get('ownerCompletionReviewed'):return json_response(self,{'error':'Tournament completion was already reviewed.'},409)
                     matches=tournament.get('matches') or []
                     if any(match.get('player1') and match.get('player2') and not match.get('winner') for match in matches if isinstance(match,dict)):
                         return json_response(self,{'error':'Every played match must have a confirmed result.'},409)
@@ -1974,10 +2273,13 @@ class Handler(BaseHTTPRequestHandler):
                     final=next((match for match in reversed(matches) if isinstance(match,dict) and int(match.get('round') or 1)==final_round and match.get('winner')),None)
                     if not final:return json_response(self,{'error':'A confirmed final result is required.'},409)
                     runner_up=final.get('player2') if str(final.get('winner'))==str(final.get('player1')) else final.get('player1')
-                    tournament.update(status='Completed',completed=True,registrationOpen=False,squadRegistrationOpen=False,champion=final.get('winner'),runnerUp=runner_up,completedAt=now_iso(),completedBy=str(session.get('id')))
+                    tournament.update(status='Completed',completed=True,ownerCompletionReviewed=True,registrationOpen=False,squadRegistrationOpen=False,champion=final.get('winner'),runnerUp=runner_up,completedAt=tournament.get('completedAt') or now_iso(),completedBy=str(session.get('id')))
                     hall=state_get(c,'hallOfFame',[]) or []
-                    if not any(isinstance(item,dict) and str(item.get('tournamentId'))==tournament_id for item in hall):
-                        hall.append({'id':'H'+secrets.token_hex(6),'tournamentId':tournament_id,'title':tournament.get('title'),'champion':tournament.get('champion'),'runnerUp':runner_up,'date':tournament.get('date'),'completedAt':tournament.get('completedAt')});state_set(c,'hallOfFame',hall)
+                    history=next((item for item in hall if isinstance(item,dict) and str(item.get('tournamentId'))==tournament_id),None)
+                    history_values={'tournamentId':tournament_id,'title':tournament.get('title'),'champion':tournament.get('champion'),'runnerUp':runner_up,'date':tournament.get('date'),'completedAt':tournament.get('completedAt')}
+                    if history:history.update(history_values)
+                    else:hall.append({'id':'H'+secrets.token_hex(6),**history_values})
+                    state_set(c,'hallOfFame',hall)
                     audit_action='owner_tournament_complete';title='Tournament completed'
                 elif action=='archive':
                     if status!='completed':return json_response(self,{'error':'Only a completed tournament can be archived.'},409)
@@ -1985,7 +2287,7 @@ class Handler(BaseHTTPRequestHandler):
                     audit_action='owner_tournament_archive';title='Tournament archived'
                 elif action=='cancel':
                     if status not in ('open','inprogress'):return json_response(self,{'error':'Tournament cannot be cancelled in its current state.'},409)
-                    tournament.update(statusBeforeCancellation=tournament.get('status'),registrationOpenBeforeCancellation=bool(tournament.get('registrationOpen')),status='Cancelled',registrationOpen=False,squadRegistrationOpen=False,cancelledAt=now_iso(),cancelledBy=str(session.get('id')))
+                    tournament.update(statusBeforeCancellation=tournament.get('status'),registrationOpenBeforeCancellation=bool(tournament.get('registrationOpen')),squadRegistrationOpenBeforeCancellation=bool(tournament.get('squadRegistrationOpen')),status='Cancelled',registrationOpen=False,squadRegistrationOpen=False,cancelledAt=now_iso(),cancelledBy=str(session.get('id')))
                     registrations=state_get(c,'registrations',[])
                     for registration in registrations:
                         if not isinstance(registration,dict) or str(registration.get('tournamentId'))!=tournament_id:continue
@@ -2006,7 +2308,8 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:return json_response(self,{'error':'The reinstatement window has expired.'},409)
                     if time.time()-cancelled>1800:return json_response(self,{'error':'The reinstatement window has expired.'},409)
                     tournament.update(status=tournament.get('statusBeforeCancellation') or 'Open',registrationOpen=bool(tournament.get('registrationOpenBeforeCancellation')),cancelledAt=None,cancelledBy=None)
-                    if tournament.get('format')=='Squad vs Squad' and not tournament.get('bracketReady'):tournament['squadRegistrationOpen']=tournament['registrationOpen']
+                    if tournament.get('format')=='Squad vs Squad' and not tournament.get('bracketReady'):
+                        tournament['squadRegistrationOpen']=bool(tournament.get('squadRegistrationOpenBeforeCancellation'))
                     registrations=state_get(c,'registrations',[])
                     for registration in registrations:
                         if not isinstance(registration,dict) or str(registration.get('tournamentId'))!=tournament_id:continue
@@ -2046,6 +2349,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     data=read_json(self);allowed=('scheduledAt','venue','streamUrl','status')
                     if not data or set(data)-set(allowed):return json_response(self,{'error':'Unsupported match field.'},400)
+                    if 'status' in data and data['status'] not in OWNER_MATCH_STATUSES:return json_response(self,{'error':'Match status is invalid.'},400)
                     for key,value in data.items():
                         if not isinstance(value,str) or len(value.strip())>500:return json_response(self,{'error':f'{key} must be bounded text.'},400)
                         match[key]=value.strip()
@@ -2059,6 +2363,43 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self,{'error':'The match change could not be saved.'},503)
         return json_response(self,{'ok':True,'match':safe})
 
+    def owner_tournament_match_create(self,tournament_id):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self);allowed={'id','player1','player2','round','number','scheduledAt','venue','streamUrl','status'}
+        if set(data)-allowed:return json_response(self,{'error':'Unsupported match field.'},400)
+        player1=str(data.get('player1','')).strip();player2=str(data.get('player2','')).strip()
+        if not player1 or not player2 or player1==player2:return json_response(self,{'error':'Two distinct registered participants are required.'},400)
+        round_number=data.get('round',1);match_number=data.get('number')
+        if isinstance(round_number,bool) or not isinstance(round_number,int) or round_number<1:return json_response(self,{'error':'round must be a positive integer.'},400)
+        if match_number is not None and (isinstance(match_number,bool) or not isinstance(match_number,int) or match_number<1):return json_response(self,{'error':'number must be a positive integer.'},400)
+        for key in ('scheduledAt','venue','streamUrl','status'):
+            if key in data and (not isinstance(data[key],str) or len(data[key].strip())>500):return json_response(self,{'error':f'{key} must be bounded text.'},400)
+        if 'status' in data and data['status'] not in OWNER_MATCH_STATUSES:return json_response(self,{'error':'Match status is invalid.'},400)
+        requested_id=str(data.get('id','')).strip()
+        if requested_id and not OWNER_CONTENT_ID.fullmatch(requested_id):return json_response(self,{'error':'Match id is invalid.'},400)
+        try:
+            with LOCK,db() as c:
+                tournaments=state_get(c,'tournaments',[]);tournament=owner_tournament_by_id(tournaments,tournament_id)
+                if not tournament:return json_response(self,{'error':'Tournament not found.'},404)
+                if overview_status(tournament.get('status'))!='inprogress':return json_response(self,{'error':'Matches can only be created while a tournament is in progress.'},409)
+                eligible={str(item.get('accountId')) for item in state_get(c,'registrations',[]) if isinstance(item,dict) and str(item.get('tournamentId'))==tournament_id and overview_status(item.get('status')) in ('registered','approved')}
+                if player1 not in eligible or player2 not in eligible:return json_response(self,{'error':'Match participants must have eligible tournament registrations.'},400)
+                matches=tournament.get('matches') if isinstance(tournament.get('matches'),list) else []
+                match_id=requested_id or f'{tournament_id}-M-{secrets.token_hex(4)}'
+                if owner_tournament_by_id(matches,match_id):return json_response(self,{'error':'Match already exists.'},409)
+                match={'id':match_id,'round':round_number,'number':match_number or (max((int(item.get('number') or 0) for item in matches if isinstance(item,dict)),default=0)+1),'player1':player1,'player2':player2,'winner':None,'submission':None,'createdAt':now_iso(),'createdBy':str(session.get('id'))}
+                for key in ('scheduledAt','venue','streamUrl','status'):
+                    if key in data:match[key]=data[key].strip()
+                matches.append(match);tournament['matches']=matches;state_set(c,'tournaments',tournaments)
+                create_owner_notification(c,session,'owner_tournament_match_create','match',match_id,'Tournament match created','An Overall Owner created a tournament match.','community')
+                insert_audit(c,session,'owner_tournament_match_create','match',match_id,{'tournamentId':tournament_id})
+                c.commit();safe=safe_owner_tournament_value(c,match)
+        except Exception:
+            logging.exception('Owner tournament match creation failed.')
+            return json_response(self,{'error':'The match could not be created.'},503)
+        return json_response(self,{'match':safe},201)
+
     def owner_tournament_result_change(self,tournament_id,match_id):
         session=require_overall_owner(self)
         if not session:return
@@ -2068,18 +2409,20 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK,db() as c:
                 tournaments=state_get(c,'tournaments',[]);tournament=owner_tournament_by_id(tournaments,tournament_id)
                 if not tournament:return json_response(self,{'error':'Tournament not found.'},404)
-                if overview_status(tournament.get('status'))!='inprogress':return json_response(self,{'error':'Results can only change while a tournament is in progress.'},409)
+                tournament_status=overview_status(tournament.get('status'))
+                if tournament_status not in ('inprogress','completed') or (tournament_status=='completed' and action!='correct'):
+                    return json_response(self,{'error':'Results cannot make that transition in the current tournament state.'},409)
                 match=owner_tournament_by_id(tournament.get('matches') or [],match_id)
                 if not match:return json_response(self,{'error':'Match not found.'},404)
                 submission=match.get('submission')
                 if action=='confirm':
-                    if not isinstance(submission,dict) or overview_status(submission.get('status')) not in ('awaitingconfirmation','disputed') or match.get('winner'):
+                    if not isinstance(submission,dict) or overview_status(submission.get('status'))!='awaitingconfirmation' or match.get('winner'):
                         return json_response(self,{'error':'The result is not awaiting confirmation.'},409)
                     winner=str(submission.get('winner',''))
                 elif action=='reject':
                     if not isinstance(submission,dict) or overview_status(submission.get('status')) not in ('awaitingconfirmation','disputed'):
                         return json_response(self,{'error':'The result is not open for rejection.'},409)
-                    submission.update(status='Rejected',reviewedAt=now_iso(),reviewedBy=str(session.get('id')));match['submission']=submission
+                    match['submission']=None
                     winner='';audit_action='owner_tournament_result_reject'
                 else:
                     if action=='resolve' and (not isinstance(submission,dict) or overview_status(submission.get('status'))!='disputed'):
@@ -2090,6 +2433,9 @@ class Handler(BaseHTTPRequestHandler):
                 if action!='reject':
                     participants={str(match.get('player1')),str(match.get('player2'))}
                     if winner not in participants:return json_response(self,{'error':'Winner must be a match participant.'},400)
+                    target=owner_tournament_by_id(tournament.get('matches') or [],match.get('nextMatchId'))
+                    if action=='correct' and target and (target.get('winner') or target.get('submission') or target.get('result') or target.get('pointsAwarded')):
+                        return json_response(self,{'error':'An upstream result cannot be corrected after downstream result activity.'},409)
                     previous=str(match.get('winner') or '');points=state_get(c,'seasonPoints',{}) or {}
                     if match.get('pointsAwarded') and previous:
                         old_loser=str(match.get('player2')) if previous==str(match.get('player1')) else str(match.get('player1'))
@@ -2104,11 +2450,13 @@ class Handler(BaseHTTPRequestHandler):
                     submission.update(winner=winner,status='Owner Confirmed' if action=='confirm' else 'Owner Corrected',reviewedAt=now_iso(),reviewedBy=str(session.get('id')))
                     if action in ('correct','resolve'):submission['reviewReason']=str(data.get('reason')).strip()
                     match['submission']=submission
-                    target=owner_tournament_by_id(tournament.get('matches') or [],match.get('nextMatchId'))
                     if target:
                         slot=match.get('nextSlot') if match.get('nextSlot') in ('player1','player2') else ('player1' if not target.get('player1') else 'player2')
                         if previous and target.get(slot)==previous and previous!=winner:target[slot]=winner
                         elif not target.get(slot):target[slot]=winner
+                    final_round=max((int(item.get('round') or 1) for item in tournament.get('matches',[]) if isinstance(item,dict)),default=0)
+                    if tournament_status=='completed' and int(match.get('round') or 1)==final_round:
+                        tournament['champion']=winner;tournament['runnerUp']=loser
                     audit_action='owner_tournament_result_'+action
                 state_set(c,'tournaments',tournaments)
                 create_owner_notification(c,session,audit_action,'match',match_id,'Tournament result reviewed','An Overall Owner reviewed a tournament result.','community')
@@ -2153,6 +2501,8 @@ class Handler(BaseHTTPRequestHandler):
                     for old in former: revoke_user_sessions(c,'squad',old['id'])
                 elif role != row['role']:
                     revoke_user_sessions(c,'squad',mid)
+                if role not in ('Squad Leader','Assistant Squad Leader'):
+                    remove_tournament_manager_permission(c,mid)
                 c.execute('UPDATE squad_members SET role=? WHERE id=?',(role,mid))
                 row=c.execute('SELECT * FROM squad_members WHERE id=?',(mid,)).fetchone()
                 if s.get('type') == 'owner' and s.get('role') == 'Overall Owner':
@@ -2442,6 +2792,8 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
                 if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated'] or vals['accessCode'] != str(row['access_code']).upper():
                     revoke_user_sessions(c,'squad',mid)
+                if vals['role'] not in ('Squad Leader','Assistant Squad Leader') or vals['status']=='Disabled' or not vals['accountActivated']:
+                    remove_tournament_manager_permission(c,mid)
                 row=c.execute('SELECT * FROM squad_members WHERE id=?',(mid,)).fetchone()
                 insert_audit(c,s,'member_update','squad_member',mid,{'role':vals['role'],'status':vals['status']})
                 c.commit()
@@ -2465,6 +2817,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not row:return json_response(self,{'error':'Member not found.'},404)
                 if row['role']=='Squad Owner':return json_response(self,{'error':'Appoint a replacement before removing the active Squad Owner.'},409)
                 revoke_user_sessions(c,'squad',mid)
+                remove_tournament_manager_permission(c,mid)
                 c.execute('DELETE FROM squad_members WHERE id=?',(mid,))
                 insert_audit(c,s,'member_delete','squad_member',mid)
                 c.commit()
@@ -2856,6 +3209,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,status=?,last_login=?,profile_complete=?,account_activated=? WHERE id=?',values)
                     if values[8]=='Disabled' or not values[11]:
                         revoke_user_sessions(c,'squad',values[12])
+                        remove_tournament_manager_permission(c,values[12])
             if role=='Squad Owner':
                 for member_id in (squad.get('__deletedMemberIds') or []):
                     row=c.execute('SELECT role FROM squad_members WHERE id=?',(str(member_id),)).fetchone()
@@ -2863,6 +3217,7 @@ class Handler(BaseHTTPRequestHandler):
                         return reject_sync('Appoint a replacement before removing the active Squad Owner.',409)
                     if row:
                         revoke_user_sessions(c,'squad',member_id)
+                        remove_tournament_manager_permission(c,member_id)
                         c.execute('DELETE FROM squad_members WHERE id=?',(str(member_id),))
             c.commit()
         self.audit(s,'legacy_state_sync','state','global',{'domains':list(squad.keys())+list(community.keys())})
