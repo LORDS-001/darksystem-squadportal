@@ -209,6 +209,12 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(login.status_code, 200)
                 owner_cookie = login.headers["set-cookie"].split(";", 1)[0]
+                second_login = self.request(
+                    "POST", "/api/owner/login",
+                    {"username": winner["username"], "password": winner["password"]},
+                )
+                self.assertEqual(second_login.status_code, 200)
+                copied_owner_cookie = second_login.headers["set-cookie"].split(";", 1)[0]
 
                 overview = self.request(
                     "GET", "/api/owner/overview", cookie=owner_cookie
@@ -282,6 +288,11 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     "POST", f"/api/owner/events/{event_id}/participation",
                     {"accountId": account_id}, owner_cookie,
                 ).status_code, 201)
+                corrected_points = self.request(
+                    "PATCH", f"/api/owner/season-points/{account_id}",
+                    {"points": 15, "reason": "PostgreSQL transaction gate"}, owner_cookie,
+                )
+                self.assertEqual(corrected_points.status_code, 200)
 
                 tournament_response = self.request(
                     "POST", "/api/owner/tournaments",
@@ -308,7 +319,16 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                 ).status_code, 200)
                 history = self.request("GET", "/api/owner/history", cookie=owner_cookie)
                 self.assertEqual(history.status_code, 200)
-                self.assertTrue(json.loads(history.body)["seasonHallOfFame"])
+                season_hall = json.loads(history.body)["seasonHallOfFame"]
+                self.assertTrue(season_hall)
+                corrected_history = self.request(
+                    "PATCH",
+                    f"/api/owner/history/season-hall-of-fame/{season_hall[0]['id']}",
+                    {"points": 16, "reason": "Verified PostgreSQL history correction"},
+                    owner_cookie,
+                )
+                self.assertEqual(corrected_history.status_code, 200)
+                self.assertEqual(json.loads(corrected_history.body)["entry"]["points"], 16)
                 self.assertEqual(
                     self.request("GET", "/api/owner/audit?limit=100", cookie=owner_cookie).status_code,
                     200,
@@ -317,6 +337,20 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     self.request("GET", "/api/owner/settings", cookie=owner_cookie).status_code,
                     200,
                 )
+                changed_settings = self.request(
+                    "PATCH", "/api/owner/settings",
+                    {
+                        "currentPassword": winner["password"],
+                        "newPassword": "postgres-owner-password-456",
+                    }, owner_cookie,
+                )
+                self.assertEqual(changed_settings.status_code, 200)
+                self.assertTrue(json.loads(self.request(
+                    "GET", "/api/auth/me", cookie=owner_cookie,
+                ).body)["authenticated"])
+                self.assertFalse(json.loads(self.request(
+                    "GET", "/api/auth/me", cookie=copied_owner_cookie,
+                ).body)["authenticated"])
 
                 logout = self.request("POST", "/api/logout", cookie=owner_cookie)
                 self.assertEqual(logout.status_code, 200)
@@ -340,7 +374,7 @@ class OwnerPostgreSQLIntegrationTests(unittest.TestCase):
                     connection.commit()
                 self.assertEqual(
                     audit_counts,
-                    {"owner_setup": 1, "owner_login": 1, "owner_logout": 1},
+                    {"owner_setup": 1, "owner_login": 2, "owner_logout": 1},
                 )
 
                 credentials = {

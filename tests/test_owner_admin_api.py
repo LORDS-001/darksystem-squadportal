@@ -2425,20 +2425,60 @@ class OwnerCompleteLifecycleAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.request("GET", "/api/auth/me", cookie=copied_cookie).json["authenticated"])
         self.assertEqual(self.request("POST", "/api/logout", cookie=first_cookie).status, 200)
 
-        protected_reads = (
-            "/api/owner/overview", "/api/owner/squad-members",
-            "/api/owner/community-accounts", "/api/owner/squad-content?domain=announcements",
-            "/api/owner/tournaments", "/api/owner/seasons", "/api/owner/events",
-            "/api/owner/history", "/api/owner/audit", "/api/owner/settings",
+        protected_routes = (
+            ("GET", "/api/owner/overview", None),
+            ("GET", "/api/owner/audit", None),
+            ("GET", "/api/owner/settings", None),
+            ("PATCH", "/api/owner/settings", {"currentPassword": "irrelevant", "newPassword": "irrelevant-password"}),
+            ("GET", "/api/owner/squad-content?domain=announcements", None),
+            ("POST", "/api/owner/squad-content/announcements/stale", {"title": "Stale", "body": "Rejected"}),
+            ("PATCH", "/api/owner/squad-content/announcements/stale", {"title": "Stale", "body": "Rejected"}),
+            ("DELETE", "/api/owner/squad-content/announcements/stale", {}),
+            ("GET", "/api/owner/squad-members", None),
+            ("POST", "/api/owner/squad-members", {"email": "stale@example.test"}),
+            ("PATCH", "/api/owner/squad-members/stale", {"status": "Disabled"}),
+            ("DELETE", "/api/owner/squad-members/stale", {}),
+            ("POST", "/api/owner/squad-owner", {"memberId": "stale"}),
+            ("GET", "/api/owner/community-accounts", None),
+            ("PATCH", "/api/owner/community-accounts/stale", {"status": "Disabled"}),
+            ("GET", "/api/owner/tournaments", None),
+            ("POST", "/api/owner/tournaments", {"title": "Stale"}),
+            ("GET", "/api/owner/tournaments/stale", None),
+            ("PATCH", "/api/owner/tournaments/stale", {"reward": "Stale"}),
+            ("POST", "/api/owner/tournaments/stale/matches", {}),
+            ("POST", "/api/owner/tournaments/stale/cancel", {}),
+            ("POST", "/api/owner/tournaments/stale/reinstate", {}),
+            ("POST", "/api/owner/tournaments/stale/bracket", {}),
+            ("POST", "/api/owner/tournaments/stale/complete", {}),
+            ("POST", "/api/owner/tournaments/stale/archive", {}),
+            ("POST", "/api/owner/tournaments/stale/registrations/stale/decision", {"action": "reject"}),
+            ("POST", "/api/owner/tournaments/stale/approvals/stale/decision", {"action": "reject"}),
+            ("PATCH", "/api/owner/tournaments/stale/matches/stale", {"scheduledAt": "2099-01-01T00:00:00Z"}),
+            ("DELETE", "/api/owner/tournaments/stale/matches/stale", {}),
+            ("POST", "/api/owner/tournaments/stale/matches/stale/result", {"action": "reject", "reason": "Stale"}),
+            ("POST", "/api/owner/tournament-managers/stale/grant", {}),
+            ("GET", "/api/owner/seasons", None),
+            ("POST", "/api/owner/seasons", {"name": "Stale"}),
+            ("POST", "/api/owner/seasons/stale/complete", {}),
+            ("PATCH", "/api/owner/season-points/stale", {"points": 1, "reason": "Stale"}),
+            ("GET", "/api/owner/history", None),
+            ("PATCH", "/api/owner/history/season-hall-of-fame/stale", {"points": 1, "reason": "Stale"}),
+            ("GET", "/api/owner/events", None),
+            ("POST", "/api/owner/events", {"title": "Stale", "date": "2099-01-01"}),
+            ("PATCH", "/api/owner/events/stale", {"title": "Stale"}),
+            ("POST", "/api/owner/events/stale/publish", {}),
+            ("POST", "/api/owner/events/stale/close", {}),
+            ("POST", "/api/owner/events/stale/archive", {}),
+            ("POST", "/api/owner/events/stale/participation", {"accountId": "stale"}),
         )
         for stale_cookie in (first_cookie, copied_cookie):
             self.assertEqual(
                 self.request("GET", "/api/auth/me", cookie=stale_cookie).json,
                 {"authenticated": False, "session": None},
             )
-            for path in protected_reads:
-                with self.subTest(cookie=stale_cookie, path=path):
-                    self.assertEqual(self.request("GET", path, cookie=stale_cookie).status, 401)
+            for method, path, payload in protected_routes:
+                with self.subTest(cookie=stale_cookie, method=method, path=path):
+                    self.assertEqual(self.request(method, path, payload, stale_cookie).status, 401)
 
 
 if __name__ == "__main__":
