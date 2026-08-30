@@ -1063,6 +1063,37 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
                 )
         self.assertIsNotNone(member["id"])
 
+    def test_squad_owner_partial_unique_index_rejects_a_second_owner(self):
+        member = self.create_member("SecondOwner", "310001", "3101")
+        with server.LOCK, server.db() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE squad_members SET role='Squad Owner' WHERE id=?", (member["id"],))
+
+    def test_rejected_state_sync_leaves_state_and_audit_unchanged(self):
+        owner_login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "DarkOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-OWNER",
+        })
+        self.assertEqual(owner_login.status, 200)
+        owner_cookie = owner_login.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            original_announcements = server.state_get(connection, "announcements", [])
+            audit_before = connection.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+        rejected = self.backend.request("PUT", "/api/state", {
+            "squad": {
+                "announcements": [{"id": "should-not-persist", "title": "Invalid sync"}],
+                "members": [{
+                    "id": "1", "name": "Dark System Owner", "ign": "DarkOwner",
+                    "gameId": "123456", "serverId": "1234", "status": "Disabled",
+                    "profileComplete": True, "accountActivated": True,
+                }],
+            },
+            "community": {},
+        }, cookie=owner_cookie)
+        self.assertEqual(rejected.status, 409)
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(server.state_get(connection, "announcements", []), original_announcements)
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"], audit_before)
+
     def test_state_sync_cannot_disable_or_deactivate_the_active_squad_owner_and_revokes_disabled_member(self):
         member = self.create_member("SyncTarget", "200001", "2001")
         member_login = self.backend.request(

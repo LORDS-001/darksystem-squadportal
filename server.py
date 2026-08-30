@@ -230,9 +230,15 @@ def init_db():
             ).fetchone()
             if duplicate:
                 raise RuntimeError(f'Cannot apply Squad identity uniqueness migration while duplicate {column} records exist.')
+        duplicate_owners = c.execute(
+            "SELECT role FROM squad_members WHERE role='Squad Owner' GROUP BY role HAVING COUNT(*)>1"
+        ).fetchone()
+        if duplicate_owners:
+            raise RuntimeError('Cannot apply Squad Owner uniqueness migration while multiple Squad Owners exist.')
         c.execute('CREATE UNIQUE INDEX IF NOT EXISTS squad_members_ign_ci_unique_idx ON squad_members(lower(ign))')
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS squad_members_game_id_unique_idx ON squad_members(game_id) WHERE game_id IS NOT NULL AND game_id<>''")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS squad_members_server_id_unique_idx ON squad_members(server_id) WHERE server_id IS NOT NULL AND server_id<>''")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS squad_members_one_owner_unique_idx ON squad_members(role) WHERE role='Squad Owner'")
         count = c.execute('SELECT COUNT(*) AS n FROM squad_members').fetchone()['n']
         if count == 0 and DEMO_DATA:
             seed = [
@@ -1922,6 +1928,9 @@ class Handler(BaseHTTPRequestHandler):
         d=read_json(self); squad=d.get('squad') or {}; community=d.get('community') or {}
         role=s.get('role','')
         with LOCK, db() as c:
+            def reject_sync(message, status):
+                c.rollback()
+                return json_response(self, {'error': message}, status)
             leadership=role in ('Squad Owner','Squad Leader','Assistant Squad Leader')
             owner=role in ('Squad Owner','Overall Owner')
             if leadership:
@@ -1962,29 +1971,29 @@ class Handler(BaseHTTPRequestHandler):
             if leadership:
                 incoming_members=squad.get('members',[])
                 if not isinstance(incoming_members,list):
-                    return json_response(self,{'error':'Squad members must be a list.'},400)
+                    return reject_sync('Squad members must be a list.',400)
                 changes=[]
                 for m in incoming_members:
                     if not isinstance(m,dict) or not m.get('id'):
-                        return json_response(self,{'error':'Each synchronized Squad member requires an object id.'},400)
+                        return reject_sync('Each synchronized Squad member requires an object id.',400)
                     member_id=str(m['id'])
                     existing=c.execute('SELECT * FROM squad_members WHERE id=?',(member_id,)).fetchone()
                     if not existing or (role!='Squad Owner' and member_id!=str(s.get('id'))):
                         continue
                     profile_complete,error=json_bool(m,'profileComplete',existing['profile_complete'])
-                    if error:return json_response(self,{'error':error},400)
+                    if error:return reject_sync(error,400)
                     account_activated,error=json_bool(m,'accountActivated',existing['account_activated'])
-                    if error:return json_response(self,{'error':error},400)
+                    if error:return reject_sync(error,400)
                     status=str(m.get('status',existing['status'])).strip()
                     if status not in SQUAD_MEMBER_STATUSES:
-                        return json_response(self,{'error':'A valid Squad status is required.'},400)
+                        return reject_sync('A valid Squad status is required.',400)
                     if existing['role']=='Squad Owner' and (status=='Disabled' or not account_activated):
-                        return json_response(self,{'error':'Appoint a replacement before changing the active Squad Owner.'},409)
+                        return reject_sync('Appoint a replacement before changing the active Squad Owner.',409)
                     values=(str(m.get('name',existing['name'])).strip(),str(m.get('ign',existing['ign'])).strip(),str(m.get('gameId',existing['game_id'])).strip(),str(m.get('serverId',existing['server_id'])).strip(),str(m.get('lane',existing['lane'] or '')).strip(),str(m.get('email',existing['email'] or '')).strip(),str(m.get('phone',existing['phone'] or '')).strip(),str(m.get('birthday',existing['birthday'] or '')).strip(),status,m.get('lastLogin',existing['last_login']),1 if profile_complete else 0,1 if account_activated else 0,member_id)
                     if not all(values[index] for index in (0,1,2,3)):
-                        return json_response(self,{'error':'Synchronized Squad identity fields cannot be empty.'},400)
+                        return reject_sync('Synchronized Squad identity fields cannot be empty.',400)
                     if identity_conflict(c,'squad_members',values[1],values[2],values[3],member_id):
-                        return json_response(self,{'error':'A Squad member already uses that IGN, Game ID, or Server ID.'},409)
+                        return reject_sync('A Squad member already uses that IGN, Game ID, or Server ID.',409)
                     changes.append((existing,values))
                 for existing,values in changes:
                     c.execute('UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,status=?,last_login=?,profile_complete=?,account_activated=? WHERE id=?',values)
@@ -1994,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
                 for member_id in (squad.get('__deletedMemberIds') or []):
                     row=c.execute('SELECT role FROM squad_members WHERE id=?',(str(member_id),)).fetchone()
                     if row and row['role']=='Squad Owner':
-                        return json_response(self,{'error':'Appoint a replacement before removing the active Squad Owner.'},409)
+                        return reject_sync('Appoint a replacement before removing the active Squad Owner.',409)
                     if row:
                         revoke_user_sessions(c,'squad',member_id)
                         c.execute('DELETE FROM squad_members WHERE id=?',(str(member_id),))
