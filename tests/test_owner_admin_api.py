@@ -70,6 +70,32 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         return response.headers["Set-Cookie"].split(";", 1)[0]
 
+    def ordinary_squad_cookie(self):
+        with server.LOCK, server.db() as connection:
+            connection.execute(
+                """INSERT INTO squad_members
+                   (id,name,ign,game_id,server_id,role,access_code,status,profile_complete,account_activated)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "ordinary-squad", "Ordinary Squad Member", "OrdinarySquad",
+                    "777777", "7777", "Squad Member", "DS-ORDINARY",
+                    "Offline", 1, 1,
+                ),
+            )
+            connection.commit()
+        response = self.backend.request(
+            "POST",
+            "/api/squad/login",
+            {
+                "ign": "OrdinarySquad",
+                "gameId": "777777",
+                "serverId": "7777",
+                "accessCode": "DS-ORDINARY",
+            },
+        )
+        self.assertEqual(response.status, 200)
+        return response.headers["Set-Cookie"].split(";", 1)[0]
+
     def test_community_registration_ignores_submitted_privileged_roles(self):
         for index, role in enumerate(
             ("Tournament Manager", "Squad Owner", "Overall Owner")
@@ -171,6 +197,78 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         serialized = json.dumps(response.json).lower()
         self.assertNotIn("community-bootstrap@example.test", serialized)
         self.assertNotIn("+234-555-0100", serialized)
+
+    def test_tournament_manager_identity_supports_string_and_legacy_dictionary_entries(self):
+        session = {"id": "delegated-manager", "role": "Squad Member"}
+
+        self.assertTrue(
+            server.tournament_manager_identity(session, ["delegated-manager"])
+        )
+        self.assertTrue(
+            server.tournament_manager_identity(
+                session, [{"id": "delegated-manager"}]
+            )
+        )
+        self.assertTrue(
+            server.tournament_manager_identity(
+                session, [{"accountId": "delegated-manager"}]
+            )
+        )
+        self.assertFalse(
+            server.tournament_manager_identity(
+                session,
+                [
+                    "different-manager",
+                    {"id": "different-legacy-manager"},
+                    {"accountId": "different-legacy-account"},
+                ],
+            )
+        )
+
+    def test_ordinary_community_and_squad_bootstrap_reject_nonmatching_string_manager(self):
+        community = self.register_community("ordinary-bootstrap@example.test")
+        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        self.setup_owner()
+        squad_cookie = self.ordinary_squad_cookie()
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournamentManagers",
+                [
+                    "different-manager",
+                    {"id": "different-legacy-manager"},
+                    {"accountId": "different-legacy-account"},
+                ],
+            )
+            server.state_set(
+                connection,
+                "tournaments",
+                [{
+                    "id": "private-workflow", "title": "Private Workflow",
+                    "leaderAccessCode": "PRIVATE-LEADER-CODE",
+                }],
+            )
+            server.state_set(
+                connection,
+                "squadTournamentApprovals",
+                [{
+                    "id": "private-approval", "tournamentId": "private-workflow",
+                    "leaderAccountId": "different-community", "status": "Approved",
+                    "memberAccessCode": "PRIVATE-MEMBER-CODE",
+                }],
+            )
+            connection.commit()
+
+        for actor, cookie in (
+            ("community", community_cookie),
+            ("squad", squad_cookie),
+        ):
+            with self.subTest(actor=actor):
+                response = self.backend.request("GET", "/api/bootstrap", cookie=cookie)
+                self.assertEqual(response.status, 200)
+                serialized = json.dumps(response.json)
+                self.assertNotIn("PRIVATE-LEADER-CODE", serialized)
+                self.assertNotIn("PRIVATE-MEMBER-CODE", serialized)
 
     def test_authenticated_bootstrap_scopes_tournament_codes_to_distributors(self):
         leader = self.register_community("approval-leader@example.test")
@@ -295,6 +393,43 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
         self.assertEqual(len(stored), 1)
         self.assertNotIn("accessCode", stored[0])
 
+    def test_expired_deadline_rejects_leader_code_when_open_flags_are_stale(self):
+        community = self.register_community("expired-leader@example.test")
+        cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournaments",
+                [{
+                    "id": "expired-squad-tournament", "title": "Expired Squad Tournament",
+                    "format": "Squad vs Squad", "status": "Open",
+                    "registrationOpen": True, "squadRegistrationOpen": True,
+                    "registrationDeadline": "2000-01-01T23:59:59Z",
+                    "squadSlots": 4, "membersPerSquad": 7,
+                    "leaderAccessCode": "EXPIRED-LEADER-CODE",
+                }],
+            )
+            connection.commit()
+
+        response = self.backend.request(
+            "POST",
+            "/api/tournaments/squad-approval",
+            {
+                "action": "submit_leader",
+                "tournamentId": "expired-squad-tournament",
+                "accessCode": "EXPIRED-LEADER-CODE",
+                "squad": {"squadName": "Late Squad", "squadId": "LATE-1"},
+            },
+            cookie=cookie,
+        )
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(response.json["error"], "Squad registration is closed.")
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(
+                server.state_get(connection, "squadTournamentApprovals", []), []
+            )
+
     def test_community_member_joins_through_server_without_downloading_approval_codes(self):
         community = self.register_community("server-member@example.test")
         cookie = community.headers["Set-Cookie"].split(";", 1)[0]
@@ -355,6 +490,49 @@ class OwnerAdministrationSecurityTests(unittest.TestCase):
             cookie=cookie,
         )
         self.assertEqual(duplicate.status, 409)
+
+    def test_expired_deadline_rejects_member_code_when_open_flags_are_stale(self):
+        community = self.register_community("expired-member@example.test")
+        cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            server.state_set(
+                connection,
+                "tournaments",
+                [{
+                    "id": "expired-squad-tournament", "title": "Expired Squad Tournament",
+                    "format": "Squad vs Squad", "status": "Open",
+                    "registrationOpen": True, "squadRegistrationOpen": True,
+                    "registrationDeadline": "2000-01-01T23:59:59Z",
+                    "membersPerSquad": 7,
+                }],
+            )
+            server.state_set(
+                connection,
+                "squadTournamentApprovals",
+                [{
+                    "id": "expired-approval", "tournamentId": "expired-squad-tournament",
+                    "status": "Approved", "squadName": "Late Squad",
+                    "squadId": "LATE-1", "leaderAccountId": "different-account",
+                    "membersPerSquad": 7, "memberAccessCode": "EXPIRED-MEMBER-CODE",
+                }],
+            )
+            connection.commit()
+
+        response = self.backend.request(
+            "POST",
+            "/api/tournaments/squad-approval",
+            {
+                "action": "join_member",
+                "tournamentId": "expired-squad-tournament",
+                "accessCode": "EXPIRED-MEMBER-CODE",
+            },
+            cookie=cookie,
+        )
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(response.json["error"], "Squad registration is closed.")
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(server.state_get(connection, "registrations", []), [])
 
     def test_legacy_state_sync_cannot_bypass_squad_member_code_validation(self):
         community = self.register_community("sync-bypass@example.test")

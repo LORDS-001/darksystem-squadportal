@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64, hashlib, hmac, json, logging, os, re, secrets, smtplib, sqlite3, threading, time
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -586,12 +587,20 @@ def tournament_manager_identity(session, managers):
     if session.get('role') in ('Overall Owner', 'Squad Owner', 'Tournament Manager'):
         return True
     session_id = str(session.get('id'))
-    return any(
-        str(item) == session_id
-        or str((item or {}).get('id')) == session_id
-        or str((item or {}).get('accountId')) == session_id
-        for item in managers
-    )
+    for item in managers if isinstance(managers, (list, tuple)) else ():
+        identities=(item.get('id'),item.get('accountId')) if isinstance(item,dict) else (item,)
+        if any(identity is not None and str(identity)==session_id for identity in identities):
+            return True
+    return False
+
+def registration_deadline_expired(value):
+    deadline=str(value or '').strip()
+    if not deadline:return False
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}',deadline):deadline=f'{deadline}T23:59:59Z'
+    try: expires_at=datetime.fromisoformat(deadline.replace('Z','+00:00'))
+    except ValueError:return True
+    if expires_at.tzinfo is None:expires_at=expires_at.replace(tzinfo=timezone.utc)
+    return expires_at.timestamp()<=time.time()
 
 def workflow_code_matches(submitted, expected):
     submitted_code = str(submitted or '').strip().upper()
@@ -1247,7 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
             if action=='submit_leader':
                 if str(t.get('format'))!='Squad vs Squad':return json_response(self,{'error':'Invalid tournament type.'},400)
-                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False or t.get('squadRegistrationOpen') is False:return json_response(self,{'error':'Squad registration is closed.'},409)
+                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False or t.get('squadRegistrationOpen') is False or registration_deadline_expired(t.get('registrationDeadline')):return json_response(self,{'error':'Squad registration is closed.'},409)
                 if not workflow_code_matches(d.get('accessCode'),t.get('leaderAccessCode')):return json_response(self,{'error':'The tournament invitation code is invalid.'},403)
                 squad=d.get('squad') or {}; leader=str(s.get('id'))
                 if not squad.get('squadName') or not squad.get('squadId'):return json_response(self,{'error':'Squad name and ID are required.'},400)
@@ -1264,7 +1273,7 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self,{'approval':a,'approvals':own_approvals},201)
             if action=='join_member':
                 if str(t.get('format'))!='Squad vs Squad':return json_response(self,{'error':'Invalid tournament type.'},400)
-                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False:return json_response(self,{'error':'Squad registration is closed.'},409)
+                if str(t.get('status','')).lower()!='open' or t.get('registrationOpen') is False or registration_deadline_expired(t.get('registrationDeadline')):return json_response(self,{'error':'Squad registration is closed.'},409)
                 a=next((item for item in approvals if str(item.get('tournamentId'))==tid and item.get('status')=='Approved' and workflow_code_matches(d.get('accessCode'),item.get('memberAccessCode'))),None)
                 if not a:return json_response(self,{'error':'The squad member access code is invalid.'},403)
                 regs=state_get(c,'registrations',[]); account_id=str(s.get('id'))
