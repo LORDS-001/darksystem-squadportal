@@ -32,6 +32,7 @@ COOKIE_NAME = 'dark_system_session'
 SESSION_TTL = 60 * 60 * 24 * 7
 RATE_LIMIT_WINDOW = 300
 RATE_LIMIT_MAX = 12
+RECOVERY_TTL = 600
 RATE_LIMITS = {}
 SQUAD_ROLES = ('Squad Owner', 'Squad Leader', 'Assistant Squad Leader', 'Squad Member')
 SQUAD_MEMBER_STATUSES = ('Online', 'Offline', 'Disabled')
@@ -66,6 +67,11 @@ PUBLIC_STATIC_FILES = {
     '/script.js': 'script.js',
     '/owner-admin.css': 'owner-admin.css',
     '/owner-admin.js': 'owner-admin.js',
+    '/owner-admin-api.js': 'owner-admin-api.js',
+    '/owner-admin-squad.js': 'owner-admin-squad.js',
+    '/owner-admin-tournaments.js': 'owner-admin-tournaments.js',
+    '/owner-admin-seasons.js': 'owner-admin-seasons.js',
+    '/owner-admin-audit.js': 'owner-admin-audit.js',
     '/assets/mlbb/birthday-mage.jpg': 'assets/mlbb/birthday-mage.jpg',
     '/assets/mlbb/bunny-gunner.jpg': 'assets/mlbb/bunny-gunner.jpg',
     '/assets/mlbb/cafe-welcome.jpg': 'assets/mlbb/cafe-welcome.jpg',
@@ -146,6 +152,20 @@ def verify_password(password, encoded):
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
+
+def hash_recovery_code(code):
+    return hash_password(str(code))
+
+def verify_recovery_code(code, encoded):
+    stored=str(encoded or '')
+    return verify_password(str(code),stored) or ('$' not in stored and hmac.compare_digest(str(code),stored))
+
+def access_code_matches(code, row):
+    submitted = str(code or '').strip().upper()
+    encoded = row['access_code_hash'] if 'access_code_hash' in row.keys() else None
+    if encoded:
+        return verify_password(submitted, encoded)
+    return workflow_code_matches(submitted, row['access_code'])
 
 def sign(value):
     sig = hmac.new(SESSION_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
@@ -229,6 +249,11 @@ def init_db():
         CREATE INDEX IF NOT EXISTS login_throttle_window_started_idx ON login_throttle(window_started);
         CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, domain TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS notification_reads (notification_id TEXT NOT NULL, recipient_type TEXT NOT NULL, recipient_id TEXT NOT NULL, read_at TEXT NOT NULL, PRIMARY KEY(notification_id,recipient_type,recipient_id));
+        CREATE TABLE IF NOT EXISTS recovery_codes (
+          id TEXT PRIMARY KEY, account_type TEXT NOT NULL, account_id TEXT NOT NULL,
+          code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS recovery_codes_account_idx ON recovery_codes(account_type,account_id,created_at);
         ''')
         if isinstance(c, PostgresCompat):
             columns = {
@@ -240,6 +265,16 @@ def init_db():
             columns = {row['name'] for row in c.execute('PRAGMA table_info(community_accounts)').fetchall()}
         if 'status' not in columns:
             c.execute("ALTER TABLE community_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
+        if isinstance(c, PostgresCompat):
+            squad_columns = {
+                row['column_name'] for row in c.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='squad_members'"
+                ).fetchall()
+            }
+        else:
+            squad_columns = {row['name'] for row in c.execute('PRAGMA table_info(squad_members)').fetchall()}
+        if 'access_code_hash' not in squad_columns:
+            c.execute("ALTER TABLE squad_members ADD COLUMN access_code_hash TEXT")
         duplicate_ign = c.execute(
             "SELECT lower(ign) FROM squad_members GROUP BY lower(ign) HAVING COUNT(*)>1 LIMIT 1"
         ).fetchone()
@@ -293,6 +328,13 @@ def state_get(c, key, default):
 
 def state_set(c, key, value):
     c.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value, separators=(',', ':'))))
+
+def lock_state_workflow(connection):
+    """Serialize app_state read/modify/write workflows across processes."""
+    if isinstance(connection, PostgresCompat):
+        connection.execute('SELECT pg_advisory_xact_lock(?)', (1146313043,))
+    else:
+        connection.execute('BEGIN IMMEDIATE')
 
 def remove_tournament_manager_permission(connection, member_id):
     member_id=str(member_id)
@@ -1104,7 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
         if path in ('/api/community/login','/api/squad/login') and method=='POST' and rate_limited(self, path):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
-        if path=='/api/community/forgot' and method=='POST' and rate_limited(self, path):
+        if path in ('/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and method=='POST' and rate_limited(self, path):
             return json_response(self, {'error':'Too many password reset requests. Please wait a few minutes and try again.'}, 429)
         if path=='/api/health': return json_response(self, {'ok':True,'service':'Dark System backend','time':now_iso()})
         if path=='/api/bootstrap' and method=='GET': return json_response(self, bootstrap(auth_from_cookie(self)))
@@ -1114,6 +1156,8 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/owner/login' and method=='POST': return self.owner_login()
         if path=='/api/owner/overview' and method=='GET': return self.owner_overview()
         if path=='/api/owner/audit' and method=='GET': return self.owner_audit()
+        if path=='/api/owner/settings' and method=='GET': return self.owner_settings()
+        if path=='/api/owner/settings' and method=='PATCH': return self.owner_settings_update()
         if path=='/api/owner/squad-content' and method=='GET': return self.owner_squad_content_list()
         if path.startswith('/api/owner/squad-content/'):
             parts = [part for part in path[len('/api/owner/squad-content/'):].split('/') if part]
@@ -1196,6 +1240,8 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/community/notifications/read' and method=='POST': return self.community_notification_read()
         if path=='/api/community/notifications/read-all' and method=='POST': return self.community_notifications_read_all()
         if path=='/api/squad/login' and method=='POST': return self.squad_login()
+        if path=='/api/squad/forgot' and method=='POST': return self.squad_forgot()
+        if path=='/api/squad/reset' and method=='POST': return self.squad_reset()
         if path=='/api/squad/notifications/read' and method=='POST': return self.squad_notification_read()
         if path=='/api/squad/notifications/read-all' and method=='POST': return self.squad_notifications_read_all()
         if path=='/api/squad/content' and method in ('POST','PUT'): return self.squad_content_write()
@@ -1380,6 +1426,32 @@ class Handler(BaseHTTPRequestHandler):
     def owner_audit(self):
         s=require_overall_owner(self)
         if not s:return
+        query=parse_qs(urlparse(self.path).query,keep_blank_values=True)
+        action=str(query.get('action',[''])[0]).strip()
+        actor=str(query.get('actor',[''])[0]).strip()
+        target=str(query.get('target',[''])[0]).strip()
+        start=str(query.get('from',[''])[0]).strip()
+        end=str(query.get('to',[''])[0]).strip()
+        cursor=str(query.get('cursor',[''])[0]).strip()
+        try:limit=int(str(query.get('limit',['50'])[0]))
+        except ValueError:return json_response(self,{'error':'limit must be a number.'},400)
+        if limit<1 or limit>100:return json_response(self,{'error':'limit must be between 1 and 100.'},400)
+        def audit_date(value,end_of_day=False):
+            if not value:return None
+            try:
+                parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+                if parsed.tzinfo is None:parsed=parsed.replace(tzinfo=timezone.utc)
+                if end_of_day and len(value)==10:parsed=parsed.replace(hour=23,minute=59,second=59)
+                return parsed.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            except ValueError:return False
+        start_value=audit_date(start);end_value=audit_date(end,True)
+        if start_value is False or end_value is False:return json_response(self,{'error':'Audit dates must be valid ISO dates.'},400)
+        cursor_values=None
+        if cursor:
+            try:
+                decoded=json.loads(base64.urlsafe_b64decode(cursor+'='*(-len(cursor)%4)).decode())
+                cursor_values=(str(decoded['createdAt']),str(decoded['id']))
+            except Exception:return json_response(self,{'error':'cursor is invalid.'},400)
         with LOCK, db() as c:
             secret_values=set()
             for query, column in (
@@ -1393,12 +1465,58 @@ class Handler(BaseHTTPRequestHandler):
             session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
             cookies=SimpleCookie(); cookies.load(request_header(self, 'Cookie'))
             if cookies.get(COOKIE_NAME): secret_values.add(cookies[COOKIE_NAME].value)
+            clauses=[];params=[]
+            if action:clauses.append('action=?');params.append(action)
+            if actor:clauses.append('(actor_id=? OR actor_role=? OR actor_type=?)');params.extend((actor,actor,actor))
+            if target:clauses.append('(target_id LIKE ? OR target_type=?)');params.extend((f'%{target}%',target))
+            if start_value:clauses.append('created_at>=?');params.append(start_value)
+            if end_value:clauses.append('created_at<=?');params.append(end_value)
+            if cursor_values:
+                clauses.append('(created_at<? OR (created_at=? AND id<?))');params.extend((cursor_values[0],cursor_values[0],cursor_values[1]))
+            where=(' WHERE '+' AND '.join(clauses)) if clauses else ''
+            fetched=c.execute(
+                'SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log'+where+' ORDER BY created_at DESC, id DESC LIMIT ?',
+                tuple(params+[limit+1]),
+            ).fetchall()
             rows=[]
-            for row in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC, id DESC LIMIT 500').fetchall():
+            for row in fetched[:limit]:
                 item=sanitize_overview_value(dict(row), secret_values, session_token_hashes)
                 item['details']=overview_details(item.get('details'), secret_values, session_token_hashes)
                 rows.append(item)
-        return json_response(self,{'audit':rows})
+            next_cursor=''
+            if len(fetched)>limit and rows:
+                marker=json.dumps({'createdAt':rows[-1]['created_at'],'id':rows[-1]['id']},separators=(',',':')).encode()
+                next_cursor=base64.urlsafe_b64encode(marker).decode().rstrip('=')
+        return json_response(self,{'audit':rows,'nextCursor':next_cursor})
+
+    def owner_settings(self):
+        session=require_overall_owner(self)
+        if not session:return
+        with LOCK,db() as c:
+            row=c.execute('SELECT username,created_at FROM owner_accounts WHERE id=?',(session['id'],)).fetchone()
+        if not row:return json_response(self,{'error':'Owner account not found.'},404)
+        return json_response(self,{'settings':{'username':row['username'],'createdAt':row['created_at'],'sessionTtlSeconds':SESSION_TTL,'recoveryCodeTtlSeconds':RECOVERY_TTL}})
+
+    def owner_settings_update(self):
+        session=require_overall_owner(self)
+        if not session:return
+        data=read_json(self);current=str(data.get('currentPassword',''));new=str(data.get('newPassword',''))
+        if len(new)<12:return json_response(self,{'error':'The new password must be at least 12 characters.'},400)
+        cookies=SimpleCookie();cookies.load(request_header(self,'Cookie'));morsel=cookies.get(COOKIE_NAME)
+        current_token_hash=session_token_hash(morsel.value) if morsel else ''
+        try:
+            with LOCK,db() as c:
+                row=c.execute('SELECT password_hash FROM owner_accounts WHERE id=?',(session['id'],)).fetchone()
+                if not row or not verify_password(current,row['password_hash']):
+                    return json_response(self,{'error':'The current password is incorrect.'},403)
+                c.execute('UPDATE owner_accounts SET password_hash=? WHERE id=?',(hash_password(new),session['id']))
+                c.execute('DELETE FROM sessions WHERE type=? AND user_id=? AND token!=?',('owner',str(session['id']),current_token_hash))
+                insert_audit(c,session,'owner_password_change','owner',session['id'],{'otherSessionsRevoked':True})
+                c.commit()
+        except Exception:
+            logging.exception('Owner settings update failed.')
+            return json_response(self,{'error':'Owner settings could not be updated.'},503)
+        return self.owner_settings()
 
     def owner_squad_content_list(self):
         session = require_overall_owner(self)
@@ -1641,7 +1759,7 @@ class Handler(BaseHTTPRequestHandler):
                     'profile_complete': 1 if profile_complete else 0,
                     'account_activated': 1 if account_activated else 0,
                 }
-                if not all(values[key] for key in ('name', 'ign', 'game_id', 'server_id', 'access_code')):
+                if not all(values[key] for key in ('name', 'ign', 'game_id', 'server_id')) or not (values['access_code'] or row['access_code_hash']):
                     return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code cannot be empty.'}, 400)
                 if values['role'] not in SQUAD_ROLES:
                     return json_response(self, {'error': 'The requested Squad role is invalid.'}, 400)
@@ -1655,14 +1773,17 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {'error': 'Use the Squad Owner appointment endpoint to appoint a Squad Owner.'}, 409)
                 if identity_conflict(c, 'squad_members', values['ign'], values['game_id'], values['server_id'], member_id):
                     return json_response(self, {'error': 'A Squad member already uses that IGN, Game ID, or Server ID.'}, 409)
+                new_access_hash=row['access_code_hash']
+                if 'accessCode' in data:
+                    new_access_hash=hash_password(values['access_code']);values['access_code']=''
                 c.execute(
-                    '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,status=?,profile_complete=?,account_activated=? WHERE id=?''',
+                    '''UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?''',
                     (values['name'], values['ign'], values['game_id'], values['server_id'], values['role'],
                      values['lane'], values['email'], values['phone'], values['birthday'], values['access_code'],
-                     values['status'], values['profile_complete'], values['account_activated'], member_id),
+                     new_access_hash,values['status'], values['profile_complete'], values['account_activated'], member_id),
                 )
                 authority_changed = values['role'] != row['role']
-                credentials_changed = values['access_code'] != str(row['access_code']).upper()
+                credentials_changed = 'accessCode' in data
                 unavailable = values['status'] == 'Disabled' or not values['account_activated']
                 if authority_changed or credentials_changed or unavailable:
                     revoke_user_sessions(c, 'squad', member_id)
@@ -1875,6 +1996,7 @@ class Handler(BaseHTTPRequestHandler):
         if request_id is not None and (not isinstance(request_id,str) or not request_id.strip() or len(request_id)>120):return json_response(self,{'error':'requestId must be a valid identifier.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 current=state_get(c,'currentSeason',None)
                 if isinstance(current,dict):
                     if request_id and current.get('requestId')==request_id.strip():
@@ -1904,8 +2026,10 @@ class Handler(BaseHTTPRequestHandler):
         if request_id is not None and (not isinstance(request_id,str) or not request_id.strip() or len(request_id)>120):return json_response(self,{'error':'requestId must be a valid identifier.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 account=c.execute('SELECT id FROM community_accounts WHERE id=?',(account_id,)).fetchone()
                 if not account:return json_response(self,{'error':'Community account not found.'},404)
+                if not isinstance(state_get(c,'currentSeason',None),dict):return json_response(self,{'error':'Season points require an active season.'},409)
                 operations=state_get(c,'ownerIdempotency',{}) or {};operation_key='season-points:'+request_id.strip() if request_id else ''
                 if operation_key and operation_key in operations:
                     stored=operations[operation_key]
@@ -1927,6 +2051,7 @@ class Handler(BaseHTTPRequestHandler):
         if not session:return
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 history=state_get(c,'seasonHistory',[]) or []
                 existing=next((item for item in history if isinstance(item,dict) and str(item.get('seasonId'))==season_id),None)
                 if existing:return json_response(self,{'history':safe_owner_tournament_value(c,existing),'alreadyCompleted':True})
@@ -1969,12 +2094,31 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(reason,str) or not reason.strip() or len(reason.strip())>500:return json_response(self,{'error':'A correction reason is required.'},400)
         state_key,allowed=domains[domain];changes={key:value for key,value in data.items() if key!='reason'}
         if not changes or set(changes)-allowed:return json_response(self,{'error':'Unsupported history correction field.'},400)
-        if any(isinstance(value,(dict,list)) or value is None for value in changes.values()):return json_response(self,{'error':'History correction values must be scalar.'},400)
-        if 'points' in changes and (isinstance(changes['points'],bool) or not isinstance(changes['points'],int) or changes['points']<0):return json_response(self,{'error':'points must be a non-negative integer.'},400)
+        text_limits={'title':200,'champion':120,'runnerUp':120,'date':10,'seasonName':120,'accountId':120,'ign':120}
+        for key,value in changes.items():
+            if key=='points':
+                if isinstance(value,bool) or not isinstance(value,int) or value<0 or value>100000000:return json_response(self,{'error':'points must be an integer between 0 and 100000000.'},400)
+            elif not isinstance(value,str) or not value.strip() or len(value.strip())>text_limits[key]:
+                return json_response(self,{'error':f'{key} must be valid bounded text.'},400)
+            else:changes[key]=value.strip()
+        if 'date' in changes:
+            try:datetime.strptime(changes['date'],'%Y-%m-%d')
+            except ValueError:return json_response(self,{'error':'date must be a valid YYYY-MM-DD date.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 items=state_get(c,state_key,[]) or [];entry=next((item for item in items if isinstance(item,dict) and str(item.get('id'))==entry_id),None)
                 if not entry:return json_response(self,{'error':'History entry not found.'},404)
+                account_fields=('champion','runnerUp') if domain=='hall-of-fame' else ('accountId',)
+                for key in account_fields:
+                    if key in changes and not c.execute('SELECT 1 FROM community_accounts WHERE id=? OR ign=?',(changes[key],changes[key])).fetchone():
+                        return json_response(self,{'error':f'{key} must identify a Community account.'},400)
+                if domain=='season-hall-of-fame' and ('accountId' in changes or 'ign' in changes):
+                    identity=str(changes.get('accountId') or entry.get('accountId') or '')
+                    account=c.execute('SELECT ign FROM community_accounts WHERE id=?',(identity,)).fetchone()
+                    if not account or ('ign' in changes and changes['ign']!=str(account['ign'])):
+                        return json_response(self,{'error':'The Hall of Fame identity must match a Community account.'},400)
+                    changes['accountId']=identity;changes['ign']=str(account['ign'])
                 before={key:entry.get(key) for key in changes};entry.update(changes);entry['correctedAt']=now_iso();entry['correctedBy']=str(session.get('id'))
                 state_set(c,state_key,items)
                 insert_audit(c,session,'owner_hall_of_fame_correct','history',entry_id,{'domain':domain,'before':before,'changes':changes,'reason':reason.strip()})
@@ -2025,6 +2169,7 @@ class Handler(BaseHTTPRequestHandler):
         if request_id:event['requestId']=request_id.strip()
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 events=state_get(c,'events',[]) or []
                 existing=next((item for item in events if isinstance(item,dict) and request_id and item.get('requestId')==request_id.strip()),None)
                 if existing:return json_response(self,{'event':safe_owner_tournament_value(c,existing)},200)
@@ -2040,6 +2185,7 @@ class Handler(BaseHTTPRequestHandler):
         data=read_json(self)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
                 if not event:return json_response(self,{'error':'Event not found.'},404)
                 if event.get('status') in ('Closed','Archived'):return json_response(self,{'error':'Event cannot be edited in its current state.'},409)
@@ -2058,6 +2204,7 @@ class Handler(BaseHTTPRequestHandler):
         before,after=transitions[action]
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
                 if not event:return json_response(self,{'error':'Event not found.'},404)
                 if event.get('status')!=before:return json_response(self,{'error':'Event cannot make that transition.'},409)
@@ -2075,16 +2222,19 @@ class Handler(BaseHTTPRequestHandler):
         if not account_id:return json_response(self,{'error':'A Community account id is required.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 events=state_get(c,'events',[]) or [];event=owner_tournament_by_id(events,event_id)
                 if not event:return json_response(self,{'error':'Event not found.'},404)
                 if event.get('status')!='Published':return json_response(self,{'error':'Participation is only available for published events.'},409)
                 account=c.execute("SELECT id FROM community_accounts WHERE id=? AND status='Active'",(account_id,)).fetchone()
                 if not account:return json_response(self,{'error':'Active Community account not found.'},404)
                 current=state_get(c,'currentSeason',None);season_id=str(current.get('id')) if isinstance(current,dict) else ''
+                reward=int(event.get('rewardPoints',0) or 0)
+                if reward and not season_id:return json_response(self,{'error':'Point-bearing participation requires an active season.'},409)
                 items=state_get(c,'eventParticipation',[]) or []
                 existing=next((item for item in items if isinstance(item,dict) and str(item.get('eventId'))==event_id and str(item.get('accountId'))==account_id and str(item.get('seasonId',''))==season_id),None)
                 if existing:return json_response(self,{'participation':safe_owner_tournament_value(c,existing),'pointsAwarded':0,'created':False})
-                reward=int(event.get('rewardPoints',0) or 0);record={'id':'EP'+secrets.token_hex(7),'eventId':event_id,'accountId':account_id,'seasonId':season_id,'pointsAwarded':reward,'createdAt':now_iso(),'createdBy':str(session.get('id'))}
+                record={'id':'EP'+secrets.token_hex(7),'eventId':event_id,'accountId':account_id,'seasonId':season_id,'pointsAwarded':reward,'createdAt':now_iso(),'createdBy':str(session.get('id'))}
                 items.append(record);points=state_get(c,'seasonPoints',{}) or {};points[account_id]=int(points.get(account_id,0) or 0)+reward
                 state_set(c,'eventParticipation',items);state_set(c,'seasonPoints',points)
                 create_owner_notification(c,session,'owner_event_participation','event',event_id,'Event participation recorded','An Overall Owner recorded your event participation.','community',account_id)
@@ -2138,6 +2288,7 @@ class Handler(BaseHTTPRequestHandler):
         data=read_json(self)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 tournaments=state_get(c,'tournaments',[]);tournament=owner_tournament_by_id(tournaments,tournament_id)
                 if not tournament:return json_response(self,{'error':'Tournament not found.'},404)
                 if overview_status(tournament.get('status')) in ('completed','archived','cancelled','canceled'):
@@ -2188,6 +2339,7 @@ class Handler(BaseHTTPRequestHandler):
         if action not in ('approve','reject'):return json_response(self,{'error':'Unsupported Squad approval decision.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 tournaments=state_get(c,'tournaments',[]);tournament=owner_tournament_by_id(tournaments,tournament_id)
                 if not tournament:return json_response(self,{'error':'Tournament not found.'},404)
                 if tournament.get('format')!='Squad vs Squad':return json_response(self,{'error':'This is not a Squad tournament.'},400)
@@ -2407,6 +2559,7 @@ class Handler(BaseHTTPRequestHandler):
         if action not in ('confirm','correct','resolve','reject'):return json_response(self,{'error':'Unsupported result action.'},400)
         try:
             with LOCK,db() as c:
+                lock_state_workflow(c)
                 tournaments=state_get(c,'tournaments',[]);tournament=owner_tournament_by_id(tournaments,tournament_id)
                 if not tournament:return json_response(self,{'error':'Tournament not found.'},404)
                 tournament_status=overview_status(tournament.get('status'))
@@ -2457,6 +2610,11 @@ class Handler(BaseHTTPRequestHandler):
                     final_round=max((int(item.get('round') or 1) for item in tournament.get('matches',[]) if isinstance(item,dict)),default=0)
                     if tournament_status=='completed' and int(match.get('round') or 1)==final_round:
                         tournament['champion']=winner;tournament['runnerUp']=loser
+                        hall=state_get(c,'hallOfFame',[]) or []
+                        history_entry=next((item for item in hall if isinstance(item,dict) and str(item.get('tournamentId'))==tournament_id),None)
+                        if history_entry:
+                            history_entry.update(champion=winner,runnerUp=loser,correctedAt=now_iso(),correctedBy=str(session.get('id')))
+                            state_set(c,'hallOfFame',hall)
                     audit_action='owner_tournament_result_'+action
                 state_set(c,'tournaments',tournaments)
                 create_owner_notification(c,session,audit_action,'match',match_id,'Tournament result reviewed','An Overall Owner reviewed a tournament result.','community')
@@ -2543,22 +2701,36 @@ class Handler(BaseHTTPRequestHandler):
         d=read_json(self); email=str(d.get('email','')).strip().lower()
         with LOCK, db() as c: row=c.execute('SELECT * FROM community_accounts WHERE lower(email)=?',(email,)).fetchone()
         # Always return the same response to reduce account enumeration.
-        if row:
+        if row and str(row['status'] or '').strip().lower()!='disabled':
             code=f'{secrets.randbelow(900000)+100000}'; exp=int(time.time())+600
             with LOCK, db() as c:
-                c.execute('UPDATE community_accounts SET reset_code=?,reset_expires=? WHERE id=?',(code,exp,row['id'])); c.commit()
-            try: smtp_send(email,'Your Dark System password reset code',f'Your Dark System password reset code is {code}. It expires in 10 minutes.')
-            except Exception: pass
+                c.execute('UPDATE community_accounts SET reset_code=?,reset_expires=? WHERE id=?',(hash_recovery_code(code),exp,row['id'])); c.commit()
+            try:smtp_send(email,'Your Dark System password reset code',f'Your Dark System password reset code is {code}. It expires in 10 minutes.')
+            except Exception:logging.exception('Community recovery email delivery failed.')
         return json_response(self, {'ok':True,'message':'If that account exists, a reset code has been sent.'})
     def community_reset(self):
         d=read_json(self); email=str(d.get('email','')).strip().lower(); code=str(d.get('code','')).strip(); password=str(d.get('password',''))
         with LOCK, db() as c: row=c.execute('SELECT * FROM community_accounts WHERE lower(email)=?',(email,)).fetchone()
-        if not row or row['reset_code']!=code or not row['reset_expires'] or int(row['reset_expires'])<int(time.time()): return json_response(self, {'error':'The reset code is invalid or expired.'},400)
+        if not row or not verify_recovery_code(code,row['reset_code']) or not row['reset_expires'] or int(row['reset_expires'])<int(time.time()): return json_response(self, {'error':'The reset code is invalid or expired.'},400)
         if len(password)<8:return json_response(self, {'error':'Password must be at least 8 characters.'},400)
-        with LOCK, db() as c:
-            c.execute('UPDATE community_accounts SET password_hash=?,reset_code=NULL,reset_expires=NULL WHERE id=?',(hash_password(password),row['id']))
-            c.execute('DELETE FROM sessions WHERE type=? AND user_id=?',('community',str(row['id'])))
-            c.commit()
+        try:
+            with LOCK, db() as c:
+                current=c.execute('SELECT reset_code,reset_expires FROM community_accounts WHERE id=?',(row['id'],)).fetchone()
+                if not current or not verify_recovery_code(code,current['reset_code']) or int(current['reset_expires'] or 0)<int(time.time()):
+                    return json_response(self, {'error':'The reset code is invalid or expired.'},400)
+                claimed=c.execute(
+                    '''UPDATE community_accounts SET password_hash=?,reset_code=NULL,reset_expires=NULL
+                       WHERE id=? AND reset_code=? AND reset_expires=?''',
+                    (hash_password(password),row['id'],current['reset_code'],current['reset_expires']),
+                )
+                if claimed.rowcount!=1:
+                    return json_response(self, {'error':'The reset code is invalid or expired.'},400)
+                revoke_user_sessions(c,'community',row['id'])
+                insert_audit(c,{'type':'community','id':row['id'],'role':row['role'] or 'Community Member'},'community_password_reset','community_account',row['id'])
+                c.commit()
+        except Exception:
+            logging.exception('Community password reset failed.')
+            return json_response(self,{'error':'The password could not be reset.'},503)
         return json_response(self, {'ok':True})
     def community_profile(self):
         s=require_auth(self,['community'])
@@ -2674,13 +2846,69 @@ class Handler(BaseHTTPRequestHandler):
 
     def squad_login(self):
         d=read_json(self); ign=str(d.get('ign','')).strip().lower(); gid=str(d.get('gameId','')).strip(); sid=str(d.get('serverId','')).strip(); code=str(d.get('accessCode','')).strip().upper()
-        with LOCK, db() as c: row=c.execute('SELECT * FROM squad_members WHERE lower(ign)=? AND game_id=? AND server_id=? AND upper(access_code)=? AND status!=? AND account_activated=1',(ign,gid,sid,code,'Disabled')).fetchone()
-        if not row:return json_response(self, {'error':'The In-Game Name, IDs or access code were not recognized.'},401)
+        with LOCK, db() as c: row=c.execute('SELECT * FROM squad_members WHERE lower(ign)=? AND game_id=? AND server_id=? AND status!=? AND account_activated=1',(ign,gid,sid,'Disabled')).fetchone()
+        if not row or not access_code_matches(code,row):return json_response(self, {'error':'The In-Game Name, IDs or access code were not recognized.'},401)
         stamp=now_iso()
         with LOCK, db() as c:
+            if not row['access_code_hash']:
+                c.execute('UPDATE squad_members SET access_code_hash=?,access_code=? WHERE id=?',(hash_password(code),'',row['id']))
             c.execute('UPDATE squad_members SET status=?,last_login=? WHERE id=?',('Online',stamp,row['id'])); c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(row['id'],)).fetchone()
         token=create_session('squad',row['id'],row['role'])
         return json_response(self, {'member':public_member(row,True)},200,{'Set-Cookie':session_cookie(self, token)})
+
+    def squad_forgot(self):
+        data=read_json(self)
+        email=str(data.get('email','')).strip().lower();ign=str(data.get('ign','')).strip()
+        game_id=str(data.get('gameId','')).strip();server_id=str(data.get('serverId','')).strip()
+        with LOCK,db() as c:
+            row=c.execute(
+                '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
+                   AND status!=? AND account_activated=1''',
+                (email,ign,game_id,server_id,'Disabled'),
+            ).fetchone()
+        if row:
+            code=f'{secrets.randbelow(900000)+100000}';expires=int(time.time())+RECOVERY_TTL
+            try:
+                with LOCK,db() as c:
+                    c.execute("UPDATE recovery_codes SET used_at=? WHERE account_type='squad' AND account_id=? AND used_at IS NULL",(int(time.time()),row['id']))
+                    c.execute('INSERT INTO recovery_codes(id,account_type,account_id,code_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(
+                        'RC'+secrets.token_hex(8),'squad',row['id'],hash_recovery_code(code),expires,None,now_iso(),
+                    ))
+                    c.commit()
+                smtp_send(email,'Your Dark System Squad recovery code',f'Your Dark System Squad recovery code is {code}. It expires in 10 minutes.')
+            except Exception:
+                logging.exception('Squad recovery email delivery failed.')
+        return json_response(self,{'ok':True,'message':'If those account details match, a recovery code has been sent.'})
+
+    def squad_reset(self):
+        data=read_json(self);email=str(data.get('email','')).strip().lower();ign=str(data.get('ign','')).strip()
+        game_id=str(data.get('gameId','')).strip();server_id=str(data.get('serverId','')).strip()
+        code=str(data.get('code','')).strip();new_code=str(data.get('accessCode','')).strip().upper()
+        if len(new_code)<8:return json_response(self,{'error':'The new access code must be at least 8 characters.'},400)
+        now=int(time.time())
+        try:
+            with LOCK,db() as c:
+                row=c.execute(
+                    '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
+                       AND status!=? AND account_activated=1''',(email,ign,game_id,server_id,'Disabled'),
+                ).fetchone()
+                recovery=c.execute(
+                    '''SELECT * FROM recovery_codes WHERE account_type='squad' AND account_id=? AND used_at IS NULL
+                       ORDER BY created_at DESC,id DESC LIMIT 1''',(row['id'] if row else '',),
+                ).fetchone()
+                if not row or not recovery or int(recovery['expires_at'])<now or not verify_recovery_code(code,recovery['code_hash']):
+                    return json_response(self,{'error':'The recovery code is invalid or expired.'},400)
+                claimed=c.execute('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL',(now,recovery['id']))
+                if claimed.rowcount!=1:
+                    return json_response(self,{'error':'The recovery code is invalid or expired.'},400)
+                c.execute('UPDATE squad_members SET access_code=?,access_code_hash=?,status=? WHERE id=?',('',hash_password(new_code),'Offline',row['id']))
+                revoke_user_sessions(c,'squad',row['id'])
+                insert_audit(c,{'type':'squad','id':row['id'],'role':row['role']},'squad_access_code_reset','squad_member',row['id'])
+                c.commit()
+        except Exception:
+            logging.exception('Squad access code reset failed.')
+            return json_response(self,{'error':'The access code could not be reset.'},503)
+        return json_response(self,{'ok':True})
     def squad_profile(self):
         s=require_auth(self,['squad']);
         if not s:return
@@ -2688,7 +2916,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK, db() as c:
             row=c.execute('SELECT * FROM squad_members WHERE id=?',(s['id'],)).fetchone()
             if not row:return json_response(self,{'error':'Squad profile not found.'},404)
-            if str(d.get('accessCode','')).upper()!=str(row['access_code']).upper():return json_response(self,{'error':'Access code verification failed.'},403)
+            if not access_code_matches(d.get('accessCode',''),row):return json_response(self,{'error':'Access code verification failed.'},403)
             c.execute('UPDATE squad_members SET ign=?,game_id=?,server_id=?,lane=?,email=?,phone=?,birthday=?,profile_complete=1,account_activated=1 WHERE id=?',(d.get('ign',''),d.get('gameId',''),d.get('serverId',''),d.get('lane',''),d.get('email',''),d.get('phone',''),d.get('birthday',''),s['id'])); c.commit(); row=c.execute('SELECT * FROM squad_members WHERE id=?',(s['id'],)).fetchone()
         return json_response(self, {'member':public_member(row,True)})
     def role_allowed(self, session, *roles):
@@ -2773,7 +3001,7 @@ class Handler(BaseHTTPRequestHandler):
                   'profileComplete':1 if profile_complete else 0,'accountActivated':1 if account_activated else 0}
                 if not owner:
                     vals['role']=row['role']; vals['accessCode']=row['access_code']; vals['profileComplete']=row['profile_complete']; vals['accountActivated']=row['account_activated']
-                if not all(vals[key] for key in ('name','ign','gameId','serverId','accessCode')):
+                if not all(vals[key] for key in ('name','ign','gameId','serverId')) or not (vals['accessCode'] or row['access_code_hash']):
                     return json_response(self,{'error':'Name, IGN, Game ID, Server ID and access code cannot be empty.'},400)
                 if vals['role'] not in SQUAD_ROLES or vals['status'] not in SQUAD_MEMBER_STATUSES:
                     return json_response(self,{'error':'A valid Squad role and status are required.'},400)
@@ -2789,8 +3017,11 @@ class Handler(BaseHTTPRequestHandler):
                     for old in former: revoke_user_sessions(c,'squad',old['id'])
                 if identity_conflict(c,'squad_members',vals['ign'],vals['gameId'],vals['serverId'],mid):
                     return json_response(self,{'error':'A Squad member already uses that IGN, Game ID, or Server ID.'},409)
-                c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
-                if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated'] or vals['accessCode'] != str(row['access_code']).upper():
+                new_access_hash=row['access_code_hash']
+                if owner and 'accessCode' in d:
+                    new_access_hash=hash_password(vals['accessCode']);vals['accessCode']=''
+                c.execute("""UPDATE squad_members SET name=?,ign=?,game_id=?,server_id=?,role=?,lane=?,email=?,phone=?,birthday=?,access_code=?,access_code_hash=?,status=?,profile_complete=?,account_activated=? WHERE id=?""",(vals['name'],vals['ign'],vals['gameId'],vals['serverId'],vals['role'],vals['lane'],vals['email'],vals['phone'],vals['birthday'],vals['accessCode'],new_access_hash,vals['status'],vals['profileComplete'],vals['accountActivated'],mid))
+                if vals['role'] != row['role'] or vals['status']=='Disabled' or not vals['accountActivated'] or (owner and 'accessCode' in d):
                     revoke_user_sessions(c,'squad',mid)
                 if vals['role'] not in ('Squad Leader','Assistant Squad Leader') or vals['status']=='Disabled' or not vals['accountActivated']:
                     remove_tournament_manager_permission(c,mid)
@@ -2926,6 +3157,7 @@ class Handler(BaseHTTPRequestHandler):
         elif not self.tournament_manager_allowed(s):
             return json_response(self,{'error':'Tournament Manager permission is required.'},403)
         with LOCK, db() as c:
+            lock_state_workflow(c)
             approvals=state_get(c,'squadTournamentApprovals',[]); tours=state_get(c,'tournaments',[])
             t=next((x for x in tours if str(x.get('id'))==tid),None)
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
@@ -3000,6 +3232,7 @@ class Handler(BaseHTTPRequestHandler):
         if not s:return
         d=read_json(self); tid=str(d.get('tournamentId','')); mid=str(d.get('matchId',''))
         with LOCK, db() as c:
+            lock_state_workflow(c)
             tours=state_get(c,'tournaments',[]); t=next((x for x in tours if str(x.get('id'))==tid),None)
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
             m=next((x for x in t.get('matches',[]) if str(x.get('id'))==mid),None)
@@ -3066,6 +3299,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.tournament_manager_allowed(s):return json_response(self,{'error':'Tournament Manager permission is required.'},403)
         d=read_json(self); tid=str(d.get('tournamentId','')); mid=str(d.get('matchId','')); action=str(d.get('action',''))
         with LOCK, db() as c:
+            lock_state_workflow(c)
             tours=state_get(c,'tournaments',[]); t=next((x for x in tours if str(x.get('id'))==tid),None)
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
             m=next((x for x in t.get('matches',[]) if str(x.get('id'))==mid),None)
@@ -3100,7 +3334,9 @@ class Handler(BaseHTTPRequestHandler):
         d=read_json(self); event_id=str(d.get('eventId',''))
         if not event_id:return json_response(self,{'error':'Event id is required.'},400)
         with LOCK, db() as c:
+            lock_state_workflow(c)
             items=state_get(c,'eventParticipation',[]) or []; season=state_get(c,'currentSeason',None)
+            if not isinstance(season,dict):return json_response(self,{'error':'Event participation rewards require an active season.'},409)
             if any(str(x.get('eventId'))==event_id and str(x.get('accountId'))==str(s['id']) and x.get('season')==season for x in items):return json_response(self,{'error':'Participation already recorded.'},409)
             items.append({'id':'EP'+secrets.token_hex(6),'eventId':event_id,'accountId':s['id'],'season':season,'time':now_iso()})
             points=state_get(c,'seasonPoints',{}) or {}; points[str(s['id'])]=int(points.get(str(s['id']),0))+50
@@ -3112,6 +3348,7 @@ class Handler(BaseHTTPRequestHandler):
         if not s:return
         d=read_json(self); tid=str(d.get('tournamentId',''))
         with LOCK, db() as c:
+            lock_state_workflow(c)
             tours=state_get(c,'tournaments',[]); regs=state_get(c,'registrations',[])
             t=next((x for x in tours if str(x.get('id'))==tid),None)
             if not t:return json_response(self,{'error':'Tournament not found.'},404)
@@ -3138,6 +3375,7 @@ class Handler(BaseHTTPRequestHandler):
         d=read_json(self); squad=d.get('squad') or {}; community=d.get('community') or {}
         role=s.get('role','')
         with LOCK, db() as c:
+            lock_state_workflow(c)
             def reject_sync(message, status):
                 c.rollback()
                 return json_response(self, {'error': message}, status)

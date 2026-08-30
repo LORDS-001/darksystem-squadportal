@@ -7,6 +7,71 @@ import server
 from tests.http_harness import BackendHarness
 
 
+class OwnerAuditAndSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.backend = BackendHarness()
+        setup = self.backend.request("POST", "/api/owner/setup", {
+            "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+            "username": "audit-owner", "password": "owner-password-123",
+            "squadOwner": {"ign": "AuditOwner", "gameId": "900001", "serverId": "9001", "accessCode": "OWNER-CODE"},
+        })
+        self.assertEqual(setup.status, 200)
+        login = self.backend.request("POST", "/api/owner/login", {
+            "username": "audit-owner", "password": "owner-password-123",
+        })
+        self.cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+    def tearDown(self):
+        self.backend.close()
+
+    def test_audit_filters_and_cursor_pagination_are_safe(self):
+        with server.LOCK, server.db() as connection:
+            owner = {"type": "owner", "id": "actor-filter", "role": "Overall Owner"}
+            for index in range(4):
+                server.insert_audit(connection, owner, "filtered_action" if index < 3 else "different_action",
+                                    "squad_member", f"target-{index}", {"password": "never-return", "index": index})
+            connection.commit()
+        first = self.backend.request("GET", "/api/owner/audit?action=filtered_action&actor=actor-filter&target=target&limit=2", cookie=self.cookie)
+        self.assertEqual(first.status, 200)
+        self.assertEqual(len(first.json["audit"]), 2)
+        self.assertTrue(first.json["nextCursor"])
+        self.assertNotIn("never-return", str(first.json).lower())
+        second = self.backend.request("GET", f"/api/owner/audit?action=filtered_action&actor=actor-filter&target=target&limit=2&cursor={first.json['nextCursor']}", cookie=self.cookie)
+        self.assertEqual(len(second.json["audit"]), 1)
+        self.assertFalse(second.json["nextCursor"])
+        self.assertTrue(set(item["id"] for item in first.json["audit"]).isdisjoint(item["id"] for item in second.json["audit"]))
+
+    def test_audit_date_validation_and_owner_guard(self):
+        self.assertEqual(self.backend.request("GET", "/api/owner/audit?from=not-a-date", cookie=self.cookie).status, 400)
+        self.assertEqual(self.backend.request("GET", "/api/owner/settings").status, 401)
+
+    def test_owner_settings_password_change_requires_current_password_and_revokes_other_sessions(self):
+        second_login = self.backend.request("POST", "/api/owner/login", {
+            "username": "audit-owner", "password": "owner-password-123",
+        })
+        second_cookie = second_login.headers["Set-Cookie"].split(";", 1)[0]
+        settings = self.backend.request("GET", "/api/owner/settings", cookie=self.cookie)
+        self.assertEqual(settings.status, 200)
+        self.assertEqual(settings.json["settings"]["username"], "audit-owner")
+        self.assertNotIn("password", str(settings.json).lower())
+        denied = self.backend.request("PATCH", "/api/owner/settings", {
+            "currentPassword": "wrong-password", "newPassword": "new-owner-password-456",
+        }, cookie=self.cookie)
+        self.assertEqual(denied.status, 403)
+        changed = self.backend.request("PATCH", "/api/owner/settings", {
+            "currentPassword": "owner-password-123", "newPassword": "new-owner-password-456",
+        }, cookie=self.cookie)
+        self.assertEqual(changed.status, 200)
+        self.assertTrue(self.backend.request("GET", "/api/auth/me", cookie=self.cookie).json["authenticated"])
+        self.assertFalse(self.backend.request("GET", "/api/auth/me", cookie=second_cookie).json["authenticated"])
+        self.assertEqual(self.backend.request("POST", "/api/owner/login", {
+            "username": "audit-owner", "password": "owner-password-123",
+        }).status, 401)
+        self.assertEqual(self.backend.request("POST", "/api/owner/login", {
+            "username": "audit-owner", "password": "new-owner-password-456",
+        }).status, 200)
+
+
 class OwnerAdministrationSecurityTests(unittest.TestCase):
     def setUp(self):
         self.backend = BackendHarness()
@@ -2062,7 +2127,72 @@ class OwnerSeasonEventHistoryAdministrationTests(unittest.TestCase):
         audit = self.owner_request("GET", "/api/owner/audit")
         self.assertIn("owner_hall_of_fame_correct", {item["action"] for item in audit.json["audit"]})
 
+    def test_history_corrections_strictly_validate_fields_dates_points_and_accounts(self):
+        account = self.accounts[0][0]
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "hallOfFame", [{"id": "H-strict", "tournamentId": "T-strict", "title": "Cup", "champion": account["id"]}])
+            server.state_set(connection, "seasonHallOfFame", [{"id": "SF-strict", "seasonId": "S-strict", "seasonName": "Season", "accountId": account["id"], "ign": account["ign"], "points": 10}])
+            connection.commit()
+        bad_payloads = (
+            {"title": 123, "reason": "bad type"},
+            {"title": "x" * 201, "reason": "too long"},
+            {"date": "2099-02-30", "reason": "bad date"},
+            {"champion": "missing-account", "reason": "bad account"},
+        )
+        for payload in bad_payloads:
+            self.assertEqual(self.owner_request("PATCH", "/api/owner/history/hall-of-fame/H-strict", payload).status, 400)
+        for payload in (
+            {"points": -1, "reason": "negative"},
+            {"points": 100000001, "reason": "too high"},
+            {"accountId": "missing-account", "reason": "bad account"},
+            {"ign": "NotTheAccount", "reason": "identity mismatch"},
+        ):
+            self.assertEqual(self.owner_request("PATCH", "/api/owner/history/season-hall-of-fame/SF-strict", payload).status, 400)
+
+    def test_points_and_point_bearing_participation_require_an_active_season(self):
+        account = self.accounts[0][0]
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{account['id']}", {"points": 10, "reason": "No season"}).status, 409)
+        event = self.owner_request("POST", "/api/owner/events", {"title": "Points Event", "date": "2099-12-20", "rewardPoints": 25}).json["event"]
+        self.owner_request("POST", f"/api/owner/events/{event['id']}/publish", {})
+        self.assertEqual(self.owner_request("POST", f"/api/owner/events/{event['id']}/participation", {"accountId": account["id"]}).status, 409)
+        season = self.owner_request("POST", "/api/owner/seasons", {"name": "Active"}).json["season"]
+        self.assertEqual(self.owner_request("POST", f"/api/owner/events/{event['id']}/participation", {"accountId": account["id"]}).status, 201)
+        self.owner_request("POST", f"/api/owner/seasons/{season['id']}/complete", {})
+        self.assertEqual(self.owner_request("PATCH", f"/api/owner/season-points/{account['id']}", {"points": 20, "reason": "Completed"}).status, 409)
+
+    def test_completed_final_correction_updates_matching_hall_of_fame_atomically(self):
+        first, second = self.accounts[0][0]["id"], self.accounts[1][0]["id"]
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "tournaments", [{
+                "id": "T-final-history", "title": "Final History", "status": "Completed", "champion": first, "runnerUp": second,
+                "matches": [{"id": "final-history", "round": 1, "player1": first, "player2": second, "winner": first, "pointsAwarded": True, "submission": {"winner": first, "status": "Owner Confirmed"}}],
+            }])
+            server.state_set(connection, "seasonPoints", {first: 100, second: 50})
+            server.state_set(connection, "hallOfFame", [{"id": "H-final-history", "tournamentId": "T-final-history", "champion": first, "runnerUp": second}])
+            connection.commit()
+        corrected = self.owner_request("POST", "/api/owner/tournaments/T-final-history/matches/final-history/result", {"action": "correct", "winner": second, "reason": "Verified replay"})
+        self.assertEqual(corrected.status, 200)
+        history = self.owner_request("GET", "/api/owner/history")
+        entry = history.json["hallOfFame"][0]
+        self.assertEqual((entry["champion"], entry["runnerUp"]), (second, first))
+
+    def test_state_workflow_lock_uses_database_transaction_locking(self):
+        class FakeCursor:
+            def execute(self, sql, params=()):
+                self.sql, self.params = sql, params
+                return self
+        cursor = FakeCursor()
+        class FakeConnection:
+            def cursor(self): return cursor
+        postgres = server.PostgresCompat(FakeConnection())
+        server.lock_state_workflow(postgres)
+        self.assertIn("pg_advisory_xact_lock", cursor.sql)
+        with server.db() as sqlite_connection:
+            server.lock_state_workflow(sqlite_connection)
+            sqlite_connection.rollback()
+
     def test_event_lifecycle_and_participation_rewards_are_idempotent(self):
+        self.assertEqual(self.owner_request("POST", "/api/owner/seasons", {"name": "Event Season"}).status, 201)
         created = self.owner_request("POST", "/api/owner/events", {
             "title": "Community Night", "date": "2099-12-10", "time": "18:00", "rewardPoints": 50,
             "requestId": "community-night",
