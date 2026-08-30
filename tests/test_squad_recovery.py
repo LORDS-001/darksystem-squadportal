@@ -66,6 +66,22 @@ class SquadRecoveryTests(unittest.TestCase):
         server.RATE_LIMITS.clear()
         self.assertEqual(self.backend.request("POST", "/api/squad/login", payload).status, 429)
 
+    def test_squad_login_throttle_ignores_extraneous_email_and_limits_identity_spraying(self):
+        base = {**self.identity(), "accessCode": "wrong"}
+        for index in range(server.RATE_LIMIT_MAX):
+            payload = {**base, "email": f"vary-{index}@example.test"}
+            self.assertEqual(self.backend.request("POST", "/api/squad/login", payload).status, 401)
+        self.assertEqual(self.backend.request("POST", "/api/squad/login", {**base, "email": "new@example.test"}).status, 429)
+
+        self.backend.close()
+        self.backend = BackendHarness()
+        statuses = []
+        for index in range((server.RATE_LIMIT_MAX * 4) + 1):
+            statuses.append(self.backend.request("POST", "/api/community/login", {
+                "email": f"spray-{index}@example.test", "password": "wrong-password",
+            }).status)
+        self.assertEqual(statuses[-1], 429)
+
     def test_reset_rotates_access_code_revokes_sessions_and_is_single_use(self):
         login = self.backend.request("POST", "/api/squad/login", {
             **self.identity(), "accessCode": "OLD-CODE",

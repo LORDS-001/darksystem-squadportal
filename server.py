@@ -1075,7 +1075,7 @@ def rate_limited(h, bucket):
         hits.append(now); RATE_LIMITS[key]=hits
         return len(hits) > RATE_LIMIT_MAX
 
-def durable_rate_limited(h, bucket, identity=''):
+def durable_rate_limited(h, bucket, identity='', max_attempts=None):
     now = int(time.time())
     cutoff = now - RATE_LIMIT_WINDOW
     durable_key = hashlib.sha256(
@@ -1102,7 +1102,7 @@ def durable_rate_limited(h, bucket, identity=''):
             (durable_key, now, cutoff, cutoff),
         ).fetchone()
         connection.commit()
-    return int(row['attempts']) > RATE_LIMIT_MAX
+    return int(row['attempts']) > (RATE_LIMIT_MAX if max_attempts is None else max_attempts)
 
 def valid_origin(h):
     origin=request_header(h, 'Origin')
@@ -1148,15 +1148,18 @@ class Handler(BaseHTTPRequestHandler):
         throttle_identity=''
         if path.startswith('/api/community/'):
             throttle_identity=str(self._parsed_json.get('email','')).strip().lower()
-        elif path.startswith('/api/squad/'):
+        elif path=='/api/squad/login':
+            throttle_identity='\0'.join(str(self._parsed_json.get(key,'')).strip().lower() for key in ('ign','gameId','serverId'))
+        elif path in ('/api/squad/forgot','/api/squad/reset'):
             throttle_identity='\0'.join(str(self._parsed_json.get(key,'')).strip().lower() for key in ('email','ign','gameId','serverId'))
         elif path=='/api/owner/login':
             throttle_identity=str(self._parsed_json.get('username','')).strip().lower()
-        if path=='/api/owner/login' and method=='POST' and durable_rate_limited(self, path, throttle_identity):
+        globally_limited=method=='POST' and path in ('/api/owner/login','/api/community/login','/api/squad/login','/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and durable_rate_limited(self,path+':ip','',RATE_LIMIT_MAX*4)
+        if path=='/api/owner/login' and method=='POST' and (globally_limited or durable_rate_limited(self, path, throttle_identity)):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
-        if path in ('/api/community/login','/api/squad/login') and method=='POST' and durable_rate_limited(self, path, throttle_identity):
+        if path in ('/api/community/login','/api/squad/login') and method=='POST' and (globally_limited or durable_rate_limited(self, path, throttle_identity)):
             return json_response(self, {'error':'Too many login attempts. Please wait a few minutes and try again.'}, 429)
-        if path in ('/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and method=='POST' and durable_rate_limited(self, path, throttle_identity):
+        if path in ('/api/community/forgot','/api/squad/forgot','/api/community/reset','/api/squad/reset') and method=='POST' and (globally_limited or durable_rate_limited(self, path, throttle_identity)):
             return json_response(self, {'error':'Too many password reset requests. Please wait a few minutes and try again.'}, 429)
         if path=='/api/health': return json_response(self, {'ok':True,'service':'Dark System backend','time':now_iso()})
         if path=='/api/bootstrap' and method=='GET': return json_response(self, bootstrap(auth_from_cookie(self)))
@@ -1693,12 +1696,11 @@ class Handler(BaseHTTPRequestHandler):
         if not session:
             return
         data = read_json(self)
-        required = ('name', 'ign', 'gameId', 'serverId', 'accessCode')
+        if 'accessCode' in data:
+            return json_response(self,{'error':'Squad members establish credentials through self-service recovery.'},400)
+        required = ('name', 'ign', 'gameId', 'serverId', 'email')
         if any(not str(data.get(key, '')).strip() for key in required):
-            return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and access code are required.'}, 400)
-        submitted_access_code=str(data['accessCode']).strip().upper()
-        if len(submitted_access_code)<8:
-            return json_response(self,{'error':'Access code must be at least 8 characters.'},400)
+            return json_response(self, {'error': 'Name, IGN, Game ID, Server ID and registered email are required.'}, 400)
         role = str(data.get('role', 'Squad Member')).strip() or 'Squad Member'
         if role not in SQUAD_ROLES or role == 'Squad Owner':
             return json_response(self, {'error': 'Use the Squad Owner appointment endpoint to appoint a Squad Owner.'}, 409)
@@ -1726,9 +1728,9 @@ class Handler(BaseHTTPRequestHandler):
                      str(data.get('phone', '')).strip(), str(data.get('birthday', '')).strip(),
                      '', status, None,
                      1 if profile_complete else 0,
-                     1 if account_activated else 0),
+                     0),
                 )
-                c.execute('UPDATE squad_members SET access_code_hash=? WHERE id=?',(hash_password(submitted_access_code),member_id))
+                c.execute('UPDATE squad_members SET access_code_hash=? WHERE id=?',(hash_password(secrets.token_urlsafe(48)),member_id))
                 row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
                 create_owner_notification(
                     c, session, 'owner_squad_member_create', 'squad_member', member_id,
@@ -2885,7 +2887,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK,db() as c:
             row=c.execute(
                 '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
-                   AND status!=? AND account_activated=1''',
+                   AND status!=?''',
                 (email,ign,game_id,server_id,'Disabled'),
             ).fetchone()
         if row:
@@ -2918,7 +2920,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK,db() as c:
                 row=c.execute(
                     '''SELECT * FROM squad_members WHERE lower(email)=? AND ign=? AND game_id=? AND server_id=?
-                       AND status!=? AND account_activated=1''',(email,ign,game_id,server_id,'Disabled'),
+                       AND status!=?''',(email,ign,game_id,server_id,'Disabled'),
                 ).fetchone()
                 recovery=c.execute(
                     '''SELECT * FROM recovery_codes WHERE account_type='squad' AND account_id=? AND used_at IS NULL
@@ -2929,7 +2931,7 @@ class Handler(BaseHTTPRequestHandler):
                 claimed=c.execute('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL',(now,recovery['id']))
                 if claimed.rowcount!=1:
                     return json_response(self,{'error':'The recovery code is invalid or expired.'},400)
-                c.execute('UPDATE squad_members SET access_code=?,access_code_hash=?,status=? WHERE id=?',('',hash_password(new_code),'Offline',row['id']))
+                c.execute('UPDATE squad_members SET access_code=?,access_code_hash=?,status=?,account_activated=1 WHERE id=?',('',hash_password(new_code),'Offline',row['id']))
                 revoke_user_sessions(c,'squad',row['id'])
                 insert_audit(c,{'type':'squad','id':row['id'],'role':row['role']},'squad_access_code_reset','squad_member',row['id'])
                 c.commit()
