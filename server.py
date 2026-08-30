@@ -36,6 +36,16 @@ RATE_LIMITS = {}
 SQUAD_ROLES = ('Squad Owner', 'Squad Leader', 'Assistant Squad Leader', 'Squad Member')
 SQUAD_MEMBER_STATUSES = ('Online', 'Offline', 'Disabled')
 COMMUNITY_ACCOUNT_STATUSES = ('Active', 'Disabled')
+OWNER_CONTENT_DOMAINS = ('announcements', 'reports', 'complaints', 'events', 'notifications')
+OWNER_CONTENT_STATE_DOMAINS = ('announcements', 'reports', 'complaints', 'events')
+OWNER_CONTENT_FIELDS = {
+    'announcements': ('id', 'title', 'body', 'author', 'authorId', 'createdAt', 'updatedAt', 'time'),
+    'reports': ('id', 'title', 'body', 'memberId', 'author', 'authorId', 'createdAt', 'updatedAt'),
+    'complaints': ('id', 'subject', 'title', 'body', 'memberId', 'author', 'authorId', 'createdAt', 'updatedAt'),
+    'events': ('id', 'title', 'date', 'time', 'description', 'author', 'authorId', 'createdAt', 'updatedAt'),
+    'notifications': ('id', 'title', 'message', 'audienceId', 'read', 'action', 'targetType', 'targetId', 'author', 'authorId', 'createdAt', 'updatedAt'),
+}
+OWNER_CONTENT_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')
 
 PUBLIC_STATIC_FILES = {
     '/': 'index.html',
@@ -272,6 +282,126 @@ def state_get(c, key, default):
 
 def state_set(c, key, value):
     c.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value, separators=(',', ':'))))
+
+def safe_owner_content_item(domain, item):
+    if domain not in OWNER_CONTENT_DOMAINS or not isinstance(item, dict):
+        return None
+    return {key: item[key] for key in OWNER_CONTENT_FIELDS[domain] if key in item}
+
+def owner_content_items(connection, domain):
+    if domain == 'notifications':
+        items = []
+        for row in connection.execute('SELECT id,payload FROM notifications ORDER BY id ASC').fetchall():
+            try:
+                payload = json.loads(row['payload'])
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payload['id'] = str(row['id'])
+                item = safe_owner_content_item(domain, payload)
+                if item:
+                    items.append(item)
+        return items
+    items = state_get(connection, domain, [])
+    return [item for raw in items if (item := safe_owner_content_item(domain, raw))]
+
+def owner_content_text(data, existing, key, required=False, maximum=4000):
+    value = data[key] if key in data else existing.get(key, '')
+    if not isinstance(value, str):
+        return None, f'{key} must be text.'
+    value = value.strip()
+    if required and not value:
+        return None, f'{key} is required.'
+    if len(value) > maximum:
+        return None, f'{key} is too long.'
+    return value, None
+
+def normalize_owner_content(domain, data, item_id, existing=None):
+    if domain not in OWNER_CONTENT_DOMAINS:
+        return None, 'Unsupported Squad content domain.'
+    if item_id and not OWNER_CONTENT_ID.fullmatch(item_id):
+        return None, 'Content id is invalid.'
+    existing = existing if isinstance(existing, dict) else {}
+    identifier = item_id or str(existing.get('id') or 'SC-' + secrets.token_hex(8))
+    if not OWNER_CONTENT_ID.fullmatch(identifier):
+        return None, 'Content id is invalid.'
+    item = {
+        'id': identifier,
+        'createdAt': str(existing.get('createdAt') or now_iso()),
+        'updatedAt': now_iso(),
+        'author': str(existing.get('author') or 'Overall Owner'),
+    }
+    if existing.get('authorId') is not None:
+        item['authorId'] = str(existing['authorId'])
+    if domain == 'announcements':
+        for key, required, maximum in (('title', True, 180), ('body', True, 8000)):
+            value, error = owner_content_text(data, existing, key, required, maximum)
+            if error: return None, error
+            item[key] = value
+    elif domain == 'reports':
+        title, error = owner_content_text(data, existing, 'title', False, 180)
+        if error: return None, error
+        body, error = owner_content_text(data, existing, 'body', True, 8000)
+        if error: return None, error
+        if title: item['title'] = title
+        item['body'] = body
+        if existing.get('memberId') is not None: item['memberId'] = str(existing['memberId'])
+    elif domain == 'complaints':
+        subject, error = owner_content_text(data, existing, 'subject', False, 180)
+        if error: return None, error
+        body, error = owner_content_text(data, existing, 'body', True, 8000)
+        if error: return None, error
+        if subject: item['subject'] = subject
+        item['body'] = body
+        if existing.get('memberId') is not None: item['memberId'] = str(existing['memberId'])
+    elif domain == 'events':
+        title, error = owner_content_text(data, existing, 'title', True, 180)
+        if error: return None, error
+        date, error = owner_content_text(data, existing, 'date', True, 10)
+        if error: return None, error
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date):
+            return None, 'date must use YYYY-MM-DD.'
+        time_value, error = owner_content_text(data, existing, 'time', False, 5)
+        if error: return None, error
+        if time_value and not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', time_value):
+            return None, 'time must use HH:MM.'
+        description, error = owner_content_text(data, existing, 'description', False, 8000)
+        if error: return None, error
+        item.update(title=title, date=date)
+        if time_value: item['time'] = time_value
+        if description: item['description'] = description
+    else:
+        title, error = owner_content_text(data, existing, 'title', True, 180)
+        if error: return None, error
+        message, error = owner_content_text(data, existing, 'message', True, 4000)
+        if error: return None, error
+        item.update(title=title, message=message)
+        audience = data['audienceId'] if 'audienceId' in data else existing.get('audienceId')
+        if audience is not None:
+            if not isinstance(audience, (str, int)) or not str(audience).strip():
+                return None, 'audienceId must be a non-empty identifier.'
+            item['audienceId'] = str(audience).strip()
+        read = data['read'] if 'read' in data else existing.get('read', False)
+        if not isinstance(read, bool):
+            return None, 'read must be true or false.'
+        item['read'] = read
+        for key in ('action', 'targetType', 'targetId'):
+            if key in existing:
+                item[key] = existing[key]
+    return item, None
+
+def create_owner_notification(connection, session, action, target_type, target_id, title, message):
+    item = {
+        'id': 'ON-' + secrets.token_hex(8), 'title': title, 'message': message,
+        'action': action, 'targetType': target_type, 'targetId': str(target_id),
+        'author': 'Overall Owner', 'authorId': str(session.get('id')), 'read': False,
+        'createdAt': now_iso(), 'updatedAt': now_iso(),
+    }
+    connection.execute(
+        'INSERT INTO notifications(id,domain,payload) VALUES(?,?,?)',
+        (item['id'], 'squad', json.dumps(item, separators=(',', ':'))),
+    )
+    return item
 
 def public_member(r, include_secret=False):
     d = dict(r)
@@ -795,6 +925,14 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/owner/login' and method=='POST': return self.owner_login()
         if path=='/api/owner/overview' and method=='GET': return self.owner_overview()
         if path=='/api/owner/audit' and method=='GET': return self.owner_audit()
+        if path=='/api/owner/squad-content' and method=='GET': return self.owner_squad_content_list()
+        if path.startswith('/api/owner/squad-content/'):
+            parts = [part for part in path[len('/api/owner/squad-content/'):].split('/') if part]
+            if len(parts) in (1, 2):
+                domain, item_id = parts[0], parts[1] if len(parts) == 2 else ''
+                if method == 'POST': return self.owner_squad_content_create(domain, item_id)
+                if method == 'PATCH': return self.owner_squad_content_update(domain, item_id)
+                if method == 'DELETE': return self.owner_squad_content_delete(domain, item_id)
         if path=='/api/owner/squad-members' and method=='GET': return self.owner_squad_members()
         if path=='/api/owner/squad-members' and method=='POST': return self.owner_squad_member_create()
         if path.startswith('/api/owner/squad-members/'):
@@ -1026,6 +1164,113 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append(item)
         return json_response(self,{'audit':rows})
 
+    def owner_squad_content_list(self):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        domain = str(parse_qs(urlparse(self.path).query, keep_blank_values=True).get('domain', [''])[0]).strip()
+        if domain not in OWNER_CONTENT_DOMAINS:
+            return json_response(self, {'error': 'A supported Squad content domain is required.'}, 400)
+        with LOCK, db() as c:
+            items = owner_content_items(c, domain)
+        return json_response(self, {'domain': domain, 'items': items})
+
+    def owner_squad_content_create(self, domain, item_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        item, error = normalize_owner_content(domain, read_json(self), item_id)
+        if error:
+            return json_response(self, {'error': error}, 400)
+        try:
+            with LOCK, db() as c:
+                if domain == 'notifications':
+                    if c.execute('SELECT 1 FROM notifications WHERE id=?', (item['id'],)).fetchone():
+                        return json_response(self, {'error': 'Content already exists.'}, 409)
+                    c.execute('INSERT INTO notifications(id,domain,payload) VALUES(?,?,?)', (
+                        item['id'], 'squad', json.dumps(item, separators=(',', ':')),
+                    ))
+                else:
+                    items = state_get(c, domain, [])
+                    if not isinstance(items, list):
+                        items = []
+                    if any(isinstance(existing, dict) and str(existing.get('id')) == item['id'] for existing in items):
+                        return json_response(self, {'error': 'Content already exists.'}, 409)
+                    items.append(item)
+                    state_set(c, domain, items)
+                insert_audit(c, session, 'owner_squad_content_create', 'squad_content', item['id'], {'domain': domain})
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad content creation failed.')
+            return json_response(self, {'error': 'The Squad content could not be created.'}, 503)
+        return json_response(self, {'item': safe_owner_content_item(domain, item)}, 201)
+
+    def owner_squad_content_update(self, domain, item_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        if domain not in OWNER_CONTENT_DOMAINS or not item_id:
+            return json_response(self, {'error': 'A supported Squad content domain and id are required.'}, 400)
+        try:
+            with LOCK, db() as c:
+                if domain == 'notifications':
+                    row = c.execute('SELECT payload FROM notifications WHERE id=?', (item_id,)).fetchone()
+                    if not row:
+                        return json_response(self, {'error': 'Content not found.'}, 404)
+                    try: existing = json.loads(row['payload'])
+                    except Exception: existing = None
+                    if not isinstance(existing, dict):
+                        return json_response(self, {'error': 'Content not found.'}, 404)
+                    item, error = normalize_owner_content(domain, read_json(self), item_id, existing)
+                    if error:
+                        return json_response(self, {'error': error}, 400)
+                    c.execute('UPDATE notifications SET payload=? WHERE id=?', (json.dumps(item, separators=(',', ':')), item_id))
+                else:
+                    items = state_get(c, domain, [])
+                    if not isinstance(items, list):
+                        items = []
+                    index = next((i for i, existing in enumerate(items) if isinstance(existing, dict) and str(existing.get('id')) == item_id), None)
+                    if index is None:
+                        return json_response(self, {'error': 'Content not found.'}, 404)
+                    item, error = normalize_owner_content(domain, read_json(self), item_id, items[index])
+                    if error:
+                        return json_response(self, {'error': error}, 400)
+                    items[index] = item
+                    state_set(c, domain, items)
+                insert_audit(c, session, 'owner_squad_content_update', 'squad_content', item_id, {'domain': domain})
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad content update failed.')
+            return json_response(self, {'error': 'The Squad content could not be updated.'}, 503)
+        return json_response(self, {'item': safe_owner_content_item(domain, item)})
+
+    def owner_squad_content_delete(self, domain, item_id):
+        session = require_overall_owner(self)
+        if not session:
+            return
+        if domain not in OWNER_CONTENT_DOMAINS or not item_id:
+            return json_response(self, {'error': 'A supported Squad content domain and id are required.'}, 400)
+        try:
+            with LOCK, db() as c:
+                if domain == 'notifications':
+                    if not c.execute('SELECT 1 FROM notifications WHERE id=?', (item_id,)).fetchone():
+                        return json_response(self, {'error': 'Content not found.'}, 404)
+                    c.execute('DELETE FROM notifications WHERE id=?', (item_id,))
+                else:
+                    items = state_get(c, domain, [])
+                    if not isinstance(items, list):
+                        items = []
+                    updated = [item for item in items if not isinstance(item, dict) or str(item.get('id')) != item_id]
+                    if len(updated) == len(items):
+                        return json_response(self, {'error': 'Content not found.'}, 404)
+                    state_set(c, domain, updated)
+                insert_audit(c, session, 'owner_squad_content_delete', 'squad_content', item_id, {'domain': domain})
+                c.commit()
+        except Exception:
+            logging.exception('Owner Squad content deletion failed.')
+            return json_response(self, {'error': 'The Squad content could not be deleted.'}, 503)
+        return json_response(self, {'ok': True})
+
     def owner_squad_members(self):
         session = require_overall_owner(self)
         if not session:
@@ -1095,6 +1340,10 @@ class Handler(BaseHTTPRequestHandler):
                      1 if account_activated else 0),
                 )
                 row = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                create_owner_notification(
+                    c, session, 'owner_squad_member_create', 'squad_member', member_id,
+                    'Squad member created', 'An Overall Owner created a Squad member.',
+                )
                 insert_audit(c, session, 'owner_squad_member_create', 'squad_member', member_id, {'ign': ign, 'role': role})
                 c.commit()
         except Exception as exc:
@@ -1161,6 +1410,10 @@ class Handler(BaseHTTPRequestHandler):
                 if authority_changed or credentials_changed or unavailable:
                     revoke_user_sessions(c, 'squad', member_id)
                 updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                create_owner_notification(
+                    c, session, 'owner_squad_member_update', 'squad_member', member_id,
+                    'Squad member updated', 'An Overall Owner updated a Squad member.',
+                )
                 insert_audit(c, session, 'owner_squad_member_update', 'squad_member', member_id, {
                     'role': values['role'], 'status': values['status'], 'identityChanged': any(
                         values[key] != row[source] for key, source in (('ign', 'ign'), ('game_id', 'game_id'), ('server_id', 'server_id'))
@@ -1187,6 +1440,10 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {'error': 'Appoint a replacement before removing the active Squad Owner.'}, 409)
                 revoke_user_sessions(c, 'squad', member_id)
                 c.execute('DELETE FROM squad_members WHERE id=?', (member_id,))
+                create_owner_notification(
+                    c, session, 'owner_squad_member_delete', 'squad_member', member_id,
+                    'Squad member removed', 'An Overall Owner removed a Squad member.',
+                )
                 insert_audit(c, session, 'owner_squad_member_delete', 'squad_member', member_id)
                 c.commit()
         except Exception:
@@ -1216,6 +1473,10 @@ class Handler(BaseHTTPRequestHandler):
                 for former in former_rows:
                     revoke_user_sessions(c, 'squad', former['id'])
                 updated = c.execute('SELECT * FROM squad_members WHERE id=?', (member_id,)).fetchone()
+                create_owner_notification(
+                    c, session, 'owner_squad_owner_appoint', 'squad_member', member_id,
+                    'Squad Owner appointed', 'An Overall Owner appointed a Squad Owner.',
+                )
                 insert_audit(c, session, 'owner_squad_owner_appoint', 'squad_member', member_id, {
                     'replacedMemberIds': [row['id'] for row in former_rows],
                 })
@@ -1294,6 +1555,11 @@ class Handler(BaseHTTPRequestHandler):
                 if values['status'] == 'Disabled':
                     revoke_user_sessions(c, 'community', account_id)
                 updated = c.execute('SELECT * FROM community_accounts WHERE id=?', (account_id,)).fetchone()
+                if values['status'] != row['status']:
+                    create_owner_notification(
+                        c, session, 'owner_community_account_update', 'community_account', account_id,
+                        'Community account status updated', 'An Overall Owner updated a Community account status.',
+                    )
                 insert_audit(c, session, 'owner_community_account_update', 'community_account', account_id, {
                     'status': values['status'], 'identityChanged': any(
                         values[key] != row[source] for key, source in (('ign', 'ign'), ('game_id', 'game_id'), ('server_id', 'server_id'), ('email', 'email'))
@@ -1343,6 +1609,11 @@ class Handler(BaseHTTPRequestHandler):
                     revoke_user_sessions(c,'squad',mid)
                 c.execute('UPDATE squad_members SET role=? WHERE id=?',(role,mid))
                 row=c.execute('SELECT * FROM squad_members WHERE id=?',(mid,)).fetchone()
+                if s.get('type') == 'owner' and s.get('role') == 'Overall Owner':
+                    create_owner_notification(
+                        c, s, 'owner_squad_role_change', 'squad_member', mid,
+                        'Squad role updated', 'An Overall Owner updated a Squad role.',
+                    )
                 insert_audit(c,s,'role_change','squad_member',mid,{'role':role})
                 c.commit()
         except Exception:

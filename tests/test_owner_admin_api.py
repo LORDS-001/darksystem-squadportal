@@ -1160,5 +1160,207 @@ class OwnerAccountAdministrationTests(unittest.TestCase):
         self.assertEqual(race.status, 409)
 
 
+class OwnerSquadContentAdministrationTests(unittest.TestCase):
+    """Owner-only, compatibility-safe Squad content administration."""
+
+    def setUp(self):
+        self.backend = BackendHarness()
+        setup = self.backend.request(
+            "POST", "/api/owner/setup", {
+                "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+                "username": "content-owner", "password": "owner-password-123",
+                "squadOwner": {
+                    "ign": "ContentOwner", "gameId": "123456", "serverId": "1234",
+                    "accessCode": "DS-CONTENT-OWNER",
+                },
+            },
+        )
+        self.assertEqual(setup.status, 200)
+        login = self.backend.request(
+            "POST", "/api/owner/login",
+            {"username": "content-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(login.status, 200)
+        self.owner_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+    def tearDown(self):
+        self.backend.close()
+
+    def owner_request(self, method, path, payload=None, cookie=None):
+        return self.backend.request(method, path, payload, cookie=cookie or self.owner_cookie)
+
+    @staticmethod
+    def content_cases():
+        return {
+            "announcements": {"title": "Roster call", "body": "Report before 19:00."},
+            "reports": {"title": "Match report", "body": "The roster is ready."},
+            "complaints": {"subject": "Conduct", "body": "Review this report."},
+            "events": {"title": "Practice", "date": "2099-05-01", "time": "19:00", "description": "Scrim."},
+            "notifications": {"title": "Owner notice", "message": "The schedule changed."},
+        }
+
+    def test_owner_content_crud_uses_the_allowed_domain_shapes_and_audits_mutations(self):
+        """Removing field validation, CRUD persistence, or transaction audit breaks this contract."""
+        for index, (domain, payload) in enumerate(self.content_cases().items()):
+            content_id = f"content-{index}"
+            with self.subTest(domain=domain):
+                created = self.owner_request(
+                    "POST", f"/api/owner/squad-content/{domain}/{content_id}",
+                    {**payload, "accessCode": "OWNER-CONTENT-SECRET", "actorRole": "Squad Owner"},
+                )
+                self.assertEqual(created.status, 201)
+                self.assertEqual(created.json["item"]["id"], content_id)
+                self.assertNotIn("accessCode", created.json["item"])
+                self.assertNotIn("actorRole", created.json["item"])
+                self.assertIn("createdAt", created.json["item"])
+
+                listed = self.owner_request("GET", f"/api/owner/squad-content?domain={domain}")
+                self.assertEqual(listed.status, 200)
+                self.assertEqual(listed.json["domain"], domain)
+                self.assertIn(content_id, [item["id"] for item in listed.json["items"]])
+
+                updated_payload = dict(payload)
+                if domain == "notifications":
+                    updated_payload["message"] = "The schedule was moved."
+                elif domain == "events":
+                    updated_payload["description"] = "Scrim moved to a new time."
+                else:
+                    updated_payload["body"] = "Updated by the Overall Owner."
+                updated = self.owner_request(
+                    "PATCH", f"/api/owner/squad-content/{domain}/{content_id}", updated_payload,
+                )
+                self.assertEqual(updated.status, 200)
+                self.assertEqual(updated.json["item"]["id"], content_id)
+
+                deleted = self.owner_request(
+                    "DELETE", f"/api/owner/squad-content/{domain}/{content_id}", {},
+                )
+                self.assertEqual(deleted.status, 200)
+                self.assertTrue(deleted.json["ok"])
+
+        audit = self.owner_request("GET", "/api/owner/audit")
+        self.assertEqual(audit.status, 200)
+        actions = {item["action"] for item in audit.json["audit"]}
+        self.assertIn("owner_squad_content_create", actions)
+        self.assertIn("owner_squad_content_update", actions)
+        self.assertIn("owner_squad_content_delete", actions)
+        self.assertNotIn("owner-content-secret", json.dumps(audit.json).lower())
+
+    def test_owner_content_rejects_unknown_domains_and_invalid_domain_payloads(self):
+        """Removing the allowlist or a domain requirement must fail these requests."""
+        self.assertEqual(
+            self.owner_request("GET", "/api/owner/squad-content?domain=secrets").status,
+            400,
+        )
+        self.assertEqual(
+            self.owner_request("POST", "/api/owner/squad-content/secrets/item-1", {"title": "Nope"}).status,
+            400,
+        )
+        for domain in self.content_cases():
+            with self.subTest(domain=domain):
+                self.assertEqual(
+                    self.owner_request(
+                        "POST", f"/api/owner/squad-content/{domain}/invalid-{domain}", {},
+                    ).status,
+                    400,
+                )
+
+    def test_every_owner_content_route_requires_an_overall_owner_session(self):
+        """Changing the common Owner guard must not expose a content read or mutation."""
+        community = self.backend.request("POST", "/api/community/register", {
+            "email": "content-community@example.test", "password": "member-password-123",
+            "ign": "ContentCommunity", "gameId": "654321", "serverId": "4321",
+        })
+        self.assertEqual(community.status, 200)
+        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        squad = self.backend.request("POST", "/api/squad/login", {
+            "ign": "ContentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-CONTENT-OWNER",
+        })
+        self.assertEqual(squad.status, 200)
+        squad_cookie = squad.headers["Set-Cookie"].split(";", 1)[0]
+        manager = self.backend.request("POST", "/api/community/register", {
+            "email": "content-manager@example.test", "password": "member-password-123",
+            "ign": "ContentManager", "gameId": "654322", "serverId": "4322",
+        })
+        self.assertEqual(manager.status, 200)
+        manager_cookie = manager.headers["Set-Cookie"].split(";", 1)[0]
+        with server.LOCK, server.db() as connection:
+            connection.execute("UPDATE community_accounts SET role='Tournament Manager' WHERE id=?", (manager.json["account"]["id"],))
+            connection.commit()
+
+        routes = (
+            ("GET", "/api/owner/squad-content?domain=announcements", None),
+            ("POST", "/api/owner/squad-content/announcements/auth-content", {"title": "Title", "body": "Body"}),
+            ("PATCH", "/api/owner/squad-content/announcements/auth-content", {"title": "Title", "body": "Body"}),
+            ("DELETE", "/api/owner/squad-content/announcements/auth-content", {}),
+        )
+        for method, path, payload in routes:
+            with self.subTest(method=method, path=path, actor="anonymous"):
+                self.assertEqual(self.backend.request(method, path, payload).status, 401)
+            for actor, cookie in (("community", community_cookie), ("squad", squad_cookie), ("manager", manager_cookie)):
+                with self.subTest(method=method, path=path, actor=actor):
+                    self.assertEqual(self.backend.request(method, path, payload, cookie=cookie).status, 403)
+
+    def test_owner_member_and_role_mutations_create_persistent_sanitized_notifications(self):
+        """Removing generated notifications, their persistence, or secret sanitization breaks this flow."""
+        created = self.owner_request("POST", "/api/owner/squad-members", {
+            "name": "Notice Member", "ign": "NoticeMember", "gameId": "777777", "serverId": "7777",
+            "accessCode": "NOTICE-MEMBER-CODE",
+        })
+        self.assertEqual(created.status, 201)
+        member_id = created.json["member"]["id"]
+        changed = self.owner_request(
+            "PATCH", f"/api/owner/squad-members/{member_id}",
+            {"role": "Squad Leader", "accessCode": "NOTICE-ROTATED-CODE"},
+        )
+        self.assertEqual(changed.status, 200)
+        appointed = self.owner_request("POST", "/api/owner/squad-owner", {"memberId": member_id})
+        self.assertEqual(appointed.status, 200)
+        deletable = self.owner_request("POST", "/api/owner/squad-members", {
+            "name": "Delete Member", "ign": "DeleteMember", "gameId": "777778", "serverId": "7778",
+            "accessCode": "DELETE-MEMBER-CODE",
+        })
+        self.assertEqual(deletable.status, 201)
+        self.assertEqual(
+            self.owner_request("DELETE", f"/api/owner/squad-members/{deletable.json['member']['id']}", {}).status,
+            200,
+        )
+        community = self.backend.request("POST", "/api/community/register", {
+            "email": "notification-status@example.test", "password": "member-password-123",
+            "ign": "NotificationStatus", "gameId": "888888", "serverId": "8888",
+        })
+        self.assertEqual(community.status, 200)
+        self.assertEqual(
+            self.owner_request(
+                "PATCH", f"/api/owner/community-accounts/{community.json['account']['id']}",
+                {"status": "Disabled"},
+            ).status,
+            200,
+        )
+
+        second_login = self.backend.request(
+            "POST", "/api/owner/login",
+            {"username": "content-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(second_login.status, 200)
+        second_cookie = second_login.headers["Set-Cookie"].split(";", 1)[0]
+        notifications = self.owner_request(
+            "GET", "/api/owner/squad-content?domain=notifications", cookie=second_cookie,
+        )
+        self.assertEqual(notifications.status, 200)
+        actions = {item.get("action") for item in notifications.json["items"]}
+        self.assertTrue({
+            "owner_squad_member_create", "owner_squad_member_update", "owner_squad_member_delete",
+            "owner_squad_owner_appoint", "owner_community_account_update",
+        }.issubset(actions))
+        serialized = json.dumps(notifications.json).lower()
+        self.assertNotIn("notice-member-code", serialized)
+        self.assertNotIn("notice-rotated-code", serialized)
+        with server.LOCK, server.db() as connection:
+            rows = connection.execute("SELECT domain,payload FROM notifications").fetchall()
+        self.assertTrue(any(row["domain"] == "squad" for row in rows))
+        self.assertNotIn("notice-member-code", json.dumps([dict(row) for row in rows]).lower())
+
+
 if __name__ == "__main__":
     unittest.main()
