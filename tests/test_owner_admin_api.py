@@ -1560,5 +1560,229 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         self.assertFalse(next(item for item in current.json["squad"]["notifications"] if item["id"] == "reused-id")["read"])
 
 
+class OwnerTournamentAdministrationTests(unittest.TestCase):
+    """Dedicated Overall Owner tournament lifecycle administration."""
+
+    def setUp(self):
+        self.backend = BackendHarness()
+        setup = self.backend.request(
+            "POST", "/api/owner/setup", {
+                "setupSecret": BackendHarness.OWNER_SETUP_SECRET,
+                "username": "tournament-owner", "password": "owner-password-123",
+                "squadOwner": {
+                    "ign": "TournamentOwner", "gameId": "123456", "serverId": "1234",
+                    "accessCode": "DS-TOURNAMENT-OWNER",
+                },
+            },
+        )
+        self.assertEqual(setup.status, 200)
+        login = self.backend.request(
+            "POST", "/api/owner/login",
+            {"username": "tournament-owner", "password": "owner-password-123"},
+        )
+        self.assertEqual(login.status, 200)
+        self.owner_cookie = login.headers["Set-Cookie"].split(";", 1)[0]
+
+    def tearDown(self):
+        self.backend.close()
+
+    def owner_request(self, method, path, payload=None, cookie=None):
+        return self.backend.request(method, path, payload, cookie=cookie or self.owner_cookie)
+
+    def register_player(self, number):
+        response = self.backend.request(
+            "POST", "/api/community/register", {
+                "email": f"player-{number}@example.test", "password": "member-password-123",
+                "ign": f"Player{number}", "gameId": f"88000{number}", "serverId": f"880{number}",
+            },
+        )
+        self.assertEqual(response.status, 200)
+        return response.json["account"], response.headers["Set-Cookie"].split(";", 1)[0]
+
+    def test_owner_can_run_a_secret_safe_tournament_from_creation_through_archive(self):
+        """Removing any dedicated lifecycle transition, safe projection, audit, or notification breaks this flow."""
+        created = self.owner_request("POST", "/api/owner/tournaments", {
+            "title": "Owner Championship", "game": "Mobile Legends: Bang Bang",
+            "format": "1v1", "date": "2099-09-10", "time": "18:00",
+            "slots": 8, "reward": "Trophy", "rules": "Best of three.",
+        })
+        self.assertEqual(created.status, 201)
+        tournament_id = created.json["tournament"]["id"]
+        edited = self.owner_request(
+            "PATCH", f"/api/owner/tournaments/{tournament_id}", {"reward": "Championship Trophy"},
+        )
+        self.assertEqual(edited.status, 200)
+        self.assertEqual(edited.json["tournament"]["reward"], "Championship Trophy")
+
+        first, first_cookie = self.register_player(1)
+        second, second_cookie = self.register_player(2)
+        for account, cookie in ((first, first_cookie), (second, second_cookie)):
+            registered = self.backend.request(
+                "POST", "/api/tournaments/register", {"tournamentId": tournament_id}, cookie=cookie,
+            )
+            self.assertEqual(registered.status, 200)
+            registration = next(
+                item for item in registered.json["registrations"]
+                if item["accountId"] == account["id"]
+            )
+            decided = self.owner_request(
+                "POST",
+                f"/api/owner/tournaments/{tournament_id}/registrations/{registration['id']}/decision",
+                {"action": "approve"},
+            )
+            self.assertEqual(decided.status, 200)
+            self.assertEqual(decided.json["registration"]["status"], "Approved")
+
+        bracket = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/bracket", {})
+        self.assertEqual(bracket.status, 200)
+        match = bracket.json["tournament"]["matches"][0]
+        changed = self.owner_request(
+            "PATCH", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}",
+            {"scheduledAt": "2099-09-10T18:30:00Z"},
+        )
+        self.assertEqual(changed.status, 200)
+
+        player_cookies = {first["id"]: first_cookie, second["id"]: second_cookie}
+        submitted = self.backend.request(
+            "POST", "/api/tournaments/result",
+            {"tournamentId": tournament_id, "matchId": match["id"], "result": {"winner": match["player1"]}},
+            cookie=player_cookies[match["player1"]],
+        )
+        self.assertEqual(submitted.status, 200)
+        confirmed = self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament_id}/matches/{match['id']}/result",
+            {"action": "confirm"},
+        )
+        self.assertEqual(confirmed.status, 200)
+        self.assertEqual(confirmed.json["match"]["winner"], match["player1"])
+        completed = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/complete", {})
+        self.assertEqual(completed.status, 200)
+        self.assertEqual(completed.json["tournament"]["status"], "Completed")
+        archived = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/archive", {})
+        self.assertEqual(archived.status, 200)
+        self.assertEqual(archived.json["tournament"]["status"], "Archived")
+
+        with server.LOCK, server.db() as connection:
+            tournaments = server.state_get(connection, "tournaments", [])
+            stored = next(item for item in tournaments if item.get("id") == tournament_id)
+            stored["leaderAccessCode"] = "OWNER-TOURNAMENT-SECRET"
+            stored["matches"][0]["submission"]["evidenceToken"] = "OWNER-RESULT-SECRET"
+            server.state_set(connection, "tournaments", tournaments)
+            connection.commit()
+        detail = self.owner_request("GET", f"/api/owner/tournaments/{tournament_id}")
+        self.assertEqual(detail.status, 200)
+        serialized = json.dumps(detail.json).lower()
+        self.assertNotIn("owner-tournament-secret", serialized)
+        self.assertNotIn("owner-result-secret", serialized)
+        self.assertEqual(len(detail.json["registrations"]), 2)
+        self.assertEqual(len(detail.json["resultSubmissions"]), 1)
+
+        audit = self.owner_request("GET", "/api/owner/audit")
+        actions = {item["action"] for item in audit.json["audit"]}
+        self.assertTrue({
+            "owner_tournament_create", "owner_tournament_update", "owner_tournament_registration_approve",
+            "owner_tournament_bracket_generate", "owner_tournament_match_update",
+            "owner_tournament_result_confirm", "owner_tournament_complete", "owner_tournament_archive",
+        }.issubset(actions))
+        notifications = self.owner_request("GET", "/api/owner/squad-content?domain=notifications")
+        notification_actions = {item.get("action") for item in notifications.json["items"]}
+        self.assertTrue({"owner_tournament_create", "owner_tournament_complete"}.issubset(notification_actions))
+
+    def test_cancellation_reinstates_registration_state_and_rejects_invalid_transitions(self):
+        """Cancellation must close dependent registrations, and only a timely reinstatement may restore them."""
+        created = self.owner_request("POST", "/api/owner/tournaments", {
+            "title": "Cancellation Cup", "game": "MLBB", "format": "1v1", "date": "2099-10-01", "slots": 4,
+        })
+        tournament_id = created.json["tournament"]["id"]
+        account, cookie = self.register_player(3)
+        registration = self.backend.request(
+            "POST", "/api/tournaments/register", {"tournamentId": tournament_id}, cookie=cookie,
+        ).json["registrations"][0]
+        cancelled = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/cancel", {})
+        self.assertEqual(cancelled.status, 200)
+        detail = self.owner_request("GET", f"/api/owner/tournaments/{tournament_id}")
+        self.assertEqual(detail.json["registrations"][0]["status"], "Tournament Cancelled")
+        self.assertEqual(self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/cancel", {}).status, 409)
+        reinstated = self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/reinstate", {})
+        self.assertEqual(reinstated.status, 200)
+        detail = self.owner_request("GET", f"/api/owner/tournaments/{tournament_id}")
+        self.assertEqual(detail.json["registrations"][0]["status"], "Registered")
+        self.assertEqual(self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/complete", {}).status, 409)
+        with server.LOCK, server.db() as connection:
+            tournaments = server.state_get(connection, "tournaments", [])
+            target = next(item for item in tournaments if item["id"] == tournament_id)
+            target.update(status="Cancelled", cancelledAt="2000-01-01T00:00:00Z")
+            server.state_set(connection, "tournaments", tournaments)
+            connection.commit()
+        self.assertEqual(self.owner_request("POST", f"/api/owner/tournaments/{tournament_id}/reinstate", {}).status, 409)
+
+    def test_squad_approval_and_tournament_manager_permissions_are_owner_administered(self):
+        """Approval decisions and Manager grants must be validated, secret-safe, notified, and audited."""
+        member = self.owner_request("POST", "/api/owner/squad-members", {
+            "name": "Tournament Lead", "ign": "TournamentLead", "gameId": "990001", "serverId": "9901",
+            "accessCode": "TOURNAMENT-LEAD-CODE", "role": "Squad Leader",
+        }).json["member"]
+        granted = self.owner_request(
+            "POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "grant"},
+        )
+        self.assertEqual(granted.status, 200)
+        self.assertTrue(granted.json["granted"])
+        self.assertEqual(
+            self.owner_request("POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "grant"}).status,
+            409,
+        )
+        revoked = self.owner_request(
+            "POST", f"/api/owner/tournament-managers/{member['id']}", {"action": "revoke"},
+        )
+        self.assertEqual(revoked.status, 200)
+        self.assertFalse(revoked.json["granted"])
+
+        tournament = self.owner_request("POST", "/api/owner/tournaments", {
+            "title": "Squad Cup", "game": "MLBB", "format": "Squad vs Squad", "date": "2099-11-01",
+            "squadSlots": 8, "membersPerSquad": 7,
+        }).json["tournament"]
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "squadTournamentApprovals", [{
+                "id": "approval-owner-test", "tournamentId": tournament["id"], "status": "Pending",
+                "leaderAccountId": "leader-account", "squadName": "Dark Alpha", "memberAccessCode": "OLD-SECRET",
+            }])
+            connection.commit()
+        approved = self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament['id']}/approvals/approval-owner-test/decision",
+            {"action": "approve"},
+        )
+        self.assertEqual(approved.status, 200)
+        self.assertEqual(approved.json["approval"]["status"], "Approved")
+        self.assertNotIn("code", json.dumps(approved.json).lower())
+        self.assertEqual(self.owner_request(
+            "POST", f"/api/owner/tournaments/{tournament['id']}/approvals/approval-owner-test/decision",
+            {"action": "reject"},
+        ).status, 409)
+
+    def test_owner_tournament_routes_enforce_owner_auth_and_rollback_audit_failures(self):
+        """Weakening the Owner guard or separating audit from state persistence must fail this test."""
+        community, community_cookie = self.register_player(4)
+        squad = self.backend.request("POST", "/api/squad/login", {
+            "ign": "TournamentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-TOURNAMENT-OWNER",
+        })
+        squad_cookie = squad.headers["Set-Cookie"].split(";", 1)[0]
+        routes = (
+            ("GET", "/api/owner/tournaments", None),
+            ("POST", "/api/owner/tournaments", {"title": "No", "game": "MLBB", "format": "1v1", "date": "2099-01-01"}),
+            ("POST", "/api/owner/tournament-managers/1", {"action": "grant"}),
+        )
+        for method, path, payload in routes:
+            self.assertEqual(self.backend.request(method, path, payload).status, 401)
+            self.assertEqual(self.backend.request(method, path, payload, cookie=community_cookie).status, 403)
+            self.assertEqual(self.backend.request(method, path, payload, cookie=squad_cookie).status, 403)
+        with patch.object(server, "insert_audit", side_effect=RuntimeError("audit unavailable")):
+            failed = self.owner_request("POST", "/api/owner/tournaments", {
+                "title": "Rollback Cup", "game": "MLBB", "format": "1v1", "date": "2099-12-01",
+            })
+        self.assertEqual(failed.status, 503)
+        listed = self.owner_request("GET", "/api/owner/tournaments")
+        self.assertNotIn("Rollback Cup", [item.get("title") for item in listed.json["tournaments"]])
+
+
 if __name__ == "__main__":
     unittest.main()
