@@ -255,22 +255,52 @@ def public_account(r):
     d['linkedSquad'] = bool(d.pop('linked_squad',0))
     return d
 
+def public_bootstrap_member(r):
+    member = public_member(r)
+    return {
+        key: member[key]
+        for key in ('id', 'name', 'ign', 'gameId', 'serverId', 'role', 'lane', 'status', 'profileComplete', 'accountActivated')
+        if key in member
+    }
+
+def public_bootstrap_tournament(tournament):
+    if not isinstance(tournament, dict):
+        return None
+    return {
+        key: tournament[key]
+        for key in ('id', 'title', 'game', 'format', 'date', 'time', 'slots', 'status', 'reward', 'rules')
+        if key in tournament
+    }
+
+def safe_owner_squad_member(r):
+    member = public_member(r)
+    return {
+        key: member[key]
+        for key in ('id', 'name', 'ign', 'gameId', 'serverId', 'role', 'lane', 'email', 'phone', 'birthday', 'status', 'lastLogin', 'profileComplete', 'accountActivated')
+        if key in member
+    }
+
+def safe_owner_community_account(r):
+    account = public_account(r)
+    return {
+        key: account[key]
+        for key in ('id', 'squadMemberId', 'ign', 'gameId', 'serverId', 'email', 'phone', 'role', 'lane', 'createdAt', 'emailNotifications', 'linkedSquad')
+        if key in account
+    }
+
 def bootstrap(session):
     with LOCK, db() as c:
-        auth = session or {}
-        include_secret = auth.get('type') == 'squad' and auth.get('role') in ('Squad Owner','Squad Leader','Assistant Squad Leader')
-        members = [public_member(r, include_secret) for r in c.execute('SELECT * FROM squad_members').fetchall()]
-        accounts = [public_account(r) for r in c.execute('SELECT * FROM community_accounts').fetchall()]
-        community = {
-          'accounts': accounts,
-          'tournaments': state_get(c,'tournaments',[]), 'registrations': state_get(c,'registrations',[]),
-          'tournamentManagers': state_get(c,'tournamentManagers',[]), 'notifications': state_get(c,'community_notifications',[]),
-          'seasonPoints': state_get(c,'seasonPoints',{}), 'seasonHistory': state_get(c,'seasonHistory',[]),
-          'seasonHallOfFame': state_get(c,'seasonHallOfFame',[]), 'eventParticipation': state_get(c,'eventParticipation',[]),
-          'currentSeason': state_get(c,'currentSeason',None), 'hallOfFame': state_get(c,'hallOfFame',[]),
-          'squadTournamentApprovals': state_get(c,'squadTournamentApprovals',[])
+        members = [public_bootstrap_member(r) for r in c.execute('SELECT * FROM squad_members').fetchall()]
+        tournaments = [
+            item for tournament in state_get(c, 'tournaments', [])
+            if (item := public_bootstrap_tournament(tournament)) is not None
+        ]
+        community = {'tournaments': tournaments}
+        squad = {
+            'members': members,
+            'announcements': state_get(c, 'announcements', []),
+            'events': state_get(c, 'events', []),
         }
-        squad = {'members':members,'announcements':state_get(c,'announcements',[]),'reports':state_get(c,'reports',[]),'complaints':state_get(c,'complaints',[]),'events':state_get(c,'events',[]),'reportConfig':state_get(c,'reportConfig',{}) ,'notifications':[]}
         return {'squad':squad,'community':community}
 
 def request_header(handler, name, default=''):
@@ -354,6 +384,15 @@ def require_auth(h, types=None):
     if not s or (types and s.get('type') not in types):
         json_response(h, {'error':'Authentication required'}, 401); return None
     return s
+
+def require_overall_owner(h):
+    session = require_auth(h)
+    if not session:
+        return None
+    if session.get('type') != 'owner' or session.get('role') != 'Overall Owner':
+        json_response(h, {'error':'Overall Owner permission required.'}, 403)
+        return None
+    return session
 
 def request_is_https(h):
     forwarded_proto = request_header(h, 'X-Forwarded-Proto')
@@ -654,9 +693,8 @@ class Handler(BaseHTTPRequestHandler):
         return json_response(self, {'ok':True},200,{'Set-Cookie':clear_session_cookie(self)})
 
     def owner_overview(self):
-        s=require_auth(self,['owner'])
+        s=require_overall_owner(self)
         if not s:return
-        if s.get('role')!='Overall Owner': return json_response(self,{'error':'Overall Owner permission required.'},403)
         with LOCK, db() as c:
             tournaments=state_get(c,'tournaments',[])
             registrations=state_get(c,'registrations',[])
@@ -696,10 +734,26 @@ class Handler(BaseHTTPRequestHandler):
         return json_response(self,{'health':{'backend':'healthy','database':'healthy'},'counts':counts,'pending':pending,'recentAudit':audit})
 
     def owner_audit(self):
-        s=require_auth(self,['owner'])
+        s=require_overall_owner(self)
         if not s:return
-        if s.get('role')!='Overall Owner': return json_response(self,{'error':'Overall Owner permission required.'},403)
-        with LOCK, db() as c: rows=[dict(r) for r in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC LIMIT 500').fetchall()]
+        with LOCK, db() as c:
+            secret_values=set()
+            for query, column in (
+                ('SELECT access_code FROM squad_members', 'access_code'),
+                ('SELECT password_hash FROM community_accounts', 'password_hash'),
+                ('SELECT reset_code FROM community_accounts WHERE reset_code IS NOT NULL', 'reset_code'),
+                ('SELECT password_hash FROM owner_accounts', 'password_hash'),
+            ):
+                for row in c.execute(query).fetchall():
+                    if row[column]: secret_values.add(str(row[column]))
+            session_token_hashes={str(row['token']) for row in c.execute('SELECT token FROM sessions').fetchall() if row['token']}
+            cookies=SimpleCookie(); cookies.load(request_header(self, 'Cookie'))
+            if cookies.get(COOKIE_NAME): secret_values.add(cookies[COOKIE_NAME].value)
+            rows=[]
+            for row in c.execute('SELECT id,actor_type,actor_id,actor_role,action,target_type,target_id,created_at,details FROM audit_log ORDER BY created_at DESC, id DESC LIMIT 500').fetchall():
+                item=sanitize_overview_value(dict(row), secret_values, session_token_hashes)
+                item['details']=overview_details(item.get('details'), secret_values, session_token_hashes)
+                rows.append(item)
         return json_response(self,{'audit':rows})
 
     def roles_info(self):
@@ -745,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK, db() as c:
             if c.execute('SELECT 1 FROM community_accounts WHERE lower(email)=?',(email,)).fetchone(): return json_response(self, {'error':'An account with this email already exists.'},409)
             aid=str(int(time.time()*1000)); created=now_iso()
-            c.execute('INSERT INTO community_accounts(id,squad_member_id,ign,game_id,server_id,email,phone,password_hash,role,lane,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(aid,d.get('squadMemberId'),str(d.get('ign','')).strip(),str(d.get('gameId','')).strip(),str(d.get('serverId','')).strip(),email,str(d.get('phone','')).strip(),hash_password(password),d.get('role','Community Member'),d.get('lane',''),created))
+            c.execute('INSERT INTO community_accounts(id,squad_member_id,ign,game_id,server_id,email,phone,password_hash,role,lane,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(aid,d.get('squadMemberId'),str(d.get('ign','')).strip(),str(d.get('gameId','')).strip(),str(d.get('serverId','')).strip(),email,str(d.get('phone','')).strip(),hash_password(password),'Community Member',d.get('lane',''),created))
             c.commit(); row=c.execute('SELECT * FROM community_accounts WHERE id=?',(aid,)).fetchone()
         token=create_session('community',aid,row['role'] or 'Community Member');
         return json_response(self, {'account':public_account(row)},200,{'Set-Cookie':session_cookie(self, token)})
