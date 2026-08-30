@@ -1515,6 +1515,50 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM notifications").fetchone()["n"], notifications_before)
             self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"], audit_before)
 
+    def test_content_projection_keeps_valid_long_text_and_metadata_has_an_aggregate_budget(self):
+        """A safe projection must not truncate valid domain text, but metadata must stay bounded."""
+        long_body = "x" * 8000
+        created = self.owner_request(
+            "POST", "/api/owner/squad-content/events/long-event",
+            {"title": "Long event", "date": "2099-07-01", "rules": long_body, "body": long_body},
+        )
+        self.assertEqual(created.status, 201)
+        listed = self.owner_request("GET", "/api/owner/squad-content?domain=events")
+        event = next(item for item in listed.json["items"] if item["id"] == "long-event")
+        self.assertEqual(event["rules"], long_body)
+        self.assertEqual(event["body"], long_body)
+        oversized_values = {f"field-{index}": "x" * 4000 for index in range(10)}
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/reports/metadata-budget",
+            {"body": "Body", "values": oversized_values},
+        ).status, 400)
+
+    def test_notification_delete_removes_recipient_receipts_before_recreate(self):
+        """Deleting a notification must remove its receipts so a reused id starts unread."""
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/notifications/reused-id",
+            {"title": "First", "message": "First message", "audienceType": "squad"},
+        ).status, 201)
+        squad_login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "ContentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-CONTENT-OWNER",
+        })
+        self.assertEqual(squad_login.status, 200)
+        squad_cookie = squad_login.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.backend.request(
+            "POST", "/api/squad/notifications/read", {"id": "reused-id"}, cookie=squad_cookie,
+        ).status, 200)
+        self.assertEqual(self.owner_request(
+            "DELETE", "/api/owner/squad-content/notifications/reused-id", {},
+        ).status, 200)
+        with server.LOCK, server.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM notification_reads WHERE notification_id='reused-id'").fetchone()["n"], 0)
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/notifications/reused-id",
+            {"title": "Second", "message": "Second message", "audienceType": "squad"},
+        ).status, 201)
+        current = self.backend.request("GET", "/api/bootstrap", cookie=squad_cookie)
+        self.assertFalse(next(item for item in current.json["squad"]["notifications"] if item["id"] == "reused-id")["read"])
+
 
 if __name__ == "__main__":
     unittest.main()

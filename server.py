@@ -287,27 +287,32 @@ def state_set(c, key, value):
 def safe_owner_content_item(domain, item):
     if domain not in OWNER_CONTENT_DOMAINS or not isinstance(item, dict):
         return None
-    return {key: sanitize_content_metadata(item[key]) for key in OWNER_CONTENT_FIELDS[domain] if key in item and sanitize_content_metadata(item[key]) is not _CONTENT_OMIT}
+    result={}
+    for key in OWNER_CONTENT_FIELDS[domain]:
+        if key not in item: continue
+        clean=sanitize_content_metadata(item[key], string_limit=4000 if key in ('values','files') else 8000)
+        if clean is not _CONTENT_OMIT: result[key]=clean
+    return result
 
 _CONTENT_OMIT = object()
 _CONTENT_SECRET_KEY = re.compile(r'(?:password|access.?code|token|reset|secret|credential)', re.I)
-def sanitize_content_metadata(value, depth=0):
+def sanitize_content_metadata(value, depth=0, string_limit=8000):
     if depth > 5: return _CONTENT_OMIT
     if isinstance(value, str):
-        return _CONTENT_OMIT if len(value) > 4000 or re.search(r'(?:access\s*code|password|reset\s*code|session\s*token)\s*[:=]', value, re.I) else value
+        return _CONTENT_OMIT if len(value) > string_limit or re.search(r'(?:access\s*code|password|reset\s*code|session\s*token)\s*[:=]', value, re.I) else value
     if value is None or isinstance(value, (bool, int, float)): return value
     if isinstance(value, list):
         if len(value) > 30: return _CONTENT_OMIT
-        return [clean for item in value if (clean := sanitize_content_metadata(item, depth + 1)) is not _CONTENT_OMIT]
+        return [clean for item in value if (clean := sanitize_content_metadata(item, depth + 1, string_limit)) is not _CONTENT_OMIT]
     if isinstance(value, dict):
         if len(value) > 50: return _CONTENT_OMIT
-        return {str(key): clean for key, item in value.items() if len(str(key)) <= 80 and not _CONTENT_SECRET_KEY.search(str(key)) and (clean := sanitize_content_metadata(item, depth + 1)) is not _CONTENT_OMIT}
+        return {str(key): clean for key, item in value.items() if len(str(key)) <= 80 and not _CONTENT_SECRET_KEY.search(str(key)) and (clean := sanitize_content_metadata(item, depth + 1, string_limit)) is not _CONTENT_OMIT}
     return _CONTENT_OMIT
 
 def validate_content_metadata(value, expected):
     if not isinstance(value, expected): return None
-    clean=sanitize_content_metadata(value)
-    if clean is _CONTENT_OMIT or clean != value: return None
+    clean=sanitize_content_metadata(value, string_limit=4000)
+    if clean is _CONTENT_OMIT or clean != value or len(json.dumps(clean,separators=(',',':')).encode()) > 16000: return None
     return clean
 
 def owner_content_items(connection, domain, notification_domain=None):
@@ -1353,6 +1358,7 @@ class Handler(BaseHTTPRequestHandler):
                     row = c.execute('SELECT domain FROM notifications WHERE id=?', (item_id,)).fetchone()
                     if not row or (requested_domain and row['domain'] != requested_domain):
                         return json_response(self, {'error': 'Content not found.'}, 404)
+                    c.execute('DELETE FROM notification_reads WHERE notification_id=?', (item_id,))
                     c.execute('DELETE FROM notifications WHERE id=?', (item_id,))
                 else:
                     items = state_get(c, domain, [])
