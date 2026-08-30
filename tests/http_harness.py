@@ -382,6 +382,7 @@ class BackendHarness:
         self._original_database_url = server.DATABASE_URL
         self._original_session_secret = server.SESSION_SECRET
         self._original_owner_setup_secret = getattr(server, "OWNER_SETUP_SECRET", _MISSING)
+        self._original_rate_limits = dict(server.RATE_LIMITS)
         self._temporary_directory = None
         self._closed = True
         with BackendHarness._active_lock:
@@ -394,6 +395,7 @@ class BackendHarness:
             server.DATABASE_URL = ""
             server.SESSION_SECRET = "test-owner-session-secret"
             server.OWNER_SETUP_SECRET = self.OWNER_SETUP_SECRET
+            server.RATE_LIMITS.clear()
             server.init_db()
         except Exception:
             try:
@@ -401,6 +403,7 @@ class BackendHarness:
                 server.DATABASE_URL = self._original_database_url
                 server.SESSION_SECRET = self._original_session_secret
                 self._restore_owner_setup_secret()
+                self._restore_rate_limits()
                 if self._temporary_directory:
                     self._temporary_directory.cleanup()
             finally:
@@ -478,6 +481,7 @@ class BackendHarness:
             server.DATABASE_URL = self._original_database_url
             server.SESSION_SECRET = self._original_session_secret
             self._restore_owner_setup_secret()
+            self._restore_rate_limits()
             self._temporary_directory.cleanup()
         finally:
             self._closed = True
@@ -490,6 +494,10 @@ class BackendHarness:
                 delattr(server, "OWNER_SETUP_SECRET")
         else:
             server.OWNER_SETUP_SECRET = self._original_owner_setup_secret
+
+    def _restore_rate_limits(self):
+        server.RATE_LIMITS.clear()
+        server.RATE_LIMITS.update(self._original_rate_limits)
 
     @staticmethod
     def _parse_response(raw_response: bytes) -> BackendResponse:
