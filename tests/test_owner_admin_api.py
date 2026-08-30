@@ -1361,6 +1361,98 @@ class OwnerSquadContentAdministrationTests(unittest.TestCase):
         self.assertTrue(any(row["domain"] == "squad" for row in rows))
         self.assertNotIn("notice-member-code", json.dumps([dict(row) for row in rows]).lower())
 
+    def test_persisted_notifications_are_scoped_by_audience_domain_and_read_cross_device(self):
+        """Changing table scoping or read persistence must not leak notifications across audiences."""
+        community = self.backend.request("POST", "/api/community/register", {
+            "email": "notification-recipient@example.test", "password": "member-password-123",
+            "ign": "NotificationRecipient", "gameId": "999991", "serverId": "9991",
+        })
+        self.assertEqual(community.status, 200)
+        community_id = community.json["account"]["id"]
+        community_cookie = community.headers["Set-Cookie"].split(";", 1)[0]
+        squad_login = self.backend.request("POST", "/api/squad/login", {
+            "ign": "ContentOwner", "gameId": "123456", "serverId": "1234", "accessCode": "DS-CONTENT-OWNER",
+        })
+        self.assertEqual(squad_login.status, 200)
+        squad_cookie = squad_login.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/notifications/squad-recipient",
+            {"title": "Squad only", "message": "For the Squad Owner.", "audienceType": "squad", "audienceId": "1"},
+        ).status, 201)
+        self.assertEqual(self.owner_request(
+            "POST", "/api/owner/squad-content/notifications/community-recipient",
+            {"title": "Community only", "message": "For the Community account.", "audienceType": "community", "audienceId": community_id},
+        ).status, 201)
+
+        squad_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=squad_cookie)
+        self.assertEqual([item["id"] for item in squad_bootstrap.json["squad"]["notifications"]], ["squad-recipient"])
+        self.assertEqual(self.backend.request("POST", "/api/squad/notifications/read", {"id": "squad-recipient"}, cookie=squad_cookie).status, 200)
+        squad_second_device = self.backend.request("GET", "/api/bootstrap", cookie=squad_cookie)
+        self.assertTrue(squad_second_device.json["squad"]["notifications"][0]["read"])
+
+        community_bootstrap = self.backend.request("GET", "/api/bootstrap", cookie=community_cookie)
+        self.assertEqual([item["id"] for item in community_bootstrap.json["community"]["notifications"]], ["community-recipient"])
+        self.assertEqual(self.backend.request(
+            "POST", "/api/community/notifications/read", {"id": "community-recipient"}, cookie=community_cookie,
+        ).status, 200)
+        community_second_device = self.backend.request("GET", "/api/bootstrap", cookie=community_cookie)
+        self.assertTrue(community_second_device.json["community"]["notifications"][0]["read"])
+        community_list = self.owner_request("GET", "/api/owner/squad-content?domain=notifications&audienceType=community")
+        self.assertEqual([item["id"] for item in community_list.json["items"]], ["community-recipient"])
+        self.assertEqual(self.owner_request(
+            "PATCH", "/api/owner/squad-content/notifications/community-recipient?audienceType=squad",
+            {"title": "No", "message": "No"},
+        ).status, 404)
+
+    def test_owner_content_patch_preserves_legacy_render_fields_and_audit_failure_rolls_back(self):
+        """Replacing a record must preserve legacy fields, and an audit failure must persist nothing."""
+        with server.LOCK, server.db() as connection:
+            server.state_set(connection, "reports", [{
+                "id": "legacy-report", "memberId": "1", "title": "Old", "body": "Old body",
+                "values": {"reportTitle": "Old", "reportDetails": "Old body"}, "time": "2099-01-01T00:00:00Z",
+                "files": [{"name": "proof.png", "type": "image/png", "size": 12}], "legacyMarker": "keep",
+            }])
+            server.state_set(connection, "complaints", [{
+                "id": "legacy-complaint", "memberId": "1", "title": "Issue", "body": "Old complaint",
+                "time": "2099-01-01T00:00:00Z", "files": [{"name": "proof.pdf", "size": 13}],
+                "response": "Investigating", "respondedBy": "Leader", "legacyMarker": "keep",
+            }])
+            server.state_set(connection, "events", [{
+                "id": "legacy-event", "title": "Legacy event", "date": "2099-06-01", "time": "19:00",
+                "rules": "Be ready", "body": "Venue", "legacyMarker": "keep",
+            }])
+            connection.commit()
+
+        self.assertEqual(self.owner_request(
+            "PATCH", "/api/owner/squad-content/reports/legacy-report", {"body": "New body"},
+        ).status, 200)
+        self.assertEqual(self.owner_request(
+            "PATCH", "/api/owner/squad-content/complaints/legacy-complaint", {"body": "New complaint"},
+        ).status, 200)
+        self.assertEqual(self.owner_request(
+            "PATCH", "/api/owner/squad-content/events/legacy-event", {"rules": "Updated rules", "body": "New venue"},
+        ).status, 200)
+        with server.LOCK, server.db() as connection:
+            report = server.state_get(connection, "reports", [])[0]
+            complaint = server.state_get(connection, "complaints", [])[0]
+            event = server.state_get(connection, "events", [])[0]
+        self.assertEqual(report["values"]["reportDetails"], "Old body")
+        self.assertEqual(report["files"][0]["name"], "proof.png")
+        self.assertEqual(report["legacyMarker"], "keep")
+        self.assertEqual(complaint["response"], "Investigating")
+        self.assertEqual(complaint["files"][0]["name"], "proof.pdf")
+        self.assertEqual(event["rules"], "Updated rules")
+        self.assertEqual(event["body"], "New venue")
+        self.assertEqual(event["legacyMarker"], "keep")
+        with patch.object(server, "insert_audit", side_effect=RuntimeError("audit unavailable")):
+            failed = self.owner_request(
+                "POST", "/api/owner/squad-content/announcements/rollback-test",
+                {"title": "Rollback", "body": "This must not persist."},
+            )
+        self.assertEqual(failed.status, 503)
+        with server.LOCK, server.db() as connection:
+            self.assertFalse(any(item.get("id") == "rollback-test" for item in server.state_get(connection, "announcements", [])))
+
 
 if __name__ == "__main__":
     unittest.main()
