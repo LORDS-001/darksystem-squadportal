@@ -243,61 +243,6 @@ function appendMetricGroup(container, title, values) {
   container.append(group);
 }
 
-function renderOwnerDashboard(data) {
-  const dashboard = ownerElement("section", "owner-admin__dashboard");
-  const header = ownerElement("header", "owner-admin__dashboard-header");
-  const heading = ownerElement("div", "owner-admin__dashboard-heading");
-  heading.append(
-    ownerElement("p", "owner-admin__eyebrow", "OVERALL OWNER"),
-    ownerElement("h1", "owner-admin__title", "Overview"),
-    ownerElement("p", "owner-admin__copy", "Current operational state for Dark System."),
-  );
-  const logout = ownerElement("button", "owner-admin__button owner-admin__button--secondary", "Logout");
-  logout.type = "button";
-  logout.addEventListener("click", ownerLogout);
-  header.append(heading, logout);
-  const logoutError = ownerElement("p", "owner-admin__error-banner owner-admin__logout-error");
-  logoutError.hidden = true;
-  logoutError.setAttribute("role", "alert");
-  dashboard.append(header, logoutError);
-
-  const health = data && typeof data.health === "object" ? data.health : {};
-  const healthCard = ownerElement("section", "owner-admin__health-card");
-  const backendHealth = ownerElement("p", "owner-admin__health-indicator", "Backend: ");
-  backendHealth.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.backend)));
-  const databaseHealth = ownerElement("p", "owner-admin__health-indicator", "Database: ");
-  databaseHealth.append(ownerElement("span", "owner-admin__health-value", ownerValue(health.database)));
-  healthCard.append(ownerElement("h2", "owner-admin__section-title", "System health"), backendHealth, databaseHealth);
-  dashboard.append(healthCard);
-  appendMetricGroup(dashboard, "System totals", data && data.counts);
-  appendMetricGroup(dashboard, "Pending work", data && data.pending);
-
-  const activity = ownerElement("section", "owner-admin__activity-section");
-  activity.append(ownerElement("h2", "owner-admin__section-title", "Recent Activity"));
-  const list = ownerElement("div", "owner-admin__activity-list");
-  const recentAudit = Array.isArray(data && data.recentAudit) ? data.recentAudit : [];
-  if (!recentAudit.length) {
-    list.append(ownerElement("p", "owner-admin__empty", "No recent activity is available."));
-  } else {
-    for (const item of recentAudit) {
-      const row = ownerElement("article", "owner-admin__activity-item");
-      const detail = ownerElement("div", "owner-admin__activity-detail");
-      const meta = ownerElement("span", "owner-admin__activity-meta");
-      meta.append(
-        document.createTextNode(ownerValue(item && item.actor_role)),
-        document.createTextNode(" / "),
-        document.createTextNode(ownerValue(item && item.created_at)),
-      );
-      detail.append(ownerElement("span", "owner-admin__activity-dot"), ownerElement("strong", "owner-admin__activity-action", ownerValue(item && item.action)), meta);
-      row.append(detail);
-      list.append(row);
-    }
-  }
-  activity.append(list);
-  dashboard.append(activity);
-  setOwnerRoot(dashboard);
-}
-
 const OWNER_SECTIONS = [
   ["overview", "Overview"], ["squads", "Squads"], ["community", "Community"],
   ["content", "Content"], ["tournaments", "Tournaments"],
@@ -392,14 +337,15 @@ function ownerRows(items, columns, actions) {
   const table = ownerElement("table", "owner-admin__table");
   const thead = ownerElement("thead");
   const heading = ownerElement("tr");
-  for (const column of columns) heading.append(ownerElement("th", "", ownerLabel(column)));
-  if (actions) heading.append(ownerElement("th", "", "Actions"));
+  const headerCell = (text) => { const cell = ownerElement("th", "", text); cell.scope = "col"; return cell; };
+  for (const column of columns) heading.append(headerCell(ownerLabel(column.split("|")[0])));
+  if (actions) heading.append(headerCell("Actions"));
   thead.append(heading);
   const tbody = ownerElement("tbody");
   for (const raw of items) {
     const item = OwnerAdminApi.scrub(raw);
     const row = ownerElement("tr");
-    for (const column of columns) row.append(ownerElement("td", "", ownerValue(item[column])));
+    for (const column of columns) row.append(ownerElement("td", "", ownerValue(column.split("|").map((key) => item[key]).find((value) => value !== undefined && value !== null && value !== ""))));
     if (actions) { const cell = ownerElement("td", "owner-admin__actions"); actions(item, cell); row.append(cell); }
     tbody.append(row);
   }
@@ -495,6 +441,13 @@ async function renderOwnerContent(shell) {
     if (domain.value === "complaints") return [{ name: "subject", label: "Subject", required: false }, { name: "body", label: "Complaint" }];
     return [{ name: "title", label: "Title", required: domain.value === "announcements" }, { name: "body", label: "Body" }];
   }
+  function columnsForDomain() {
+    if (domain.value === "events") return ["id", "title", "date", "time", "createdAt"];
+    if (domain.value === "notifications") return ["id", "title", "message", "audienceId", "createdAt"];
+    if (domain.value === "complaints") return ["id", "subject", "memberId", "response", "createdAt|time"];
+    if (domain.value === "reports") return ["id", "title", "memberId", "author", "createdAt|time"];
+    return ["id", "title", "author", "createdAt|time"];
+  }
   function rebuildForms() {
     const old = shell.content.querySelector(".owner-admin__content-forms"); if (old) old.remove();
     const forms = ownerElement("div", "owner-admin__content-forms");
@@ -512,13 +465,14 @@ async function renderOwnerContent(shell) {
     const data = await ownerRequest(`${OwnerAdminSquad.endpoints.content}?domain=${encodeURIComponent(domain.value)}`);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    records.append(ownerRows(data.items, ["id", "title", "subject", "date", "status", "audienceType", "createdAt"], (item, cell) => cell.append(ownerActionButton(shell, "Delete", async () => {
+    records.append(ownerRows(data.items, columnsForDomain(), (item, cell) => cell.append(ownerActionButton(shell, "Delete", async () => {
       await ownerRequest(`${OwnerAdminSquad.endpoints.content}/${domain.value}/${encodeURIComponent(item.id)}`, { method: "DELETE" }); await draw();
     }, { confirmText: "Delete this content item?" })))); shell.content.append(records);
   };
   domain.value = "announcements";
   domain.addEventListener("change", () => { rebuildForms(); draw().catch((e) => ownerSetNotice(shell, e.message, true)); });
-  shell.content.append(label, domain); rebuildForms(); await draw();
+  const domainField = ownerElement("div", "owner-admin__field"); domainField.append(label, domain);
+  shell.content.append(domainField); rebuildForms(); await draw();
 }
 
 async function renderOwnerTournaments(shell) {
@@ -533,14 +487,14 @@ async function renderOwnerTournaments(shell) {
       for (const action of actions) cell.append(ownerActionButton(shell, ownerLabel(action), async () => { await ownerRequest(OwnerAdminTournaments.registrationDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action })); await showDetail(id); }, { confirmText: ["reject", "withdraw"].includes(action) ? `${ownerLabel(action)} registration ${item.id}?` : "" }));
     };
     const bracket = data.bracket && !Array.isArray(data.bracket) ? data.bracket : null;
-    if (bracket) detail.append(ownerRows([{ ready: bracket.ready, generatedAt: bracket.generatedAt }], ["ready", "generatedAt"]));
+    if (bracket) detail.append(ownerElement("h3", "owner-admin__section-title", "Bracket status"), ownerRows([{ ready: bracket.ready, generatedAt: bracket.generatedAt }], ["ready", "generatedAt"]));
     const groups = [
       ["Registrations", data.registrations, ["id", "accountId", "status"], registrationActions],
       ["Squad approvals", data.approvals, ["id", "leaderAccountId", "status"], (item, cell) => cell.append(ownerActionButton(shell, "Approve", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "approve" })); await showDetail(id); }), ownerActionButton(shell, "Reject", async () => { await ownerRequest(OwnerAdminTournaments.approvalDecisionPath(id, item.id), OwnerAdminApi.json("POST", { action: "reject" })); await showDetail(id); }, { confirmText: `Reject Squad approval ${item.id}?` }))],
       ["Bracket", Array.isArray(data.bracket) ? data.bracket : (bracket && Array.isArray(bracket.matches) ? bracket.matches : []), ["id", "round", "player1", "player2"]],
       ["Matches", data.matches || (data.tournament && data.tournament.matches), ["id", "round", "player1", "player2", "winner", "status"]],
-      ["Result submissions", data.resultSubmissions, ["id", "matchId", "winner", "status"]],
-      ["Disputes", data.disputes, ["id", "matchId", "status", "reason"]],
+      ["Result submissions", data.resultSubmissions, ["matchId", "winner", "submittedBy", "status", "submittedAt"]],
+      ["Disputes", data.disputes, ["matchId", "winner", "status", "submittedAt", "disputedAt"]],
     ];
     for (const [title, rows, columns, actions] of groups) detail.append(ownerElement("h3", "owner-admin__section-title", title), ownerRows(rows, columns, actions));
     shell.content.append(detail);
@@ -585,7 +539,7 @@ async function renderOwnerSeasons(shell) {
     const data = await ownerRequest(OwnerAdminSeasons.endpoints.seasons);
     const old = shell.content.querySelector(".owner-admin__records"); if (old) old.remove();
     const records = ownerElement("section", "owner-admin__records");
-    if (data.currentSeason) records.append(ownerElement("p", "owner-admin__notice", `Active season: ${ownerValue(data.currentSeason.name)}`), ownerButton("Complete season", async () => { if (!confirm("Complete the active season?")) return; await ownerRequest(`${OwnerAdminSeasons.endpoints.seasons}/${encodeURIComponent(data.currentSeason.id)}/complete`, OwnerAdminApi.json("POST", {})); await draw(); }, true));
+    if (data.currentSeason) records.append(ownerElement("p", "owner-admin__notice", `Active season: ${ownerValue(data.currentSeason.name)}`), ownerActionButton(shell, "Complete season", async () => { await ownerRequest(`${OwnerAdminSeasons.endpoints.seasons}/${encodeURIComponent(data.currentSeason.id)}/complete`, OwnerAdminApi.json("POST", {})); await draw(); }, { confirmText: "Complete the active season?" }));
     records.append(ownerElement("h2", "owner-admin__section-title", "Rankings"), ownerRows(data.leaderboard, ["rank", "ign", "accountId", "points"])); shell.content.append(records);
   };
   shell.content.append(ownerForm("Start season", [{ name: "name", label: "Season name" }, { name: "requestId", label: "Request ID", required: false }], "Start season", async (values, form) => { await ownerRequest(OwnerAdminSeasons.endpoints.seasons, OwnerAdminApi.json("POST", values)); form.reset(); await draw(); }), ownerForm("Correct ranking points", [{ name: "accountId", label: "Community account ID" }, { name: "points", label: "Points", type: "number" }, { name: "reason", label: "Correction reason" }], "Save correction", async (values) => { await ownerRequest(`${OwnerAdminSeasons.endpoints.points}/${encodeURIComponent(values.accountId)}`, OwnerAdminApi.json("PATCH", { points: Number(values.points), reason: values.reason })); await draw(); })); await draw();
@@ -648,7 +602,6 @@ async function openOwnerSection(sectionName) {
   finally { region.setAttribute("aria-busy", "false"); const heading = shell.section.querySelector("h1"); if (heading) { heading.tabIndex = -1; heading.focus(); } }
 }
 
-// This later declaration intentionally upgrades the original foundation renderer.
 function renderOwnerDashboard(data) {
   ownerOverviewData = data;
   const app = ownerElement("section", "owner-admin__application owner-admin__dashboard");
